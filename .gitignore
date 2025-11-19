@@ -1,0 +1,27 @@
+# --- Python Basic ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+*.so
+
+# --- Distribution / Packaging ---
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual Environments ---
+venv/
+env/
+.venv/
+
+# --- IDE / OS Settings ---
+.DS_Store
+.idea/
+.vscode/
+.env
+
+# --- Application Configuration & User Data ---
+# Ignore the config directory containing generated files (config.yaml, subplot_params.yaml, takefits.range, etc.)
+config/
