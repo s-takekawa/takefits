@@ -404,6 +404,16 @@ class ChannelMapWindow(QMainWindow):
             dialog._import_values()
             self.toolbar._subplot_dialog.hide()
 
+    def _base_plane_from_name(self, plane: Optional[str]) -> str:
+        value = (plane or "").lower()
+        if "xz" in value:
+            return "xz"
+        if "zy" in value:
+            return "zy"
+        if "xy" in value:
+            return "xy"
+        return self.plane
+
     # ------------------------------------------------------------------
     # Marker manager integration
     def default_marker_plane(self) -> Optional[str]:
@@ -496,7 +506,18 @@ class ChannelMapWindow(QMainWindow):
         return mirrored_markers
 
     def open_marker_panel(self):
-        if self.marker_panel is None or not self.marker_panel.isVisible():
+        needs_new_panel = False
+        if self.marker_panel is None:
+            needs_new_panel = True
+        else:
+            try:
+                needs_new_panel = not self.marker_panel.isVisible()
+            except Exception:
+                # Underlying widget was deleted; recreate.
+                self.marker_panel = None
+                needs_new_panel = True
+
+        if needs_new_panel:
             from tools.marker_panel import MarkerPanel
             self.marker_panel = MarkerPanel(self, self.marker_manager)
             try:
@@ -619,6 +640,31 @@ class ChannelMapWindow(QMainWindow):
         marker_manager = getattr(self, "marker_manager", None)
         if marker_manager is not None:
             marker_manager.handle_key_release(event)
+
+    def remap_loaded_marker_state(self, state, *, source_plane: Optional[str] = None, world_frame: Optional[str] = None):
+        """
+        Map incoming marker states to the appropriate channel-map planes.
+        - If the state plane matches this viewer's base plane (e.g., saved from main),
+          replicate to all tiles.
+        - If the state plane matches a channel-map plane (channel_<base>_N), restore to that tile index.
+        - Ignore states whose base plane differs.
+        """
+        base = self._base_plane_from_name(state.plane)
+        if base != self.plane:
+            return []
+
+        prefix = f"{self.marker_plane_prefix}_"
+        plane_name = state.plane or ""
+        if plane_name.startswith(prefix):
+            try:
+                index = int(plane_name[len(prefix):])
+            except Exception:
+                return []
+            if 0 <= index < len(self._marker_planes):
+                return [self._marker_planes[index]]
+            return []
+
+        return list(self._marker_planes)
 
 
 

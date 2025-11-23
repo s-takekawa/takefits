@@ -94,26 +94,28 @@ class MarkerPanel(QDialog):
 
     COLOR_OPTIONS = [
         "None",
-        "white",
-        "yellow",
-        "yellowgreen",
-        "cyan",
-        "magenta",
+        "blue",
         "red",
         "green",
-        "blue",
+        "cyan",
+        "magenta",
+        "black",
+        "white",
+        "gray",
         "orange",
         "purple",
-        "black",
-        "gray",
+        "yellow",
+        "yellowgreen",
+        "olive",
+        "lime",
     ]
 
     UNIT_OPTIONS = ["pixel", "arcsec", "arcmin", "deg"]
 
     FONT_OPTIONS = [
+        "Arial",
         "DejaVu Sans",
         "STIXGeneral",
-        "Arial",
         "Helvetica",
         "Times New Roman",
         "Courier New",
@@ -154,6 +156,12 @@ class MarkerPanel(QDialog):
         self._selection_from_list = False
         self.property_rows = {"symbol": [], "line": [], "text": []}
         self.link_all_checkbox: Optional[QCheckBox] = None
+        self._last_type_kind: Optional[str] = None
+        self._last_text_value: str = "Text"
+        self._suppress_label_from_text: bool = False
+        self.detail_group: Optional[QGroupBox] = None
+        self._detail_group_heights: Dict[str, int] = {}
+        self._detail_group_fixed_height: Optional[int] = None
 
         self.setWindowTitle("Markers")
         self.setModal(False)
@@ -161,6 +169,7 @@ class MarkerPanel(QDialog):
 
         self._build_ui()
         self._connect_signals()
+        self._precompute_detail_group_heights()
         self._on_type_changed(self.type_combo.currentIndex())
         self.placement_toggle.setChecked(True)
         self._configure_placement()
@@ -198,6 +207,7 @@ class MarkerPanel(QDialog):
         main_layout.addLayout(type_row)
 
         detail_group = QGroupBox("Properties", self)
+        self.detail_group = detail_group
         self.properties_form = QFormLayout(detail_group)
         self.properties_form.setContentsMargins(8, 8, 8, 8)
         self.properties_form.setVerticalSpacing(4)
@@ -208,6 +218,12 @@ class MarkerPanel(QDialog):
         self.world_y_edit = self._make_world_line_edit(detail_group, "World Y")
         self.pixel_x_spin.setFixedWidth(110)
         self.pixel_y_spin.setFixedWidth(110)
+        if self.pixel_x_spin.lineEdit() is not None:
+            self.pixel_x_spin.lineEdit().returnPressed.connect(self._on_pixel_entry_return_pressed)
+        if self.pixel_y_spin.lineEdit() is not None:
+            self.pixel_y_spin.lineEdit().returnPressed.connect(self._on_pixel_entry_return_pressed)
+        self.world_x_edit.returnPressed.connect(self._on_world_entry_return_pressed)
+        self.world_y_edit.returnPressed.connect(self._on_world_entry_return_pressed)
 
         x_row = QHBoxLayout()
         x_row.setContentsMargins(0, 0, 0, 0)
@@ -300,22 +316,14 @@ class MarkerPanel(QDialog):
         self.text_controls = self._build_text_controls()
         font_size_label = QLabel("Font Size", detail_group)
         self.properties_form.addRow(font_size_label, self.text_controls.font_size_spin)
-        rotation_label = QLabel("Rotation (deg)", detail_group)
+        rotation_label = QLabel("Angle (deg)", detail_group)
         self.properties_form.addRow(rotation_label, self.text_controls.rotation_spin)
         font_label = QLabel("Font", detail_group)
         self.properties_form.addRow(font_label, self.text_controls.font_combo)
         self.property_rows["text"].extend([(font_size_label, self.text_controls.font_size_spin), (rotation_label, self.text_controls.rotation_spin), (font_label, self.text_controls.font_combo)])
 
         # Set initial visibility
-        for label, widget in self.property_rows["symbol"]:
-            label.setVisible(True)
-            widget.setVisible(True)
-        for label, widget in self.property_rows["line"]:
-            label.setVisible(False)
-            widget.setVisible(False)
-        for label, widget in self.property_rows["text"]:
-            label.setVisible(False)
-            widget.setVisible(False)
+        self._set_property_rows_visible("symbol", "o")
 
         main_layout.addWidget(detail_group)
 
@@ -329,15 +337,24 @@ class MarkerPanel(QDialog):
         list_layout.addWidget(self.marker_list)
 
         list_button_row = QHBoxLayout()
+        list_button_row.setSpacing(8)
         self.delete_button = QPushButton("Delete", self)
         self.delete_all_button = QPushButton("Delete All", self)
+        self.save_button = QPushButton("Save", self)
+        self.load_button = QPushButton("Load", self)
         self.delete_button.setDefault(False)
         self.delete_button.setAutoDefault(False)
         self.delete_all_button.setDefault(False)
         self.delete_all_button.setAutoDefault(False)
+        self.save_button.setDefault(False)
+        self.save_button.setAutoDefault(False)
+        self.load_button.setDefault(False)
+        self.load_button.setAutoDefault(False)
+        list_button_row.addWidget(self.save_button)
+        list_button_row.addWidget(self.load_button)
+        list_button_row.addWidget(self.delete_button)
         list_button_row.addWidget(self.delete_all_button)
         list_button_row.addStretch()
-        list_button_row.addWidget(self.delete_button)
         list_layout.addLayout(list_button_row)
 
         main_layout.addWidget(list_group)
@@ -415,7 +432,7 @@ class MarkerPanel(QDialog):
         font_combo = QComboBox()
         for family in self.FONT_OPTIONS:
             font_combo.addItem(family)
-        font_combo.setCurrentText(self.FONT_OPTIONS[0])
+        font_combo.setCurrentText("Arial")
 
         return TextControls(
             widget=QWidget(), # Dummy
@@ -423,6 +440,65 @@ class MarkerPanel(QDialog):
             rotation_spin=rotation_spin,
             font_combo=font_combo,
         )
+
+    def _set_property_rows_visible(self, kind: str, symbol: Optional[str] = None) -> None:
+        for row_kind in self.property_rows:
+            for label, widget in self.property_rows[row_kind]:
+                is_visible = row_kind == kind
+                label.setVisible(is_visible)
+                widget.setVisible(is_visible)
+        if kind == "symbol":
+            symbol_value = symbol
+            if symbol_value is None:
+                index = self.type_combo.currentIndex()
+                kind_data = self.TYPE_OPTIONS[index][1]
+                symbol_value = kind_data.get("symbol")
+            is_plus_cross = symbol_value in {"+", "x"}
+            self.symbol_controls.edge_color_label.setVisible(not is_plus_cross)
+            self.symbol_controls.edge_color_combo.setVisible(not is_plus_cross)
+        else:
+            self.symbol_controls.edge_color_label.setVisible(False)
+            self.symbol_controls.edge_color_combo.setVisible(False)
+
+    def _capture_detail_group_height(self, kind: str) -> None:
+        group = self.detail_group
+        if group is None:
+            return
+        height = int(group.sizeHint().height() or 0)
+        if height <= 0:
+            return
+        previous = self._detail_group_heights.get(kind, 0)
+        if height > previous:
+            self._detail_group_heights[kind] = height
+        max_height = max(self._detail_group_heights.values(), default=0)
+        if max_height and max_height != self._detail_group_fixed_height:
+            self._detail_group_fixed_height = max_height
+            group.setMinimumHeight(max_height)
+            group.setMaximumHeight(max_height)
+
+    def _precompute_detail_group_heights(self) -> None:
+        group = self.detail_group
+        if group is None:
+            return
+        current_index = self.type_combo.currentIndex()
+        current_data = self.TYPE_OPTIONS[current_index][1]
+        original_kind = current_data.get("kind", "symbol")
+        original_symbol = current_data.get("symbol")
+        self._suspend_updates = True
+        try:
+            for _, data in self.TYPE_OPTIONS:
+                kind = data.get("kind")
+                if kind not in self.property_rows:
+                    continue
+                self._set_property_rows_visible(kind, data.get("symbol"))
+                self._update_label_field_visibility(kind)
+                group.adjustSize()
+                self._capture_detail_group_height(kind)
+        finally:
+            self._set_property_rows_visible(original_kind, original_symbol)
+            self._update_label_field_visibility(original_kind)
+            self._suspend_updates = False
+        self._capture_detail_group_height(original_kind)
 
     def _make_coordinate_spin(self, parent: QWidget) -> QDoubleSpinBox:
         spin = QDoubleSpinBox(parent)
@@ -450,6 +526,8 @@ class MarkerPanel(QDialog):
         self.marker_list.delete_pressed.connect(self._on_delete_marker)
         self.delete_button.clicked.connect(self._on_delete_marker)
         self.delete_all_button.clicked.connect(self._on_delete_all)
+        self.save_button.clicked.connect(self._on_save_json)
+        self.load_button.clicked.connect(self._on_load_json)
 
         self.label_edit.editingFinished.connect(self._on_label_changed)
         self.label_edit.returnPressed.connect(self._on_label_changed)
@@ -460,8 +538,6 @@ class MarkerPanel(QDialog):
         self.pixel_y_spin.valueChanged.connect(self._on_pixel_spin_changed)
         self.world_x_edit.editingFinished.connect(self._on_world_edit_finished)
         self.world_y_edit.editingFinished.connect(self._on_world_edit_finished)
-        self.world_x_edit.returnPressed.connect(self._on_world_edit_finished)
-        self.world_y_edit.returnPressed.connect(self._on_world_edit_finished)
 
         self.symbol_controls.size_spin.valueChanged.connect(lambda _: self._apply_symbol_style())
         self.symbol_controls.linewidth_spin.valueChanged.connect(lambda _: self._apply_symbol_style())
@@ -646,12 +722,22 @@ class MarkerPanel(QDialog):
             self.line_controls.style_combo.setCurrentIndex(0)
             current_kind = self.TYPE_OPTIONS[self.type_combo.currentIndex()][1].get("kind", "symbol")
             self._update_label_field_visibility(current_kind)
-            self.text_controls.font_combo.setCurrentText(self.FONT_OPTIONS[0])
+            if current_kind == "text":
+                template_text = self._last_text_value or "Text"
+                self.label_edit.setText(template_text)
+            fallback_font = next((font for font in self.FONT_OPTIONS if font != "STIXGeneral"), self.FONT_OPTIONS[0])
+            self.text_controls.font_combo.setCurrentText(fallback_font)
+            self.pixel_x_spin.setEnabled(True)
+            self.pixel_y_spin.setEnabled(True)
+            self.world_x_edit.setEnabled(True)
+            self.world_y_edit.setEnabled(True)
         finally:
             self._suspend_updates = False
 
     def _populate_detail_fields(self, marker: Marker, *, preserve_selection: bool = False) -> None:
         self._suspend_updates = True
+        focus_label_field = False
+        fallback_font_option = next((font for font in self.FONT_OPTIONS if font != "STIXGeneral"), self.FONT_OPTIONS[0])
         try:
             self._current_plane = marker.plane
             self._current_marker_id = marker.marker_id
@@ -733,21 +819,33 @@ class MarkerPanel(QDialog):
                 self._update_line_detail_fields(marker, style=style)
 
             elif isinstance(marker, TextMarker):
-                #self.detail_stack.setCurrentIndex(2)
-                self.label_edit.setText(marker.text)
+                fallback_font_option = next((font for font in self.FONT_OPTIONS if font != "STIXGeneral"), self.FONT_OPTIONS[0])
                 self.text_controls.font_size_spin.setValue(style.size)
                 self.text_controls.rotation_spin.setValue(style.rotation)
-                if "$" in (marker.text or ""):
+                text_value = marker.text or ""
+                if not text_value:
+                    text_value = "Text"
+                    marker.update_text(text_value)
+                self.label_edit.setText(text_value)
+                self._last_text_value = text_value
+                if "$" in text_value:
                     self.text_controls.font_combo.setCurrentText("STIXGeneral")
                 else:
-                    family = style.font_family or self.FONT_OPTIONS[0]
+                    family = style.font_family or fallback_font_option
                     if family not in self.FONT_OPTIONS:
                         self.text_controls.font_combo.addItem(family)
                     self.text_controls.font_combo.setCurrentText(family)
+                if not text_value.strip():
+                    focus_label_field = True
             self._update_position_fields(marker)
         finally:
             self._suspend_updates = False
         self._ensure_marker_selected(marker, preserve_existing=preserve_selection)
+        if focus_label_field:
+            def _focus_text_field() -> None:
+                self.label_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+                self.label_edit.selectAll()
+            QTimer.singleShot(0, _focus_text_field)
 
     def _type_matches_marker(self, data: Dict[str, str], marker: Marker) -> bool:
         if data.get("kind") == "symbol" and isinstance(marker, SymbolMarker):
@@ -834,55 +932,90 @@ class MarkerPanel(QDialog):
         kwargs["style"] = style
 
         label = self.label_edit.text().strip()
-        if kind != "text" and label:
-            kwargs["label"] = label
+        if kind != "text":
+            if self._suppress_label_from_text and label == self._last_text_value:
+                label = ""
+            if label:
+                kwargs["label"] = label
         return kwargs
 
-    def _plane_center_pixel(self, plane: str) -> Optional[Tuple[float, float]]:
+    def _resolve_current_plane(self) -> str:
+        current_plane = self._current_plane
+        selected_lookup = getattr(self.marker_manager, "selected_marker", None)
+        selected_marker = selected_lookup() if callable(selected_lookup) else None
+        active_plane_getter = getattr(self.marker_manager, "active_plane", None)
+        manager_plane = active_plane_getter() if callable(active_plane_getter) else None
+        if selected_marker is not None:
+            current_plane = selected_marker.plane
+        elif manager_plane:
+            current_plane = manager_plane
+        if not current_plane:
+            current_plane = getattr(self.viewer, "plane", "xy")
+        self._current_plane = current_plane
+        return current_plane
+
+    def _world_inputs_to_pixels(
+        self,
+        plane: str,
+        world_inputs: Tuple[str, str],
+    ) -> Optional[Tuple[float, float]]:
         viewer = self._viewer_for_plane(plane)
-        axes = None
-        if viewer is not None:
-            custom_lookup = getattr(viewer, "marker_axes_for_plane", None)
-            if callable(custom_lookup):
-                try:
-                    axes = custom_lookup(plane)
-                except Exception:
-                    axes = None
-            if axes is None:
-                base_plane = self._base_plane(plane)
-                axes = getattr(viewer, "overlay_ax", None)
-                if axes is None and base_plane:
-                    axes = getattr(viewer, f"overlay_ax_{base_plane}", None)
-                if axes is None:
-                    axes = getattr(viewer, "ax", None)
-                if axes is None and base_plane:
-                    axes = getattr(viewer, f"ax_{base_plane}", None)
-        if axes is None:
-            base_plane = self._base_plane(plane)
-            axes = getattr(Common, f"overlay_ax_{base_plane}", None) or getattr(Common, f"ax_{base_plane}", None)
-        if axes is None:
+        converter = getattr(viewer, "converter", None) if viewer else None
+        wcs = getattr(converter, "wcs", None) if converter else None
+        axis_indices = self._plane_axis_indices(plane, wcs)
+        if converter is None or wcs is None or axis_indices is None:
+            return None
+        cleaned_inputs = [value.strip() for value in world_inputs]
+        if not all(cleaned_inputs):
             return None
         try:
-            x0, x1 = axes.get_xlim()
-            y0, y1 = axes.get_ylim()
+            ref_pixel = getattr(wcs, "wcs", None).crpix if hasattr(wcs, "wcs") else wcs.crpix
+            ref_world = wcs.wcs_pix2world([ref_pixel], 0)[0]
         except Exception:
             return None
-        return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        target_world = list(ref_world)
+        for value, idx in zip(cleaned_inputs, axis_indices):
+            target_world[idx] = value
+        try:
+            pix_coords = converter.world_to_pix(*target_world)
+            x_pix = float(pix_coords[axis_indices[0]])
+            y_pix = float(pix_coords[axis_indices[1]])
+        except Exception:
+            return None
+        return (x_pix, y_pix)
 
-    def _place_text_at_center(self, text: str) -> None:
-        if not text:
-            return
-        center = self._plane_center_pixel(self._current_plane)
-        if center is None:
-            return
-        kwargs = dict(self._style_configuration_for_kind("text"))
-        kwargs["text"] = text
-        kwargs.pop("label", None)
-        marker = self.marker_manager.create_text_marker(self._current_plane, center, **kwargs)
-        self.marker_manager.select_marker(marker)
-        self._refresh_marker_list()
-        self._populate_detail_fields(marker)
-        self.marker_manager.redraw_plane(self._current_plane)
+    def _create_marker_from_coordinates(self, plane: str, x: float, y: float) -> Optional[Marker]:
+        entry = self.TYPE_OPTIONS[self.type_combo.currentIndex()]
+        kind = entry[1].get("kind", "symbol")
+        kwargs = dict(self._style_configuration_for_kind(kind))
+        marker: Optional[Marker] = None
+        if kind == "symbol":
+            marker = self.marker_manager.create_symbol_marker(plane, (x, y), **kwargs)
+        elif kind == "line":
+            marker = self.marker_manager.create_line_marker(plane, (x, y), **kwargs)
+        elif kind == "text":
+            marker = self.marker_manager.create_text_marker(plane, (x, y), **kwargs)
+        else:
+            marker = self.marker_manager.create_symbol_marker(plane, (x, y), **kwargs)
+        if marker is None:
+            return None
+        if kind == "text" and self.placement_toggle.isChecked():
+            self.marker_manager.select_marker(None)
+            self._current_marker_id = None
+            self._on_deselect_markers()
+            self._refresh_marker_list()
+            self._focus_label_edit()
+        else:
+            self.marker_manager.select_marker(marker)
+            self._refresh_marker_list()
+            self._populate_detail_fields(marker)
+        return marker
+
+    def _focus_label_edit(self) -> None:
+        def _focus() -> None:
+            self.label_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+            self.label_edit.selectAll()
+        QTimer.singleShot(0, _focus)
 
     def _update_label_field_visibility(self, kind: str) -> None:
         if kind == "text":
@@ -1059,6 +1192,12 @@ class MarkerPanel(QDialog):
         if not found and style_combo.count():
             style_combo.setCurrentIndex(0)
         style_combo.blockSignals(False)
+
+    def _update_text_detail_fields(self, marker: TextMarker) -> None:
+        rotation_spin = self.text_controls.rotation_spin
+        rotation_spin.blockSignals(True)
+        rotation_spin.setValue(marker.style.rotation)
+        rotation_spin.blockSignals(False)
 
     def _ensure_marker_selected(
         self,
@@ -1349,6 +1488,38 @@ class MarkerPanel(QDialog):
         else:
             self._update_position_fields(primary)
 
+    def _on_pixel_entry_return_pressed(self) -> None:
+        if self._suspend_updates:
+            return
+        if self._selected_markers() or self._current_marker() is not None:
+            return
+        if not getattr(self, "marker_manager", None):
+            return
+        plane = self._resolve_current_plane()
+        marker = self._create_marker_from_coordinates(plane, self.pixel_x_spin.value(), self.pixel_y_spin.value())
+        if marker is None:
+            return
+        self.marker_manager.redraw_plane(plane)
+
+    def _on_world_entry_return_pressed(self) -> None:
+        if self._suspend_updates:
+            return
+        if self._selected_markers() or self._current_marker() is not None:
+            return
+        if not getattr(self, "marker_manager", None):
+            return
+        world_inputs = (self.world_x_edit.text().strip(), self.world_y_edit.text().strip())
+        if not all(world_inputs):
+            return
+        plane = self._resolve_current_plane()
+        pixel_coords = self._world_inputs_to_pixels(plane, world_inputs)
+        if pixel_coords is None:
+            return
+        marker = self._create_marker_from_coordinates(plane, pixel_coords[0], pixel_coords[1])
+        if marker is None:
+            return
+        self.marker_manager.redraw_plane(plane)
+
     def _on_world_edit_finished(self) -> None:
         if self._suspend_updates:
             return
@@ -1362,33 +1533,15 @@ class MarkerPanel(QDialog):
         elif not markers:
             return
         primary = markers[0]
-        viewer = self._viewer_for_marker(primary)
-        converter = getattr(viewer, "converter", None) if viewer else None
-        wcs = getattr(converter, "wcs", None) if converter else None
-        axis_indices = self._plane_axis_indices(primary.plane, wcs)
-        if converter is None or wcs is None or axis_indices is None:
-            self._update_position_fields(primary)
-            return
-        world_inputs = [self.world_x_edit.text().strip(), self.world_y_edit.text().strip()]
+        world_inputs = (self.world_x_edit.text().strip(), self.world_y_edit.text().strip())
         if not all(world_inputs):
             self._update_position_fields(primary)
             return
-        try:
-            ref_pixel = wcs.wcs.crpix
-            ref_world = wcs.wcs_pix2world([ref_pixel], 0)[0]
-        except Exception:
+        pixel_coords = self._world_inputs_to_pixels(primary.plane, world_inputs)
+        if pixel_coords is None:
             self._update_position_fields(primary)
             return
-        target_world = list(ref_world)
-        for value, idx in zip(world_inputs, axis_indices):
-            target_world[idx] = value
-        try:
-            pix_coords = converter.world_to_pix(*target_world)
-            x_pix = float(pix_coords[axis_indices[0]])
-            y_pix = float(pix_coords[axis_indices[1]])
-        except Exception:
-            self._update_position_fields(primary)
-            return
+        x_pix, y_pix = pixel_coords
         any_updated = False
         self._suspend_updates = True
         try:
@@ -1420,103 +1573,87 @@ class MarkerPanel(QDialog):
                 self._update_position_fields(marker)
                 if isinstance(marker, LineMarker):
                     self._update_line_detail_fields(marker)
+                elif isinstance(marker, TextMarker):
+                    self._update_text_detail_fields(marker)
             finally:
                 self._suspend_updates = False
         self._refresh_marker_list()
 
     def _on_type_changed(self, index: int) -> None:
-        if self._suspend_updates:
-            return
+        prev_kind = getattr(self, "_last_type_kind", None)
+        programmatic = self._suspend_updates
         kind_data = self.TYPE_OPTIONS[index][1]
         kind = kind_data.get("kind")
 
-        for row_kind in self.property_rows:
-            for label, widget in self.property_rows[row_kind]:
-                is_visible = row_kind == kind
-                label.setVisible(is_visible)
-                widget.setVisible(is_visible)
-
-        if kind == "symbol":
-            is_plus_cross = kind_data.get("symbol") in {"+", "x"}
-            self.symbol_controls.edge_color_label.setVisible(not is_plus_cross)
-            self.symbol_controls.edge_color_combo.setVisible(not is_plus_cross)
+        self._set_property_rows_visible(kind, kind_data.get("symbol"))
 
         self._update_label_field_visibility(kind)
-        markers = self._selected_markers()
-        if not markers:
-            marker = self._current_marker()
-            if marker is not None:
-                markers = [marker]
-        changed_planes: set[str] = set()
-        if markers:
-            symbol = kind_data.get("symbol")
-            for target in markers:
-                replacement = None
-                if kind == "symbol":
-                    new_symbol = kind_data.get("symbol", "o")
-                    style_dict = target.style.to_dict()
+        if kind == "text" and not self._selected_markers() and self._current_marker() is None:
+            template_text = self._last_text_value or "Text"
+            if self.label_edit.text() != template_text:
+                self.label_edit.setText(template_text)
 
-                    is_new_plus_cross = new_symbol in {"+", "x"}
-                    was_symbol = isinstance(target, SymbolMarker)
-                    was_plus_cross = was_symbol and getattr(target, "symbol", None) in {"+", "x"}
+        if kind == "symbol":
+            symbol = kind_data.get("symbol")
+            if symbol in {"+", "x"} and self.symbol_controls.linewidth_spin.value() < 1.0:
+                self.symbol_controls.linewidth_spin.setValue(1.0)
+
+        if not programmatic:
+            if prev_kind == "text" and kind != "text":
+                self._last_text_value = self.label_edit.text().strip()
+                self._suppress_label_from_text = True
+                self.label_edit.clear()
+            elif kind == "text":
+                self._suppress_label_from_text = False
+
+        if programmatic:
+            self._last_type_kind = kind
+            return
+
+        changed_planes: set[str] = set()
+        if kind == "symbol":
+            markers = [m for m in self._selected_markers() if isinstance(m, SymbolMarker)]
+            if not markers:
+                marker = self._current_marker()
+                if isinstance(marker, SymbolMarker):
+                    markers = [marker]
+            if markers:
+                new_symbol = kind_data.get("symbol", "o")
+                is_new_plus_cross = new_symbol in {"+", "x"}
+                for target in markers:
+                    style_dict = target.style.to_dict()
+                    was_plus_cross = getattr(target, "symbol", None) in {"+", "x"}
 
                     if is_new_plus_cross and not was_plus_cross:
                         if style_dict.get("linewidth", 0.0) < 1.0:
                             style_dict["linewidth"] = 1.0
-                        
                         current_color = style_dict.get("color", "none")
                         if current_color != "none":
                             style_dict["edgecolor"] = current_color
                         elif style_dict.get("edgecolor", "none") == "none":
                             style_dict["edgecolor"] = "white"
                         style_dict["color"] = "none"
-
                     elif not is_new_plus_cross and was_plus_cross:
                         current_edge_color = style_dict.get("edgecolor", "none")
                         if current_edge_color != "none":
                             style_dict["color"] = current_edge_color
                             style_dict["edgecolor"] = "none"
 
-                    if was_symbol:
-                        target.symbol = new_symbol
-                        target.update_style(MarkerStyle.from_dict(style_dict))
-                        changed_planes.add(target.plane)
-                    else:
-                        replacement = self.marker_manager.create_symbol_marker(
-                            target.plane,
-                            target.pixel[:2],
-                            symbol=new_symbol,
-                            style=MarkerStyle.from_dict(style_dict),
-                            label=target.label,
-                        )
-                        replacement.marker_id = target.marker_id
-                        self.marker_manager.remove_marker(target.marker_id, target.plane)
-                elif kind == "line" and not isinstance(target, LineMarker):
-                    replacement = self.marker_manager.create_line_marker(
-                        target.plane, target.pixel[:2], length=10.0, angle_deg=0.0, unit="pixel"
-                    )
-                    replacement.marker_id = target.marker_id
-                    self.marker_manager.remove_marker(target.marker_id, target.plane)
-                elif kind == "text" and not isinstance(target, TextMarker):
-                    replacement = self.marker_manager.create_text_marker(
-                        target.plane, target.pixel[:2], text=target.label or ""
-                    )
-                    replacement.marker_id = target.marker_id
-                    self.marker_manager.remove_marker(target.marker_id, target.plane)
-                if replacement is not None:
-                    self.marker_manager.add_marker(replacement)
-                    changed_planes.add(replacement.plane)
-                    markers[markers.index(target)] = replacement
+                    target.symbol = new_symbol
+                    target.update_style(MarkerStyle.from_dict(style_dict))
+                    changed_planes.add(target.plane)
+
+        if changed_planes:
             for plane in changed_planes:
                 self.marker_manager.redraw_plane(plane)
             self._refresh_marker_list()
             self.marker_list.setFocus()
-        if kind == "symbol":
-            symbol = kind_data.get("symbol")
-            if symbol in {"+", "x"} and self.symbol_controls.linewidth_spin.value() < 1.0:
-                self.symbol_controls.linewidth_spin.setValue(1.0)
+
+        self._capture_detail_group_height(kind)
         if self.placement_toggle.isChecked():
             self._configure_placement()
+
+        self._last_type_kind = kind
 
     def _on_placement_toggled(self, enabled: bool) -> None:
         if enabled:
@@ -1539,6 +1676,18 @@ class MarkerPanel(QDialog):
         value = self.label_edit.text().strip()
         kind = self._current_kind()
 
+        template_update_only = not markers
+
+        if kind == "text":
+            self._last_text_value = value or "Text"
+        else:
+            self._suppress_label_from_text = False
+
+        if template_update_only:
+            if self.placement_toggle.isChecked():
+                self._configure_placement()
+            return
+
         if markers:
             changed_planes: set[str] = set()
             for target in markers:
@@ -1554,15 +1703,13 @@ class MarkerPanel(QDialog):
             primary = markers[0]
             if isinstance(primary, TextMarker):
                 self.label_edit.setText(primary.text)
-        elif self.placement_toggle.isChecked() and kind == "text" and value:
-            self._place_text_at_center(value)
-
         if kind == "text":
             if "$" in value:
                 self.text_controls.font_combo.setCurrentText("STIXGeneral")
             else:
                 if self.text_controls.font_combo.currentText() == "STIXGeneral":
-                    self.text_controls.font_combo.setCurrentText(self.FONT_OPTIONS[0])
+                    fallback_font = next((font for font in self.FONT_OPTIONS if font != "STIXGeneral"), self.FONT_OPTIONS[0])
+                    self.text_controls.font_combo.setCurrentText(fallback_font)
 
         if self.placement_toggle.isChecked():
             self._configure_placement()
@@ -1780,41 +1927,69 @@ class MarkerPanel(QDialog):
     # ------------------------------------------------------------------
     # Persistence and export helpers
     def _choose_plane_for_export(self, title: str) -> Optional[str]:
-        planes = sorted(
-            {marker.plane for layer in self.marker_manager._layers.values() for marker in layer.markers.values()},
-            key=lambda p: {"xy": 0, "xz": 1, "zy": 2}.get(p, 99),
-        )
+        planes_set = {marker.plane for layer in self.marker_manager._layers.values() for marker in layer.markers.values()}
+        def _plane_sort_key(name: str) -> Tuple[int, int, str]:
+            base_order = {"xy": 0, "xz": 1, "zy": 2}.get(name, 50)
+            suffix_num = 0
+            try:
+                parts = name.rsplit("_", 1)
+                if len(parts) == 2:
+                    suffix_num = int(parts[1])
+            except Exception:
+                suffix_num = 0
+            return (base_order, suffix_num, name)
+        planes = sorted(planes_set, key=_plane_sort_key)
         if not planes:
             return None
-        if len(planes) == 1:
-            return planes[0]
-        plane_labels = [plane.upper() for plane in planes]
+        multi_choice = len(planes) > 1
+        options = list(planes)
+        if multi_choice:
+            options.insert(0, "all")
+        if len(options) == 1:
+            return options[0]
+        plane_labels = [opt.upper() for opt in options]
         choice, ok = QInputDialog.getItem(self, title, "Select plane:", plane_labels, 0, False)
         if not ok or not choice:
             return None
-        return planes[plane_labels.index(choice)]
+        return options[plane_labels.index(choice)]
 
     def _on_save_json(self) -> None:
         plane = self._choose_plane_for_export("Save Markers")
         if plane is None:
             return
-        states = self._collect_states(plane)
-        if not states:
-            self._show_info(f"No markers to save for plane '{plane.upper()}'.")
-            return
+        if plane.lower() == "all":
+            states: Dict[str, MarkerState] = {}
+            for layer_plane in list(self.marker_manager._layers.keys()):
+                states.update(self._collect_states(layer_plane))
+            if not states:
+                self._show_info("No markers to save.")
+                return
+        else:
+            states = self._collect_states(plane)
+            if not states:
+                self._show_info(f"No markers to save for plane '{plane.upper()}'.")
+                return
         default_dir = os.path.dirname(getattr(self.viewer, "filename_path", "")) or os.getcwd()
+        file_plane = "all" if plane.lower() == "all" else plane
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Save Markers",
-            os.path.join(default_dir, f"markers_{plane}.marker.json"),
-            "Marker Files (*.marker.json);;JSON Files (*.json);;All Files (*)",
+            os.path.join(default_dir, f"markers_{file_plane}.marker"),
+            "Marker Files (*.marker *.marker.json *.json);;JSON Files (*.json);;All Files (*)",
         )
         if not filename:
             return
-        if not filename.lower().endswith((".json", ".marker.json")):
-            filename += ".marker.json"
+        if not filename.lower().endswith((".marker", ".marker.json", ".json")):
+            filename += ".marker"
         try:
-            payload = marker_states_to_json(states, plane=plane)
+            world_frame = None
+            if hasattr(self.marker_manager, "world_frame_for_plane"):
+                try:
+                    target_plane = next(iter(states.values())).plane if states else plane
+                    world_frame = self.marker_manager.world_frame_for_plane(target_plane)
+                except Exception:
+                    world_frame = None
+            payload = marker_states_to_json(states, plane=file_plane, world_frame=world_frame)
             with open(filename, "w", encoding="utf-8") as handle:
                 handle.write(payload)
             self._show_info(f"Saved {len(states)} marker(s) to {os.path.basename(filename)}.")
@@ -1827,7 +2002,7 @@ class MarkerPanel(QDialog):
             self,
             "Load Markers",
             default_dir,
-            "Marker Files (*.marker.json *.json);;All Files (*)",
+            "Marker Files (*.marker *.marker.json *.json);;All Files (*)",
         )
         if not path:
             return
@@ -1874,18 +2049,7 @@ class MarkerPanel(QDialog):
     def _configure_placement(self) -> None:
         if not self.placement_toggle.isChecked():
             return
-        active_plane_getter = getattr(self.marker_manager, "active_plane", None)
-        manager_plane = active_plane_getter() if callable(active_plane_getter) else None
-        selected_lookup = getattr(self.marker_manager, "selected_marker", None)
-        selected = selected_lookup() if callable(selected_lookup) else None
-        current_plane = self._current_plane
-        if selected is not None:
-            current_plane = selected.plane
-        elif manager_plane:
-            current_plane = manager_plane
-        if not current_plane:
-            current_plane = getattr(self.viewer, "plane", "xy")
-        self._current_plane = current_plane
+        current_plane = self._resolve_current_plane()
         entry = self.TYPE_OPTIONS[self.type_combo.currentIndex()]
         config = dict(entry[1])
         kind = config.get("kind", "symbol")
@@ -1899,8 +2063,37 @@ class MarkerPanel(QDialog):
     # ------------------------------------------------------------------
     # Utility helpers
     def _collect_states(self, plane: str) -> Dict[str, MarkerState]:
+        try:
+            self.marker_manager.refresh_world_coordinates(plane)
+        except Exception:
+            pass
         markers = self.marker_manager.markers_for_plane(plane)
-        return {marker.marker_id: marker.to_state() for marker in markers}
+        states = {marker.marker_id: marker.to_state() for marker in markers}
+
+        # Attach world endpoints for lines so they can be reprojected with correct angle.
+        viewer = self.marker_manager.viewer_for_plane(plane)
+        format_pix = getattr(viewer, "format_pix", None) if viewer else None
+        wcs = getattr(viewer, "wcs", None) if viewer else None
+        base_plane_resolver = getattr(self.marker_manager, "_base_plane_for", None)
+        base_plane = base_plane_resolver(plane) if callable(base_plane_resolver) else plane
+        if format_pix is not None and wcs is not None:
+            for marker in markers:
+                if not isinstance(marker, LineMarker):
+                    continue
+                state = states.get(marker.marker_id)
+                if state is None:
+                    continue
+                try:
+                    start, end = marker._endpoints()
+                    meta = dict(state.metadata)
+                    wx0, wy0 = format_pix.pix_to_wcs(wcs, start[0], start[1], base_plane)
+                    wx1, wy1 = format_pix.pix_to_wcs(wcs, end[0], end[1], base_plane)
+                    meta["pixel_endpoints"] = [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))]
+                    meta["world_endpoints"] = [(float(wx0), float(wy0)), (float(wx1), float(wy1))]
+                    state.metadata = meta
+                except Exception:
+                    continue
+        return states
 
     def _show_info(self, message: str) -> None:
         QMessageBox.information(self, "Markers", message)

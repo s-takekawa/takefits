@@ -10,16 +10,19 @@ class Region(ABC):
     Abstract base class for all region types.
     """
     def __init__(self, style=None):
-        self.default_style = {'color': 'lime', 'linewidth': 1, 'fill': False}
-        self.selected_style = {'color': 'yellow', 'linewidth': 2, 'fill': False}
-        self.style = style if style is not None else self.default_style.copy()
-        
-        self.mpl_patch = None
+        self.base_style = {'color': 'lime', 'linewidth': 1, 'fill': False, 'linestyle': 'solid'}
+        if isinstance(style, dict):
+            self._apply_style_overrides(style)
+        self.selected_style = {}
         self.selected = False
+        self.style = {}
+
+        self.mpl_patch = None
         self.label_text = ""
         self.label_artist: Text | None = None
         self.axes = None
         self.region_id = None
+        self._refresh_style_state(initial=True)
 
     @abstractmethod
     def contains(self, x, y):
@@ -35,7 +38,7 @@ class Region(ABC):
         
     def set_selected(self, selected):
         self.selected = selected
-        self.style = self.selected_style.copy() if selected else self.default_style.copy()
+        self._refresh_style_state()
 
     def add_to_axes(self, ax):
         self.axes = ax
@@ -110,6 +113,54 @@ class Region(ABC):
             'min': np.nanmin(region_pixels),
             'max': np.nanmax(region_pixels)
         }
+
+    def _apply_style_overrides(self, overrides):
+        for key in ('color', 'linewidth', 'linestyle', 'fill'):
+            if key in overrides and overrides[key] is not None:
+                self.base_style[key] = overrides[key]
+
+    def _refresh_style_state(self, initial=False):
+        linewidth = float(self.base_style.get('linewidth', 1.0) or 1.0)
+        linewidth = max(linewidth, 0.1)
+        self.base_style['linewidth'] = linewidth
+        self.base_style.setdefault('linestyle', 'solid')
+        self.base_style.setdefault('fill', False)
+
+        selected_linewidth = max(linewidth, 2.0)
+        self.selected_style = self.base_style.copy()
+        self.selected_style.update({
+            'color': 'yellow',
+            'linewidth': selected_linewidth,
+        })
+        self.selected_style['linestyle'] = self.base_style['linestyle']
+
+        if initial:
+            self.style = self.base_style.copy()
+        else:
+            self.style = self.selected_style.copy() if self.selected else self.base_style.copy()
+
+        if self.mpl_patch is not None:
+            self.mpl_patch.set(**self.style)
+        self._update_label_position()
+
+    def update_style_attributes(self, *, color=None, linewidth=None, linestyle=None):
+        changed = False
+        if color and color != self.base_style.get('color'):
+            self.base_style['color'] = color
+            changed = True
+        if linewidth is not None:
+            linewidth = max(float(linewidth), 0.1)
+            if not math.isclose(linewidth, float(self.base_style.get('linewidth', 1.0))):
+                self.base_style['linewidth'] = linewidth
+                changed = True
+        if linestyle and linestyle != self.base_style.get('linestyle'):
+            self.base_style['linestyle'] = linestyle
+            changed = True
+        if changed:
+            self._refresh_style_state()
+
+    def get_style_attributes(self):
+        return self.base_style.copy()
 
 
     def get_moments(self, data):
@@ -192,7 +243,12 @@ class CircleRegion(Region):
         return None
 
     def get_state(self):
-        return {'center': tuple(self.center), 'radius': float(self.radius), 'label': self.label_text}
+        return {
+            'center': tuple(self.center),
+            'radius': float(self.radius),
+            'label': self.label_text,
+            'style': self.get_style_attributes()
+        }
 
     def _label_position(self):
         cx, cy = self.center
@@ -363,7 +419,8 @@ class RectangleRegion(Region):
             'height': float(self.height),
             'angle': float(self.angle),
             'center': self.center,
-            'label': self.label_text
+            'label': self.label_text,
+            'style': self.get_style_attributes()
         }
 
     def _label_position(self):
@@ -507,7 +564,8 @@ class EllipseRegion(Region):
             'width': float(self.width),
             'height': float(self.height),
             'angle': float(self.angle),
-            'label': self.label_text
+            'label': self.label_text,
+            'style': self.get_style_attributes()
         }
 
     def _label_position(self):

@@ -3,6 +3,7 @@ import numpy as np
 import os
 import time
 import math
+from typing import Optional
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QMainWindow, QWidget, QGridLayout, QSlider, QLineEdit, QPushButton, QLabel, QSizePolicy, QMessageBox
@@ -1868,6 +1869,59 @@ class FITSViewer(QMainWindow):
             self.marker_panel.setProperty("_marker_panel_positioned", True)
         self.marker_panel.raise_()
         self.marker_panel.activateWindow()
+
+    # Marker plane helpers -------------------------------------------------
+    def has_marker_plane(self, plane: str) -> bool:
+        base = (plane or "").lower()
+        if base == "xy":
+            return getattr(Common, "overlay_ax_xy", None) is not None
+        if base == "xz":
+            return getattr(Common, "overlay_ax_xz", None) is not None
+        if base == "zy":
+            return getattr(Common, "overlay_ax_zy", None) is not None
+        return False
+
+    def marker_axes_for_plane(self, plane: str):
+        base = (plane or "").lower()
+        if base == "xy":
+            return getattr(Common, "overlay_ax_xy", None)
+        if base == "xz":
+            return getattr(Common, "overlay_ax_xz", None)
+        if base == "zy":
+            return getattr(Common, "overlay_ax_zy", None)
+        return None
+
+    def marker_plane_base(self, plane: str) -> str:
+        if not plane:
+            return getattr(self, "plane", "xy")
+        plane_lower = plane.lower()
+        if "xz" in plane_lower:
+            return "xz"
+        if "zy" in plane_lower:
+            return "zy"
+        if "xy" in plane_lower:
+            return "xy"
+        return plane_lower
+
+    def remap_loaded_marker_state(self, state, *, source_plane: Optional[str] = None, world_frame: Optional[str] = None):
+        """
+        Remap incoming marker states when loading saved markers.
+
+        - Channel-map planes (channel_<base>_N) collapse to this viewer's base plane.
+        - Otherwise, keep planes this viewer can display; fall back to base plane if supported.
+        """
+        plane_name = (state.plane or "").lower()
+        base = self.marker_plane_base(plane_name)
+
+        if plane_name.startswith("channel_"):
+            return [base] if self.has_marker_plane(base) else []
+
+        targets = []
+        if self.has_marker_plane(plane_name):
+            targets.append(plane_name)
+        elif self.has_marker_plane(base):
+            targets.append(base)
+        return targets
 
     def _position_marker_panel(self, panel):
         if panel is None:

@@ -153,6 +153,13 @@ class MenuBar:
         clear_all_action = QAction("Clear All", self.parent)
         clear_all_action.triggered.connect(self.parent.clear_all_regions_globally)
         region_menu.addAction(clear_all_action)
+        region_menu.addSeparator()
+        self.save_regions_action = QAction("Save Regions...", self.parent)
+        self.save_regions_action.triggered.connect(self.parent.save_regions_dialog)
+        region_menu.addAction(self.save_regions_action)
+        self.load_regions_action = QAction("Load Regions...", self.parent)
+        self.load_regions_action.triggered.connect(self.parent.load_regions_dialog)
+        region_menu.addAction(self.load_regions_action)
         
     def enable_plane_menu(self, enabled):
         self.plane_menu.setEnabled(enabled)

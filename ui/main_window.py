@@ -7,10 +7,11 @@ from ui.range_control import RangeControlPanel
 from tools.regrid_panel import RegridPanel
 from logic.regridder import Regridder
 from core.save_fits import SaveFITS
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QMessageBox, QFileDialog, QInputDialog
 from PyQt6.QtCore import Qt, QThread
 import sys
 import os
+import json
 from functools import partial
 from core.common import Common
 
@@ -213,6 +214,143 @@ class MainWindow(FITSViewer):
         print("\n\nProgram exited.")
         QApplication.instance().quit()
         sys.exit()
+
+    # ------------------------------------------------------------------
+    # Region save/load
+    def save_regions_dialog(self):
+        if not hasattr(self, "region_manager"):
+            return
+        # Collect candidates (manager, plane, label) that have regions
+        candidates = []
+        # Main viewer
+        main_regions = getattr(self.region_manager, "regions", [])
+        if main_regions:
+            planes = {getattr(r, "plane", None) or getattr(self, "plane", "xy") for r in main_regions}
+            for plane_name in planes:
+                candidates.append((self.region_manager, plane_name.lower(), "Main"))
+        # Integ windows
+        if hasattr(self, "integ_result_windows"):
+            for window_ref in list(self.integ_result_windows):
+                window = window_ref()
+                if window is None:
+                    continue
+                mgr = getattr(window, "region_manager", None)
+                regs = getattr(mgr, "regions", []) if mgr is not None else []
+                if not regs:
+                    continue
+                planes = {getattr(r, "plane", None) or getattr(window, "plane", "xy") for r in regs}
+                label_attr = getattr(window, "original_window_title", None)
+                label = None
+                if label_attr:
+                    label = label_attr
+                else:
+                    label_attr = getattr(window, "windowTitle", None)
+                    if callable(label_attr):
+                        try:
+                            label = label_attr()
+                        except Exception:
+                            label = None
+                    else:
+                        label = label_attr
+                if isinstance(label, str) and label.startswith("[REGION MODE"):
+                    closing = label.find("]")
+                    if closing != -1:
+                        label = label[closing + 1 :].strip()
+                if not label:
+                    label = f"Integ ({getattr(window, 'plane', 'xy').upper()})"
+                for plane_name in planes:
+                    candidates.append((mgr, plane_name.lower(), label))
+
+        if not candidates:
+            QMessageBox.information(self, "Regions", "No regions to save.")
+            return
+
+        # Deduplicate manager/plane combos
+        unique = []
+        seen = set()
+        for mgr, plane_name, label in candidates:
+            key = (id(mgr), plane_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((mgr, plane_name, label))
+
+        if len(unique) == 1:
+            target_manager, target_plane, _label = unique[0]
+        else:
+            items = []
+            for _, pl, lbl in unique:
+                short_lbl = str(lbl)
+                if len(short_lbl) > 24:
+                    short_lbl = short_lbl[:21] + "..."
+                items.append(f"{short_lbl} - {pl.upper()}")
+            choice, ok = QInputDialog.getItem(self, "Save Regions", "Select panel/plane to save:", items, 0, False)
+            if not ok or not choice:
+                return
+            idx = items.index(choice)
+            target_manager, target_plane, _label = unique[idx]
+        default_dir = os.path.dirname(getattr(self, "filename_path", "")) or os.getcwd()
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Regions",
+            os.path.join(default_dir, f"regions_{target_plane}.region"),
+            "Region Files (*.region.json *.region *.json);;All Files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith((".region.json", ".region", ".json")):
+            path += ".region"
+        try:
+            payload = target_manager.export_regions_to_dict(target_plane)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            QMessageBox.information(self, "Regions", f"Saved {len(payload.get('regions', []))} region(s).")
+        except Exception as exc:
+            QMessageBox.warning(self, "Regions", f"Failed to save regions: {exc}")
+
+    def load_regions_dialog(self):
+        if not hasattr(self, "region_manager"):
+            return
+        default_dir = os.path.dirname(getattr(self, "filename_path", "")) or os.getcwd()
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Regions",
+            default_dir,
+            "Region Files (*.region.json *.region *.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            # Load into main viewer
+            self.region_manager.import_regions_from_dict(payload, clear_existing=True)
+            # If region mode was off, enable it with circle mode for immediate interaction
+            if not getattr(self, "region_mode_enabled", False):
+                try:
+                    try:
+                        self.menu_bar.circle_action.setChecked(True)
+                    except Exception:
+                        pass
+                    self.set_region_shape("circle")
+                except Exception:
+                    pass
+            # Also load into any open integration result windows on the XY plane
+            if hasattr(self, "integ_result_windows"):
+                for window_ref in list(self.integ_result_windows):
+                    window = window_ref()
+                    if window is None:
+                        continue
+                    try:
+                        if getattr(window, "plane", "").lower() != "xy":
+                            continue
+                        if hasattr(window, "region_manager"):
+                            window.region_manager.import_regions_from_dict(payload, clear_existing=True)
+                    except Exception:
+                        continue
+            QMessageBox.information(self, "Regions", "Regions loaded.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Regions", f"Failed to load regions: {exc}")
 
     def open_regrid_panel(self):
         if self._regrid_panel is None:

@@ -53,7 +53,7 @@ def main():
         thread.wait()
         message = details if details else title
         if message:
-            print(f"[takefits2] {message}", file=sys.stderr)
+            print(f"[takefits] {message}", file=sys.stderr)
         app.exit(1)
 
     worker.finished.connect(on_finished)

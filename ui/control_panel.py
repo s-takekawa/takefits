@@ -257,15 +257,28 @@ class ControlPanel(QWidget):
 
     def open_chmap_settings(self):
         """Opens the Channel Map settings panel."""
+        needs_new_panel = False
         if self.chmap_settings_panel is None:
-            self.chmap_settings_panel = ChannelMapSettingPanel(self.fits_viewer, self.subwindows)
-            self.chmap_settings_panel.show()
-            try: self.chmap_settings_panel.destroyed.disconnect(self.on_chmap_settings_closed)
-            except TypeError: pass # Ignore if not connected
-            self.chmap_settings_panel.destroyed.connect(self.on_chmap_settings_closed)
+            needs_new_panel = True
         else:
-            self.chmap_settings_panel.raise_()
-            self.chmap_settings_panel.activateWindow()
+            try:
+                needs_new_panel = not self.chmap_settings_panel.isVisible()
+            except Exception:
+                # Widget may already be deleted
+                self.chmap_settings_panel = None
+                needs_new_panel = True
+
+        if needs_new_panel:
+            self.chmap_settings_panel = ChannelMapSettingPanel(self.fits_viewer, self.subwindows)
+            try:
+                self.chmap_settings_panel.destroyed.disconnect(self.on_chmap_settings_closed)
+            except Exception:
+                pass
+            self.chmap_settings_panel.destroyed.connect(self.on_chmap_settings_closed)
+
+        self.chmap_settings_panel.show()
+        self.chmap_settings_panel.raise_()
+        self.chmap_settings_panel.activateWindow()
 
     def on_chmap_settings_closed(self):
         """Slot called when Channel Map panel is closed."""

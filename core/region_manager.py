@@ -3,6 +3,10 @@ import numpy as np
 import math
 from PyQt6.QtCore import Qt, pyqtSignal, QObject
 from .region import Region
+from astropy.wcs.utils import proj_plane_pixel_scales, wcs_to_celestial_frame
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+from core.common import Common
 
 class RegionManager(QObject):
     """
@@ -33,7 +37,8 @@ class RegionManager(QObject):
         self.shift_pressed = False
         self.region_editors = {}
         self.drag_initiated = False
-        
+        self._axes_cache = {}
+
 
     def set_region_mode(self, mode):
         """Sets the shape of the region to be drawn."""
@@ -824,6 +829,14 @@ class RegionManager(QObject):
         else:
             return
 
+        style_params = params.get('style')
+        if isinstance(style_params, dict):
+            region.update_style_attributes(
+                color=style_params.get('color'),
+                linewidth=style_params.get('linewidth'),
+                linestyle=style_params.get('linestyle')
+            )
+
         region.update_visual()
         self._request_overlay_redraw()
         #self._notify_region_changed(region)
@@ -918,3 +931,400 @@ class RegionManager(QObject):
         """
         for region in list(self.regions):
             self.delete_region(region)
+
+    # ------------------------------------------------------------------
+    # Plane/axes helpers for persistence
+    def _axes_for_plane(self, plane: str):
+        """Resolve overlay axes for a plane name."""
+        plane_lower = (plane or "xy").lower()
+        viewer = self.viewer
+        if viewer is not None:
+            if plane_lower == "xy":
+                return getattr(viewer, "overlay_ax", getattr(viewer, "overlay_ax_xy", None))
+            if plane_lower == "xz":
+                return getattr(viewer, "overlay_ax_xz", None)
+            if plane_lower == "zy":
+                return getattr(viewer, "overlay_ax_zy", None)
+        import core.common as common
+        if plane_lower == "xy":
+            return getattr(common.Common, "overlay_ax_xy", None)
+        if plane_lower == "xz":
+            return getattr(common.Common, "overlay_ax_xz", None)
+        if plane_lower == "zy":
+            return getattr(common.Common, "overlay_ax_zy", None)
+        return None
+
+    def _plane_for_axes(self, axes) -> str:
+        """Infer plane name from axes reference."""
+        if axes is None:
+            return "xy"
+        viewer = self.viewer
+        mapping = {}
+        if viewer is not None:
+            mapping.update({
+                getattr(viewer, "overlay_ax", None): "xy",
+                getattr(viewer, "overlay_ax_xy", None): "xy",
+                getattr(viewer, "overlay_ax_xz", None): "xz",
+                getattr(viewer, "overlay_ax_zy", None): "zy",
+            })
+        import core.common as common
+        mapping.update({
+            getattr(common.Common, "overlay_ax_xy", None): "xy",
+            getattr(common.Common, "overlay_ax_xz", None): "xz",
+            getattr(common.Common, "overlay_ax_zy", None): "zy",
+        })
+        return mapping.get(axes, "xy")
+
+    def _region_kind(self, region: Region) -> str:
+        if isinstance(region, CircleRegion):
+            return "circle"
+        if isinstance(region, CubeRegion):
+            return "cube"
+        if isinstance(region, RectangleRegion):
+            return "rectangle"
+        if isinstance(region, EllipseRegion):
+            return "ellipse"
+        return region.__class__.__name__.lower()
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    def _plane_axis_indices(self, plane: str, wcs) -> tuple[int, int] | None:
+        if wcs is None:
+            return None
+        plane_lower = (plane or "xy").lower()
+        mapping = {"xy": (0, 1), "xz": (0, 2), "zy": (2, 1)}
+        axes = mapping.get(plane_lower)
+        if axes is None:
+            return None
+        naxis = getattr(wcs, "naxis", 0) or 0
+        if naxis <= max(axes):
+            return None
+        return axes
+
+    def _pixel_scales_deg(self, plane: str, wcs) -> tuple[float, float] | None:
+        indices = self._plane_axis_indices(plane, wcs)
+        if indices is None:
+            return None
+        try:
+            scales = proj_plane_pixel_scales(wcs)
+            if scales is None or len(scales) <= max(indices):
+                return None
+            vals: list[float] = []
+            for idx in indices:
+                val = scales[idx]
+                try:
+                    vals.append(abs(val.to_value("deg")))
+                except Exception:
+                    vals.append(abs(float(val)))
+            return (vals[0], vals[1])
+        except Exception:
+            return None
+
+    def _world_frame_from_wcs(self, wcs) -> str | None:
+        if wcs is None:
+            return None
+        try:
+            frame = wcs_to_celestial_frame(wcs)
+            if frame is None:
+                return None
+            name = getattr(frame, "name", None) or frame.__class__.__name__
+            return str(name)
+        except Exception:
+            return None
+
+    def _world_center_to_pix(self, world_center, source_frame: str | None, plane: str, wcs):
+        """Convert a 2-tuple world center to pixel using the target WCS and plane axes."""
+        if world_center is None or wcs is None:
+            return None
+        axes = self._plane_axis_indices(plane, wcs)
+        if axes is None:
+            return None
+        try:
+            target_frame = wcs_to_celestial_frame(wcs)
+        except Exception:
+            target_frame = None
+        lon, lat = world_center[:2]
+        # Transform if frames differ and celestial frame is available.
+        if target_frame is not None and source_frame:
+            try:
+                sky = SkyCoord(lon, lat, unit=u.deg, frame=source_frame.lower())
+                sky_t = sky.transform_to(target_frame)
+                lon = sky_t.spherical.lon.deg
+                lat = sky_t.spherical.lat.deg
+            except Exception:
+                pass
+        try:
+            naxis = max(getattr(wcs, "naxis", 2), max(axes) + 1)
+            vec = [0.0] * naxis
+            # Fill with current world slice values for non-plane axes
+            if naxis > 0:
+                vec[0] = float(getattr(Common, "world_x", 0.0))
+            if naxis > 1:
+                vec[1] = float(getattr(Common, "world_y", 0.0))
+            if naxis > 2:
+                vec[2] = float(getattr(Common, "world_z", 0.0))
+            if naxis > 3:
+                vec[3] = float(getattr(Common, "world_s", 0.0))
+            vec[axes[0]] = float(lon)
+            vec[axes[1]] = float(lat)
+            pix = wcs.wcs_world2pix([vec], 0)[0]
+            return (float(pix[axes[0]]), float(pix[axes[1]]))
+        except Exception:
+            return None
+
+    def _rotation_transform(self, angle_deg: float, source_frame: str | None, target_frame) -> float:
+        """
+        Approximate rotation transform between frames.
+        Assumes small-angle local projection; if frames differ, reuse the same angle.
+        """
+        if source_frame is None or target_frame is None:
+            return angle_deg
+        try:
+            src_name = str(source_frame).lower()
+            tgt_name = str(getattr(target_frame, "name", None) or target_frame.__class__.__name__).lower()
+            if src_name == tgt_name:
+                return angle_deg
+        except Exception:
+            return angle_deg
+        # Fallback: keep the angle; refining would require Jacobian at center.
+        return angle_deg
+
+    def _transform_angle_via_center(self, angle_deg: float, center_world, source_frame: str | None, plane: str, wcs) -> float:
+        """Transform an orientation angle using local projection around center."""
+        if angle_deg is None or center_world is None or wcs is None:
+            return angle_deg
+        axes = self._plane_axis_indices(plane, wcs)
+        if axes is None:
+            return angle_deg
+        try:
+            # Build a small offset along the angle direction in the source frame.
+            lon, lat = center_world[:2]
+            src_frame = source_frame.lower() if source_frame else None
+            sky_center = SkyCoord(lon * u.deg, lat * u.deg, frame=src_frame) if src_frame else SkyCoord(lon * u.deg, lat * u.deg)
+            # 1 arcsec offset along angle
+            offset = sky_center.directional_offset_by(angle_deg * u.deg, 1.0 * u.arcsec)
+            tgt_frame = wcs_to_celestial_frame(wcs)
+            if tgt_frame is not None:
+                sky_center = sky_center.transform_to(tgt_frame)
+                offset = offset.transform_to(tgt_frame)
+            # Convert to pixel in target WCS
+            naxis = max(getattr(wcs, "naxis", 2), max(axes) + 1)
+            vec_center = [0.0] * naxis
+            vec_center[axes[0]] = float(sky_center.spherical.lon.deg)
+            vec_center[axes[1]] = float(sky_center.spherical.lat.deg)
+            if naxis > 2:
+                vec_center[2] = float(getattr(Common, "world_z", 0.0))
+            if naxis > 3:
+                vec_center[3] = float(getattr(Common, "world_s", 0.0))
+            pix_c = wcs.wcs_world2pix([vec_center], 0)[0]
+            vec_off = [0.0] * naxis
+            vec_off[axes[0]] = float(offset.spherical.lon.deg)
+            vec_off[axes[1]] = float(offset.spherical.lat.deg)
+            if naxis > 2:
+                vec_off[2] = float(getattr(Common, "world_z", 0.0))
+            if naxis > 3:
+                vec_off[3] = float(getattr(Common, "world_s", 0.0))
+            pix_o = wcs.wcs_world2pix([vec_off], 0)[0]
+            dx = float(pix_o[axes[0]] - pix_c[axes[0]])
+            dy = float(pix_o[axes[1]] - pix_c[axes[1]])
+            if math.isfinite(dx) and math.isfinite(dy) and abs(dx) + abs(dy) > 0:
+                return float(math.degrees(math.atan2(dy, dx)))
+        except Exception:
+            return angle_deg
+        return angle_deg
+
+    def export_regions_to_dict(self, plane: str | None = None) -> dict:
+        """Serialize regions (all or by plane) to a dict, embedding world info when possible."""
+        entries = []
+        target_plane = plane.lower() if plane else None
+        viewer = self.viewer
+        wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        world_frame = self._world_frame_from_wcs(wcs)
+        for region in self.regions:
+            plane_name = getattr(region, "plane", None) or self._plane_for_axes(region.axes)
+            if target_plane and plane_name != target_plane:
+                continue
+            state = region.get_state()
+            world_state = {}
+            axes = self._plane_axis_indices(plane_name, wcs)
+            # Center in world coordinates
+            center = None
+            if hasattr(region, "center"):
+                center = getattr(region, "center", None)
+            elif hasattr(region, "xy") and hasattr(region, "width") and hasattr(region, "height"):
+                xy = getattr(region, "xy", None)
+                if xy is not None:
+                    center = (xy[0] + region.width / 2.0, xy[1] + region.height / 2.0)
+            if wcs is not None and axes is not None and center is not None:
+                try:
+                    pix_vec = [0.0] * max(getattr(wcs, "naxis", 2), 2)
+                    pix_vec[axes[0]] = float(center[0])
+                    pix_vec[axes[1]] = float(center[1])
+                    world_vec = wcs.wcs_pix2world([pix_vec], 0)[0]
+                    world_state["center"] = [float(world_vec[axes[0]]), float(world_vec[axes[1]])]
+                except Exception:
+                    world_state = {}
+            scales = self._pixel_scales_deg(plane_name, wcs)
+            if scales is not None:
+                if isinstance(region, CircleRegion):
+                    world_state["radius_deg"] = float(region.radius) * scales[0]
+                elif isinstance(region, (RectangleRegion, EllipseRegion, CubeRegion)):
+                    world_state["width_deg"] = float(region.width) * scales[0]
+                    world_state["height_deg"] = float(region.height) * scales[1]
+                    world_state["angle_deg"] = float(getattr(region, "angle", 0.0) or 0.0)
+                    # Capture axis endpoints in world to preserve orientation/scale under frame changes
+                    try:
+                        rad = math.radians(float(getattr(region, "angle", 0.0) or 0.0))
+                        half_w = float(region.width) / 2.0
+                        half_h = float(region.height) / 2.0
+                        dx_w = half_w * math.cos(rad)
+                        dy_w = half_w * math.sin(rad)
+                        dx_h = -half_h * math.sin(rad)
+                        dy_h = half_h * math.cos(rad)
+                        cx, cy = center
+                        width_pt = (cx + dx_w, cy + dy_w)
+                        height_pt = (cx + dx_h, cy + dy_h)
+                        vec_w = [0.0] * max(getattr(wcs, "naxis", 2), 2)
+                        vec_h = list(vec_w)
+                        vec_w[axes[0]], vec_w[axes[1]] = width_pt
+                        vec_h[axes[0]], vec_h[axes[1]] = height_pt
+                        world_w = wcs.wcs_pix2world([vec_w], 0)[0]
+                        world_h = wcs.wcs_pix2world([vec_h], 0)[0]
+                        world_state["axes"] = {
+                            "width": [float(world_w[axes[0]]), float(world_w[axes[1]])],
+                            "height": [float(world_h[axes[0]]), float(world_h[axes[1]])],
+                        }
+                    except Exception:
+                        pass
+            entries.append(
+                {
+                    "id": getattr(region, "region_id", None),
+                    "kind": self._region_kind(region),
+                    "plane": plane_name,
+                    "state": state,
+                    "world": world_state,
+                }
+            )
+        return {
+            "format": "takefits.region",
+            "version": 1,
+            "plane": target_plane or "all",
+            "regions": entries,
+            "world_frame": world_frame,
+        }
+
+    def _region_from_state(self, kind: str, state: dict) -> Region | None:
+        if kind == "circle":
+            region = CircleRegion(state.get("center", (0, 0)), state.get("radius", 1.0), style=state.get("style"))
+        elif kind == "rectangle":
+            region = RectangleRegion(state.get("xy", (0, 0)), state.get("width", 1.0), state.get("height", 1.0), style=state.get("style"))
+            region.set_angle(state.get("angle", 0.0))
+        elif kind == "ellipse":
+            region = EllipseRegion(state.get("center", (0, 0)), state.get("width", 1.0), state.get("height", 1.0), style=state.get("style"))
+            region.set_angle(state.get("angle", 0.0))
+        elif kind == "cube":
+            region = CubeRegion(state.get("xy", (0, 0)), state.get("width", 1.0), state.get("height", 1.0), state.get("z_min", 0), state.get("z_max", 1), style=state.get("style"))
+            region.set_angle(state.get("angle", 0.0))
+        else:
+            return None
+        label = state.get("label", "")
+        if label:
+            region.set_label_text(label)
+        return region
+
+    def import_regions_from_dict(self, payload: dict, clear_existing: bool = True) -> None:
+        """Load regions from serialized dict. Falls back to world geometry when available."""
+        if payload.get("format") != "takefits.region":
+            raise ValueError("Unsupported region file format")
+        version = int(payload.get("version", 0))
+        if version != 1:
+            raise ValueError(f"Unsupported region format version: {version}")
+        regions_payload = payload.get("regions") or []
+        source_frame = payload.get("world_frame")
+        if clear_existing:
+            self.delete_all_regions()
+        added_any = False
+        viewer = self.viewer
+        wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        for entry in regions_payload:
+            kind = entry.get("kind")
+            plane = (entry.get("plane") or payload.get("plane") or "xy").lower()
+            state = entry.get("state") or {}
+            world_state = entry.get("world") or {}
+            axes = self._plane_axis_indices(plane, wcs)
+            scales = self._pixel_scales_deg(plane, wcs) if wcs is not None else None
+            # Apply world geometry if available
+            center_world = world_state.get("center")
+            center_pix = None
+            if axes is not None and wcs is not None and center_world and len(center_world) >= 2:
+                pix_center = self._world_center_to_pix(center_world, source_frame, plane, wcs)
+                if pix_center is not None:
+                    cx, cy = pix_center
+                    center_pix = (cx, cy)
+                    if "center" in state:
+                        state["center"] = (cx, cy)
+                    if "width" in state and "height" in state:
+                        state["xy"] = (cx - state["width"] / 2.0, cy - state["height"] / 2.0)
+            if scales is not None:
+                if "radius_deg" in world_state:
+                    try:
+                        state["radius"] = float(world_state["radius_deg"]) / scales[0]
+                    except Exception:
+                        pass
+                if "width_deg" in world_state and "height_deg" in world_state:
+                    try:
+                        state["width"] = float(world_state["width_deg"]) / scales[0]
+                        state["height"] = float(world_state["height_deg"]) / scales[1]
+                    except Exception:
+                        pass
+                if "angle_deg" in world_state:
+                    ang = float(world_state["angle_deg"])
+                    ang = self._transform_angle_via_center(ang, center_world, source_frame, plane, wcs)
+                    state["angle"] = ang
+            # If axis endpoints are available, prefer them to recover width/height/angle
+            axes_world = world_state.get("axes") if isinstance(world_state, dict) else None
+            if axes_world and axes is not None and wcs is not None:
+                width_world = axes_world.get("width")
+                height_world = axes_world.get("height")
+                if center_pix is None and center_world is not None:
+                    center_pix = self._world_center_to_pix(center_world, source_frame, plane, wcs)
+                if center_pix is not None:
+                    cx, cy = center_pix
+                    def _world_pt_to_pix(pt):
+                        if pt is None or len(pt) < 2:
+                            return None
+                        return self._world_center_to_pix(pt, source_frame, plane, wcs)
+                    w_pix = _world_pt_to_pix(width_world)
+                    h_pix = _world_pt_to_pix(height_world)
+                    if w_pix is not None and h_pix is not None:
+                        wx, wy = w_pix
+                        hx, hy = h_pix
+                        vx = wx - cx
+                        vy = wy - cy
+                        ux = hx - cx
+                        uy = hy - cy
+                        width_len = math.hypot(vx, vy) * 2.0
+                        height_len = math.hypot(ux, uy) * 2.0
+                        if width_len > 0 and height_len > 0:
+                            state["width"] = width_len
+                            state["height"] = height_len
+                            state["angle"] = math.degrees(math.atan2(vy, vx))
+                            state["center"] = (cx, cy)
+                            state["xy"] = (cx - width_len / 2.0, cy - height_len / 2.0)
+            region = self._region_from_state(kind, state)
+            if region is None:
+                continue
+            axes = self._axes_for_plane(plane)
+            if axes is None:
+                continue
+            region.plane = plane
+            region.region_id = RegionManager._global_region_counter
+            RegionManager._global_region_counter += 1
+            region.add_to_axes(axes)
+            region.update_visual() if hasattr(region, "update_visual") else None
+            self.regions.append(region)
+            added_any = True
+        if added_any:
+            self._request_overlay_redraw()
+        else:
+            raise ValueError("No regions could be loaded for this viewer.")

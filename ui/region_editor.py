@@ -28,6 +28,29 @@ from core.common import Common
 class RegionEditorDialog(QDialog):
     """Editable dialog for inspecting and tweaking region geometry."""
 
+    LINE_COLOR_OPTIONS = [
+        "lime",
+        "blue",
+        "red",
+        "green",
+        "cyan",
+        "magenta",
+        "black",
+        "white",
+        "gray",
+        "orange",
+        "purple",
+        "yellow",
+        "yellowgreen",
+        "olive",
+    ]
+
+    LINE_STYLE_OPTIONS = [
+        ("Solid", "solid"),
+        ("Dashed", "dashed"),
+        ("Dotted", "dotted"),
+    ]
+
     def __init__(self, viewer, region, region_manager):
         super().__init__(viewer)
         self.viewer = viewer
@@ -66,6 +89,22 @@ class RegionEditorDialog(QDialog):
         self.nameEdit = QLineEdit()
         self.nameEdit.setPlaceholderText("Region label")
         form.addRow("Label", self.nameEdit)
+
+        self.line_color_combo = QComboBox()
+        for color in self.LINE_COLOR_OPTIONS:
+            self.line_color_combo.addItem(color.title(), color)
+        form.addRow("Line Color", self.line_color_combo)
+
+        self.line_style_combo = QComboBox()
+        for label, value in self.LINE_STYLE_OPTIONS:
+            self.line_style_combo.addItem(label, value)
+        form.addRow("Line Style", self.line_style_combo)
+
+        self.linewidth_spin = QDoubleSpinBox()
+        self.linewidth_spin.setDecimals(2)
+        self.linewidth_spin.setRange(0.1, 20.0)
+        self.linewidth_spin.setSingleStep(0.1)
+        form.addRow("Line Width", self.linewidth_spin)
         
         self.center_x_spin = self._make_spinbox()
         self.center_y_spin = self._make_spinbox()
@@ -244,6 +283,9 @@ class RegionEditorDialog(QDialog):
         self.fill_view_button.clicked.connect(self._on_fill_the_view_clicked)
         self.cutout_button.clicked.connect(self._open_cutout_dialog)
         self.moments_button.clicked.connect(self._show_moment_results)
+        self.line_color_combo.currentIndexChanged.connect(self._on_style_control_changed)
+        self.line_style_combo.currentIndexChanged.connect(self._on_style_control_changed)
+        self.linewidth_spin.valueChanged.connect(self._on_style_control_changed)
 
     def _make_spinbox(self):
         spin = QDoubleSpinBox()
@@ -277,6 +319,36 @@ class RegionEditorDialog(QDialog):
         self._pixel_limit = max(width_limit, height_limit) * 2.0
         for spin in (self.center_x_spin, self.center_y_spin):
             spin.setRange(-self._pixel_limit, self._pixel_limit)
+
+    def _set_combo_value(self, combo, value, formatter=None):
+        combo.blockSignals(True)
+        index = combo.findData(value)
+        if index == -1 and value is not None:
+            label = formatter(value) if callable(formatter) else str(value)
+            combo.addItem(label, value)
+            index = combo.count() - 1
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _update_style_controls(self):
+        base_style = {}
+        getter = getattr(self.region, 'get_style_attributes', None)
+        if callable(getter):
+            base_style = getter()
+        elif isinstance(getattr(self.region, 'style', None), dict):
+            base_style = self.region.style
+
+        color_value = base_style.get('color', 'lime')
+        linewidth_value = float(base_style.get('linewidth', 1.0) or 1.0)
+        linestyle_value = base_style.get('linestyle', 'solid')
+
+        self._set_combo_value(self.line_color_combo, color_value, formatter=lambda v: v.title())
+        self._set_combo_value(self.line_style_combo, linestyle_value)
+
+        self.linewidth_spin.blockSignals(True)
+        self.linewidth_spin.setValue(linewidth_value)
+        self.linewidth_spin.blockSignals(False)
 
 
 
@@ -783,6 +855,7 @@ class RegionEditorDialog(QDialog):
         self._update_label_field()
         self._refresh_unit_controls()
         self._update_world_fields()
+        self._update_style_controls()
         self._updating_fields = False
 
         self.moments_button.setVisible(True)
@@ -821,6 +894,11 @@ class RegionEditorDialog(QDialog):
         else:
             self.apply_button.setEnabled(True)
 
+    def _on_style_control_changed(self, *_):
+        if self._updating_fields:
+            return
+        self._on_value_changed(None)
+
     def _on_auto_apply_changed(self, *_args):
         auto = self.auto_apply_checkbox.isChecked()
         self.apply_button.setEnabled(not auto)
@@ -846,6 +924,11 @@ class RegionEditorDialog(QDialog):
             if isinstance(self.region, CubeRegion):
                 params['z_min'] = self.z_min_spin.value()
                 params['z_max'] = self.z_max_spin.value()
+        params['style'] = {
+            'color': self.line_color_combo.currentData() or self.line_color_combo.currentText(),
+            'linewidth': self.linewidth_spin.value(),
+            'linestyle': self.line_style_combo.currentData() or self.line_style_combo.currentText(),
+        }
 
         self.region_manager.update_region_from_editor(self.region, params)
         

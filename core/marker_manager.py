@@ -6,7 +6,8 @@ import math
 import numpy as np
 
 from astropy import units as u
-from astropy.wcs.utils import proj_plane_pixel_scales
+from astropy.coordinates import SkyCoord
+from astropy.wcs.utils import proj_plane_pixel_scales, skycoord_to_pixel, wcs_to_celestial_frame
 from PyQt6.QtCore import QObject, pyqtSignal, Qt
 
 from .common import Common
@@ -16,6 +17,7 @@ from .marker import (
     MarkerId,
     MarkerState,
     PlaneId,
+    MarkerStyle,
     marker_from_state,
     serialize_marker_states,
     deserialize_marker_states,
@@ -23,6 +25,167 @@ from .marker import (
     LineMarker,
     TextMarker,
 )
+
+FRAME_ALIASES = {
+    "ICRS": "ICRS",
+    "FK5": "FK5",
+    "J2000": "FK5",
+    "FK4": "FK4",
+    "B1950": "FK4",
+    "GAL": "GALACTIC",
+    "GALACTIC": "GALACTIC",
+}
+
+
+def _normalize_frame_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    upper = str(name).strip().upper()
+    return FRAME_ALIASES.get(upper, upper if upper in {"ICRS", "FK5", "FK4", "GALACTIC"} else None)
+
+
+def _frame_name_from_frame(frame: Optional[object]) -> Optional[str]:
+    if frame is None:
+        return None
+    try:
+        candidate = getattr(frame, "name", None)
+        if candidate:
+            normalized = _normalize_frame_name(candidate)
+            if normalized:
+                return normalized
+    except Exception:
+        pass
+    return _normalize_frame_name(frame.__class__.__name__)
+
+
+def _frame_name_from_wcs(wcs: Optional[object]) -> Optional[str]:
+    if wcs is None:
+        return None
+    try:
+        frame = wcs_to_celestial_frame(wcs)
+    except Exception:
+        frame = None
+    return _frame_name_from_frame(frame)
+
+
+def _make_skycoord(coords: np.ndarray, frame_name: Optional[str]) -> Optional[SkyCoord]:
+    name = _normalize_frame_name(frame_name)
+    if name is None:
+        return None
+    lon = coords[:, 0] * u.deg
+    lat = coords[:, 1] * u.deg
+    try:
+        if name == "ICRS":
+            return SkyCoord(lon, lat, frame="icrs")
+        if name == "FK5":
+            return SkyCoord(lon, lat, frame="fk5")
+        if name == "FK4":
+            return SkyCoord(lon, lat, frame="fk4")
+        if name == "GALACTIC":
+            return SkyCoord(lon, lat, frame="galactic")
+    except Exception:
+        return None
+    return None
+
+
+def _world_to_pixel(
+    world: Optional[Tuple[float, ...]],
+    wcs: Optional[object],
+    frame_hint: Optional[str],
+) -> Optional[Tuple[float, float]]:
+    if wcs is None or world is None:
+        return None
+    arr = np.asarray(world, dtype=float)
+    arr = np.atleast_2d(arr)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        return None
+    coord = _make_skycoord(arr, frame_hint) or _make_skycoord(arr, _frame_name_from_wcs(wcs))
+    if coord is None:
+        try:
+            coord = SkyCoord(arr[:, 0] * u.deg, arr[:, 1] * u.deg)
+        except Exception:
+            return None
+
+    # Prefer celestial WCS to avoid axes beyond RA/Dec when projecting endpoints.
+    candidate_wcs = getattr(wcs, "celestial", None) or wcs
+    try:
+        px, py = skycoord_to_pixel(coord, candidate_wcs, origin=0)
+    except Exception:
+        return None
+    px_arr = np.asarray(px, dtype=float).ravel()
+    py_arr = np.asarray(py, dtype=float).ravel()
+    if px_arr.size == 0 or py_arr.size == 0:
+        return None
+    x_val, y_val = float(px_arr[0]), float(py_arr[0])
+    if not (math.isfinite(x_val) and math.isfinite(y_val)):
+        return None
+    return x_val, y_val
+
+
+def _world_to_pixel_with_converter(
+    world: Optional[Tuple[float, float]],
+    plane: PlaneId,
+    wcs: Optional[object],
+    converter,
+    axis_indices: Optional[Tuple[int, int]],
+    frame_hint: Optional[str],
+) -> Optional[Tuple[float, float]]:
+    base_plane = (plane or "xy").lower()
+
+    # Prefer converter for non-celestial plane mixes (e.g., xz/zy) to avoid treating spectral axes as Dec.
+    prefer_converter_first = base_plane not in {"xy"}
+
+    def _via_converter() -> Optional[Tuple[float, float]]:
+        if world is None or wcs is None:
+            return None
+        indices = axis_indices
+        if indices is None:
+            indices = _plane_axis_indices(plane, wcs)
+        if indices is None:
+            return None
+        try:
+            naxis = getattr(wcs, "naxis", 0) or 0
+            length = max(naxis, max(indices) + 1)
+            vector = [0.0] * length
+            # Seed with current slice/world values to keep non-plane axes stable.
+            vector[0] = float(getattr(Common, "world_x", 0.0))
+            if length > 1:
+                vector[1] = float(getattr(Common, "world_y", 0.0))
+            if length > 2:
+                vector[2] = float(getattr(Common, "world_z", 0.0))
+            if length > 3:
+                vector[3] = float(getattr(Common, "world_s", 0.0))
+            try:
+                vector[indices[0]] = float(world[0])
+                vector[indices[1]] = float(world[1])
+            except Exception:
+                return None
+            # Prefer raw WCS transform to avoid converter axis assumptions.
+            try:
+                pix = wcs.wcs_world2pix([vector], 0)[0]
+                x_val = float(pix[indices[0]])
+                y_val = float(pix[indices[1]])
+                if math.isfinite(x_val) and math.isfinite(y_val):
+                    return x_val, y_val
+            except Exception:
+                pass
+            if converter is not None:
+                result = converter.world_to_pix(*vector)
+                if isinstance(result, (list, tuple)) and len(result) >= max(indices) + 1:
+                    x_val = float(result[indices[0]])
+                    y_val = float(result[indices[1]])
+                    if math.isfinite(x_val) and math.isfinite(y_val):
+                        return x_val, y_val
+        except Exception:
+            return None
+        return None
+
+    def _via_skycoord() -> Optional[Tuple[float, float]]:
+        return _world_to_pixel(world, wcs, frame_hint)
+
+    if prefer_converter_first:
+        return _via_converter() or _via_skycoord()
+    return _via_skycoord() or _via_converter()
 
 
 @dataclass
@@ -63,6 +226,12 @@ class MarkerManager(QObject):
         self._pending_placement: Optional[Dict[str, object]] = None
         self._placement_continuous: bool = False
         self._handle_cursor = Qt.CursorShape.CrossCursor
+        self._shift_active = False
+        self._rotation_mode = False
+        self._rotation_center: Optional[Tuple[float, float]] = None
+        self._rotation_reference_angle: Optional[float] = None
+        self._rotation_targets: List[Marker] = []
+        self._rotation_initial_angles: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Plane/layer bookkeeping
@@ -216,6 +385,25 @@ class MarkerManager(QObject):
         self.markers_changed.emit(marker.plane)
         self.redraw_plane(marker.plane)
 
+    def refresh_world_coordinates(self, plane: Optional[PlaneId] = None) -> None:
+        """Recompute world coordinates for markers on the given plane(s)."""
+        target_planes: Iterable[PlaneId]
+        if plane is None:
+            target_planes = tuple(self._layers.keys())
+        else:
+            target_planes = (plane,)
+        for plane_id in target_planes:
+            layer = self._layers.get(plane_id)
+            if layer is None:
+                continue
+            viewer = self._viewer_for_plane(plane_id)
+            wcs = getattr(viewer, "wcs", None)
+            frame_name = _frame_name_from_wcs(wcs)
+            if frame_name:
+                layer.world_frame = frame_name
+            for marker in layer.markers.values():
+                self._update_marker_world(marker)
+
     # Placement helpers ------------------------------------------------
     def begin_placement(
         self,
@@ -272,24 +460,242 @@ class MarkerManager(QObject):
         layer = self._layers.get(plane)
         if layer is None:
             layer = MarkerLayer(plane=plane, markers={})
-        return serialize_marker_states(layer.states(), plane=layer.plane, world_frame=layer.world_frame)
+        self.refresh_world_coordinates(plane)
+        # Always prefer the current viewer's frame; override stale cached frame.
+        current_frame = self.world_frame_for_plane(plane)
+        if current_frame:
+            layer.world_frame = current_frame
+        world_frame = layer.world_frame or current_frame
+        states = layer.states()
+        viewer = self._viewer_for_plane(plane)
+        format_pix = getattr(viewer, "format_pix", None) if viewer else None
+        wcs = getattr(viewer, "wcs", None) if viewer else None
+        base_plane = self._base_plane_for(plane)
+
+        # Attach world endpoints for lines so orientation survives frame changes on load.
+        if format_pix is not None and wcs is not None:
+            for marker_id, state in list(states.items()):
+                marker = layer.markers.get(marker_id)
+                if not isinstance(marker, LineMarker):
+                    continue
+                try:
+                    start, end = marker._endpoints()
+                    wx0, wy0 = format_pix.pix_to_wcs(wcs, start[0], start[1], base_plane)
+                    wx1, wy1 = format_pix.pix_to_wcs(wcs, end[0], end[1], base_plane)
+                    meta = dict(state.metadata)
+                    meta["pixel_endpoints"] = [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))]
+                    meta["world_endpoints"] = [(float(wx0), float(wy0)), (float(wx1), float(wy1))]
+                    state.metadata = meta
+                except Exception:
+                    continue
+
+        return serialize_marker_states(states, plane=layer.plane, world_frame=world_frame)
 
     def import_from_dict(self, payload: Dict[str, object]) -> PlaneId:
         plane, world_frame, states = deserialize_marker_states(payload)
-        layer = self.ensure_plane(plane)
-        layer.world_frame = world_frame
-        # Remove existing markers before importing
-        for marker in layer.markers.values():
-            marker.remove_from_axes()
-        layer.markers.clear()
+        remapper = getattr(self.viewer, "remap_loaded_marker_state", None)
+        host_viewer = self.viewer
+
+        # First pass: determine target planes per state.
+        targets_by_state: List[Tuple[MarkerState, List[str]]] = []
+        planes_to_clear: set[str] = set()
+        first_target_plane: Optional[str] = None
         for state in states.values():
-            marker = marker_from_state(state)
-            self._attach_marker(marker)
-            layer.markers[marker.marker_id] = marker
-            if marker.world is None:
-                self._update_marker_world(marker)
-        self.markers_changed.emit(plane)
-        return plane
+            mapped: Optional[Iterable[str]] = None
+            if callable(remapper):
+                try:
+                    mapped = remapper(state, source_plane=plane, world_frame=world_frame)
+                except Exception:
+                    mapped = None
+            target_planes = list(dict.fromkeys(mapped)) if mapped else [state.plane or plane]
+            # Keep only planes the host viewer can display.
+            supported_targets: List[str] = []
+            for tp in target_planes:
+                if self._viewer_handles_plane(host_viewer, tp):
+                    supported_targets.append(tp)
+            targets_by_state.append((state, supported_targets))
+            if supported_targets:
+                planes_to_clear.update(supported_targets)
+                if first_target_plane is None:
+                    first_target_plane = supported_targets[0]
+
+        if not planes_to_clear:
+            raise ValueError(f"No compatible marker planes for file plane '{plane}'.")
+
+        # Clear existing markers on affected planes.
+        for target_plane in planes_to_clear:
+            self.clear_plane(target_plane)
+
+        planes_changed: set[str] = set()
+        primary_plane = plane
+        imported_any = False
+
+        for state, target_planes in targets_by_state:
+            if not target_planes:
+                continue
+            for idx, target_plane in enumerate(target_planes):
+                state_copy = state
+                if len(target_planes) > 1 or idx > 0:
+                    # Clone to keep marker ids unique across planes
+                    state_copy = MarkerState.from_dict(state.to_dict())
+                state_copy.plane = target_plane
+                layer = self.ensure_plane(target_plane)
+                if world_frame and not layer.world_frame:
+                    layer.world_frame = world_frame
+
+                viewer = self._viewer_for_plane(target_plane)
+                target_wcs = getattr(viewer, "wcs", None)
+                converter = getattr(viewer, "converter", None)
+                axis_indices = self._plane_axis_indices(target_plane, target_wcs)
+                # If line markers carry world endpoints, re-derive geometry in target frame.
+                resolved_from_endpoints = False
+                if state_copy.kind == LineMarker.kind and target_wcs is not None:
+                    base_meta = state_copy.metadata if isinstance(state_copy.metadata, dict) else {}
+                    raw_length_val = base_meta.get("length_source", base_meta.get("length"))
+                    unit_val = base_meta.get("unit", "pixel")
+                    raw_length_px = None
+                    if raw_length_val is not None:
+                        try:
+                            raw_length_px = self._length_pixels_from_unit(raw_length_val, unit_val, target_plane)
+                        except Exception:
+                            raw_length_px = None
+                    endpoints = state_copy.metadata.get("world_endpoints") if isinstance(state_copy.metadata, dict) else None
+                    if endpoints and len(endpoints) == 2:
+                        try:
+                            px0 = _world_to_pixel_with_converter(endpoints[0], target_plane, target_wcs, converter, axis_indices, world_frame)
+                            px1 = _world_to_pixel_with_converter(endpoints[1], target_plane, target_wcs, converter, axis_indices, world_frame)
+                        except Exception:
+                            px0 = px1 = None
+                        if px0 is not None and px1 is not None:
+                            sx, sy = px0
+                            ex, ey = px1
+                            cx, cy = (sx + ex) / 2.0, (sy + ey) / 2.0
+                            dx, dy = ex - sx, ey - sy
+                            length_from_endpoints = float(math.hypot(dx, dy))
+                            angle_deg = float(math.degrees(math.atan2(dy, dx)))
+                            if length_from_endpoints < 1e-6:
+                                angle_deg = float(base_meta.get("angle_deg", angle_deg))
+                            # Prefer the original length converted to target pixels if available;
+                            # fall back to the projected endpoint length.
+                            length_px_final = raw_length_px if raw_length_px is not None else length_from_endpoints
+                            meta = dict(base_meta)
+                            if length_px_final is None:
+                                length_px_final = length_from_endpoints
+                            # If projection jumps far from the stored center, treat as bad and fall back.
+                            stored_center = state_copy.pixel if state_copy.pixel else (cx, cy)
+                            delta_center = math.hypot(cx - stored_center[0], cy - stored_center[1])
+                            length_guard = max(length_px_final or 0.0, length_from_endpoints)
+                            if delta_center > max(length_guard * 3.0, 1000.0):
+                                resolved_from_endpoints = False
+                                state_copy.pixel = stored_center
+                            else:
+                                meta["length"] = length_px_final
+                                if raw_length_val is not None:
+                                    meta["length_source"] = raw_length_val
+                                else:
+                                    meta["length_source"] = length_px_final
+                                meta["angle_deg"] = angle_deg
+                                state_copy.metadata = meta
+                                state_copy.pixel = (cx, cy)
+                                state_copy.world = None
+                                resolved_from_endpoints = True
+                    if not resolved_from_endpoints:
+                        pix_endpoints = base_meta.get("pixel_endpoints")
+                        if pix_endpoints and len(pix_endpoints) == 2:
+                            try:
+                                sx, sy = float(pix_endpoints[0][0]), float(pix_endpoints[0][1])
+                                ex, ey = float(pix_endpoints[1][0]), float(pix_endpoints[1][1])
+                                cx, cy = (sx + ex) / 2.0, (sy + ey) / 2.0
+                                dx, dy = ex - sx, ey - sy
+                                length_from_pix = float(math.hypot(dx, dy))
+                                angle_deg = float(math.degrees(math.atan2(dy, dx)))
+                                meta = dict(base_meta)
+                                length_px_final = raw_length_px if raw_length_px is not None else length_from_pix
+                                if length_px_final is None or length_px_final <= 0.0:
+                                    length_px_final = length_from_pix
+                                meta["length"] = length_px_final
+                                if raw_length_val is not None:
+                                    meta["length_source"] = raw_length_val
+                                else:
+                                    meta["length_source"] = meta.get("length", length_from_pix)
+                                meta["angle_deg"] = angle_deg
+                                state_copy.metadata = meta
+                                state_copy.pixel = (cx, cy)
+                                state_copy.world = None
+                                resolved_from_endpoints = True
+                            except Exception:
+                                resolved_from_endpoints = False
+
+                if not resolved_from_endpoints:
+                    pixel_override = _world_to_pixel_with_converter(state_copy.world, target_plane, target_wcs, converter, axis_indices, world_frame)
+                    if pixel_override is not None:
+                        state_copy.pixel = tuple(pixel_override)
+                        state_copy.world = None  # Recompute in the target frame for consistency
+                    if state_copy.kind == LineMarker.kind:
+                        meta = state_copy.metadata if isinstance(state_copy.metadata, dict) else {}
+                        raw_length = meta.get("length_source", meta.get("length"))
+                        unit = meta.get("unit", "pixel")
+                        angle = meta.get("angle_deg", 0.0)
+                        if raw_length is not None:
+                            length_px = self._length_pixels_from_unit(raw_length, unit, target_plane)
+                            meta = dict(meta)
+                            meta["length"] = length_px
+                            meta["length_source"] = raw_length
+                            meta["angle_deg"] = angle
+                            state_copy.metadata = meta
+
+                marker = marker_from_state(state_copy)
+                if isinstance(marker, LineMarker):
+                    meta = state_copy.metadata if isinstance(state_copy.metadata, dict) else {}
+                    raw_length = meta.get("length_source", meta.get("length"))
+                    unit = meta.get("unit", "pixel")
+                    angle_val = meta.get("angle_deg", marker.angle_deg)
+                    style_mode = meta.get("style_mode", getattr(marker, "style_mode", "solid"))
+                    length_px = meta.get("length")
+                    if length_px is None or not math.isfinite(length_px) or length_px <= 0.0:
+                        if raw_length is not None:
+                            try:
+                                length_px = self._length_pixels_from_unit(raw_length, unit, target_plane)
+                            except Exception:
+                                length_px = None
+                    if length_px is None or not math.isfinite(length_px) or length_px <= 0.0:
+                        length_px = getattr(marker, "length", 10.0) or 10.0
+                    marker.set_length(length_px, source_value=raw_length if raw_length is not None else length_px)
+                    marker.set_angle(angle_val)
+                    marker.set_style_mode(style_mode)
+                    try:
+                        marker._on_geometry_changed()
+                    except Exception:
+                        pass
+
+                self._attach_marker(marker)
+                layer.markers[marker.marker_id] = marker
+                if marker.world is None:
+                    self._update_marker_world(marker)
+                planes_changed.add(target_plane)
+                if primary_plane == plane and first_target_plane:
+                    primary_plane = first_target_plane
+                imported_any = True
+
+        if planes_changed:
+            for plane_id in planes_changed:
+                self.markers_changed.emit(plane_id)
+        else:
+            self.markers_changed.emit(plane)
+        if not imported_any:
+            raise ValueError(f"No markers imported; plane '{plane}' is incompatible with this viewer.")
+        return primary_plane
+
+    def world_frame_for_plane(self, plane: PlaneId) -> Optional[str]:
+        layer = self._layers.get(plane)
+        if layer is not None and layer.world_frame:
+            return layer.world_frame
+        viewer = self._viewer_for_plane(plane)
+        wcs = getattr(viewer, "wcs", None)
+        frame = _frame_name_from_wcs(wcs)
+        if layer is not None and frame:
+            layer.world_frame = frame
+        return frame
 
     # ------------------------------------------------------------------
     # Matplotlib interaction hooks (to be fleshed out later)
@@ -408,6 +814,34 @@ class MarkerManager(QObject):
         for ax, plane in mapping.items():
             if ax is not None and axes is ax:
                 return plane
+        return None
+
+    def _plane_axis_indices(self, plane: Optional[PlaneId], wcs) -> Optional[Tuple[int, int]]:
+        """Resolve which WCS axes correspond to the marker plane."""
+        if wcs is None:
+            return None
+        viewer = self._viewer_for_plane(plane) if plane is not None else self.viewer
+        if viewer is not None:
+            resolver = getattr(viewer, "marker_axis_indices", None)
+            if callable(resolver):
+                try:
+                    indices = resolver(plane)
+                except Exception:
+                    indices = None
+                if indices:
+                    try:
+                        first, second = indices[:2]
+                        return (int(first), int(second))
+                    except Exception:
+                        pass
+        base_plane = self._base_plane_for(plane or "xy")
+        naxis = getattr(wcs, "naxis", 0) or 0
+        if base_plane == "xy" and naxis >= 2:
+            return (0, 1)
+        if base_plane == "xz" and naxis >= 3:
+            return (0, 2)
+        if base_plane == "zy" and naxis >= 3:
+            return (2, 1)
         return None
 
     def _extract_data_coords(self, event, axes_override=None) -> Tuple[Optional[float], Optional[float]]:
@@ -538,6 +972,13 @@ class MarkerManager(QObject):
             except Exception:
                 pass
         self._drag_canvas = canvas
+        self._rotation_mode = False
+        self._rotation_targets = []
+        self._rotation_initial_angles = {}
+        self._rotation_center = None
+        self._rotation_reference_angle = None
+        if self._event_has_shift(event) or self._shift_active:
+            self._begin_rotation_mode(xdata, ydata)
 
     def handle_release(self, event) -> None:  # pragma: no cover - GUI
         if not self._is_dragging:
@@ -637,6 +1078,10 @@ class MarkerManager(QObject):
             self.redraw_plane(self._drag_plane)
             return
 
+        if self._rotation_mode and self._rotation_center is not None and self._rotation_targets:
+            self._apply_rotation_drag(xdata, ydata)
+            return
+
         dx = xdata - self._drag_start[0]
         dy = ydata - self._drag_start[1]
 
@@ -653,10 +1098,12 @@ class MarkerManager(QObject):
         self.redraw_plane(self._drag_plane)
 
     def handle_key_press(self, event) -> None:  # pragma: no cover - GUI
-        pass
+        if self._event_has_shift(event):
+            self._shift_active = True
 
     def handle_key_release(self, event) -> None:  # pragma: no cover - GUI
-        pass
+        if self._event_has_shift(event):
+            self._shift_active = False
 
     def _finish_drag(self) -> None:
         if self._drag_canvas is not None:
@@ -673,6 +1120,11 @@ class MarkerManager(QObject):
         self._drag_handle = None
         self._drag_handle_anchor = None
         self._drag_canvas = None
+        self._rotation_mode = False
+        self._rotation_center = None
+        self._rotation_reference_angle = None
+        self._rotation_targets = []
+        self._rotation_initial_angles = {}
 
     def is_dragging(self) -> bool:
         return self._is_dragging
@@ -714,6 +1166,80 @@ class MarkerManager(QObject):
                 canvas.setCursor(Qt.CursorShape.ArrowCursor)
             except Exception:
                 pass
+
+    def _event_has_shift(self, event) -> bool:
+        key = getattr(event, "key", None)
+        if key is None:
+            return False
+        try:
+            key_str = str(key).lower()
+        except Exception:
+            return False
+        return "shift" in key_str
+
+    def _begin_rotation_mode(self, xdata: float, ydata: float) -> bool:
+        if not self._drag_markers:
+            return False
+        targets = [m for m in self._drag_markers if isinstance(m, (LineMarker, TextMarker))]
+        if not targets:
+            return False
+        primary = self._primary_drag_marker if isinstance(self._primary_drag_marker, (LineMarker, TextMarker)) else targets[0]
+        cx, cy = primary.pixel[:2]
+        self._rotation_center = (cx, cy)
+        try:
+            reference = math.degrees(math.atan2(ydata - cy, xdata - cx))
+        except Exception:
+            reference = 0.0
+        self._rotation_reference_angle = reference
+        self._rotation_targets = targets
+        self._rotation_initial_angles = {marker.marker_id: self._marker_rotation_value(marker) for marker in targets}
+        self._rotation_mode = True
+        self._drag_handle = None
+        self._drag_handle_anchor = None
+        return True
+
+    def _apply_rotation_drag(self, xdata: float, ydata: float) -> None:
+        center = self._rotation_center
+        if center is None or not self._rotation_targets:
+            return
+        dx = xdata - center[0]
+        dy = ydata - center[1]
+        try:
+            angle = math.degrees(math.atan2(dy, dx))
+        except Exception:
+            angle = 0.0
+        reference = self._rotation_reference_angle or 0.0
+        delta = angle - reference
+        while delta > 180.0:
+            delta -= 360.0
+        while delta < -180.0:
+            delta += 360.0
+        for marker in self._rotation_targets:
+            base = self._rotation_initial_angles.get(marker.marker_id)
+            if base is None:
+                continue
+            self._set_marker_rotation(marker, base + delta)
+            self._update_marker_world(marker)
+            self.geometry_changed.emit(marker)
+        if self._drag_plane is not None:
+            self.markers_changed.emit(self._drag_plane)
+            self.redraw_plane(self._drag_plane)
+
+    def _marker_rotation_value(self, marker: Marker) -> float:
+        if isinstance(marker, LineMarker):
+            return float(marker.angle_deg)
+        if isinstance(marker, TextMarker):
+            return float(getattr(marker.style, "rotation", 0.0) or 0.0)
+        return 0.0
+
+    def _set_marker_rotation(self, marker: Marker, angle: float) -> None:
+        normalized = angle
+        if isinstance(marker, LineMarker):
+            marker.set_angle(normalized)
+        elif isinstance(marker, TextMarker):
+            style_dict = marker.style.to_dict()
+            style_dict["rotation"] = normalized
+            marker.update_style(MarkerStyle.from_dict(style_dict))
 
     def _viewer_handles_plane(self, viewer: Optional[object], plane: PlaneId) -> bool:
         if viewer is None:
@@ -826,6 +1352,14 @@ class MarkerManager(QObject):
         except Exception:
             return
         marker.apply_new_world((wx, wy))
+        layer = self._layers.get(plane)
+        if layer is None:
+            return
+        frame_name = _frame_name_from_wcs(wcs)
+        if frame_name and not layer.world_frame:
+            layer.world_frame = frame_name
+        if marker.marker_id not in layer.markers:
+            layer.markers[marker.marker_id] = marker
 
     def _create_marker_from_config(self, plane: PlaneId, pixel: Tuple[float, float]) -> List[Marker]:
         config = self._pending_placement or {}
@@ -1003,6 +1537,21 @@ class MarkerManager(QObject):
         if unit == "arcsec":
             return float(length_pixels) * scale_deg * 3600.0
         return float(length_pixels)
+
+    def _length_pixels_from_unit(self, value: float, unit: str, plane: PlaneId) -> float:
+        unit = unit or "pixel"
+        if unit == "pixel":
+            return float(value)
+        scale_deg = self._pixel_scale_deg(plane)
+        if not scale_deg:
+            return float(value)
+        if unit == "deg":
+            return float(value) / scale_deg
+        if unit == "arcmin":
+            return float(value) / (scale_deg * 60.0)
+        if unit == "arcsec":
+            return float(value) / (scale_deg * 3600.0)
+        return float(value)
     def prepare_for_background_capture(self, plane: Optional[PlaneId] = None) -> List[object]:
         hidden: List[object] = []
         layers: Iterable[MarkerLayer]

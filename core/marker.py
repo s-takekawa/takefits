@@ -473,7 +473,7 @@ class LineMarker(Marker):
                 end,
                 arrowstyle=self._arrowstyle(),
                 mutation_scale=self._arrow_mutation_scale(linewidth),
-                linewidth=0.0,
+                linewidth=max(linewidth, 0.1),
                 fill=True,
                 facecolor=color,
                 edgecolor=color,
@@ -702,8 +702,12 @@ class TextMarker(Marker):
     kind = "text"
 
     def __init__(self, plane: PlaneId, pixel: Tuple[float, ...], *, text: str = "", **kwargs: Any) -> None:
-        super().__init__(plane, pixel, label=text, **kwargs)
-        self.text = text or ""
+        # Avoid passing label twice when restoring from state.
+        label_value = kwargs.pop("label", text)
+        super().__init__(plane, pixel, label=label_value, **kwargs)
+        actual_text = text or label_value
+        self.text = actual_text or ""
+        self.label = self.text
 
     def add_to_axes(self, ax) -> None:  # pragma: no cover - requires mpl context
         x, y = self.pixel[:2]
