@@ -1,7 +1,9 @@
 # Takefits
 
-Takefits is a GUI-based astronomical FITS viewer and analysis tool developed by Shunya Takekawa.  
-This is an initial public pre-release version.
+Takefits is a GUI-based astronomical FITS viewer and analysis tool developed by Shunya Takekawa. <a href="https://orcid.org/0000-0001-8147-6817">
+  <img src="https://orcid.org/sites/default/files/images/orcid_16x16.png" alt="ORCID iD" />
+</a>
+This is an initial public version.
 
 ## Requirements
 - Python 3.12 or later
@@ -57,10 +59,10 @@ Generate publication-quality figures directly from the GUI.
 
 
 ## Research use
-This is a pre-release version.  
-If you use this software for scientific research or publications,  
-please cite the following GitHub repository:
-https://github.com/s-takekawa/takefits
+If you use this software in scientific publications, please cite the Zenodo DOI:
+https://doi.org/10.5281/zenodo.18328843 (all versions)
+
+For a specific release, cite the version DOI listed on Zenodo.
 
 ## Contact
 shunya_at_kanagawa-u.ac.jp
