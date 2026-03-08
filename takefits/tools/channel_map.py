@@ -3037,9 +3037,9 @@ class ChannelMapSettingPanel(QDialog):
         self.plane_zy_radio = QRadioButton("V-Y")
         self.plane_xy_radio.setChecked(True)
         # Connect signals
-        self.plane_xy_radio.toggled.connect(lambda: self.set_plane_num(0))
-        self.plane_xz_radio.toggled.connect(lambda: self.set_plane_num(1))
-        self.plane_zy_radio.toggled.connect(lambda: self.set_plane_num(2))
+        self.plane_xy_radio.toggled.connect(lambda checked: self.set_plane_num(0, checked))
+        self.plane_xz_radio.toggled.connect(lambda checked: self.set_plane_num(1, checked))
+        self.plane_zy_radio.toggled.connect(lambda checked: self.set_plane_num(2, checked))
         plane_layout.addWidget(self.plane_xy_radio)
         plane_layout.addWidget(self.plane_xz_radio)
         plane_layout.addWidget(self.plane_zy_radio)
@@ -3055,9 +3055,9 @@ class ChannelMapSettingPanel(QDialog):
         self.mode_avg_radio = QRadioButton("Average")
         self.mode_slice_radio = QRadioButton("Slice")
         self.mode_integ_radio.setChecked(True)
-        self.mode_integ_radio.toggled.connect(lambda: self.set_mode_num(0))
-        self.mode_avg_radio.toggled.connect(lambda: self.set_mode_num(1))
-        self.mode_slice_radio.toggled.connect(lambda: self.set_mode_num(2))
+        self.mode_integ_radio.toggled.connect(lambda checked: self.set_mode_num(0, checked))
+        self.mode_avg_radio.toggled.connect(lambda checked: self.set_mode_num(1, checked))
+        self.mode_slice_radio.toggled.connect(lambda checked: self.set_mode_num(2, checked))
         mode_layout.addWidget(self.mode_integ_radio)
         mode_layout.addWidget(self.mode_avg_radio)
         mode_layout.addWidget(self.mode_slice_radio)
@@ -3097,8 +3097,8 @@ class ChannelMapSettingPanel(QDialog):
         self.direction_group = QButtonGroup(self)
         self.direction_group.addButton(self.dir_l2r_radio, 0)
         self.direction_group.addButton(self.dir_t2b_radio, 1)
-        self.dir_l2r_radio.toggled.connect(lambda: self.set_dir_num(0))
-        self.dir_t2b_radio.toggled.connect(lambda: self.set_dir_num(1))
+        self.dir_l2r_radio.toggled.connect(lambda checked: self.set_dir_num(0))
+        self.dir_t2b_radio.toggled.connect(lambda checked: self.set_dir_num(1))
         tiles_layout.addWidget(direction_label, alignment=Qt.AlignmentFlag.AlignRight)
         tiles_layout.addWidget(self.dir_l2r_radio, alignment=Qt.AlignmentFlag.AlignLeft)
         tiles_layout.addWidget(self.dir_t2b_radio, alignment=Qt.AlignmentFlag.AlignLeft)
@@ -3127,8 +3127,8 @@ class ChannelMapSettingPanel(QDialog):
         self.ch_val_group = QButtonGroup(self)
         self.ch_val_group.addButton(self.ch_radio, 0)
         self.ch_val_group.addButton(self.val_radio, 1)
-        self.ch_radio.toggled.connect(lambda: self.set_worldch_num(0))
-        self.val_radio.toggled.connect(lambda: self.set_worldch_num(1))
+        self.ch_radio.toggled.connect(lambda checked: self.set_worldch_num(0, checked))
+        self.val_radio.toggled.connect(lambda checked: self.set_worldch_num(1, checked))
         self.val_radio.setChecked(True)
         #range_layout.addWidget(unit_label, alignment=Qt.AlignmentFlag.AlignRight)
         range_layout.addWidget(self.ch_radio)
@@ -3144,8 +3144,8 @@ class ChannelMapSettingPanel(QDialog):
         self.chlabel_radio_group = QButtonGroup(self)
         self.chlabel_radio_group.addButton(self.chlabel_radio_middle, 0)
         self.chlabel_radio_group.addButton(self.chlabel_radio_range, 1)
-        self.chlabel_radio_middle.toggled.connect(lambda: self.set_chlabel_num(0))
-        self.chlabel_radio_range.toggled.connect(lambda: self.set_chlabel_num(1))
+        self.chlabel_radio_middle.toggled.connect(lambda checked: self.set_chlabel_num(0))
+        self.chlabel_radio_range.toggled.connect(lambda checked: self.set_chlabel_num(1))
         chlabel_radio_layout.addWidget(self.chlabel_radio_middle)
         chlabel_radio_layout.addWidget(self.chlabel_radio_range)
         self.chlabel_radio_middle.setChecked(True)
@@ -3174,9 +3174,17 @@ class ChannelMapSettingPanel(QDialog):
     # Placeholder functions for handling events:
     # ----------------------------
 
-    def set_plane_num(self, num):
+    def set_plane_num(self, num, is_checked=None):
         """Set plane number based on selected plane radio button."""
-        if not self.sender().isChecked(): return
+        if is_checked is None:
+            sender = self.sender()
+            if sender:
+                is_checked = sender.isChecked()
+            else:
+                is_checked = True
+
+        if not is_checked:
+            return
         self.plane_num = num
         if self.worldch_num == 0: #ch
             self.from_val =  0.5
@@ -3221,13 +3229,19 @@ class ChannelMapSettingPanel(QDialog):
         if self.mode_num == 2:
             self.set_mode_num(2)
 
-    def set_worldch_num(self, num):
+    def set_worldch_num(self, num, is_checked=None):
         """Set unit selection (0 for 'ch', 1 for 'world')."""
-        sender = self.sender()
+        if is_checked is None:
+            sender = self.sender()
+            if sender:
+                is_checked = sender.isChecked()
+            else:
+                is_checked = True  # Fallback if no sender and no boolean passed
+
         # Ignore if sender is being unchecked.
-        if not sender.isChecked():
+        if not is_checked:
             return
-    
+
         # Save current state in case we need to revert.
         previous_state = self.worldch_num  # 0 for 'ch', 1 for 'world'
         self.worldch_num = num
@@ -3394,10 +3408,16 @@ class ChannelMapSettingPanel(QDialog):
         self.ch_radio.blockSignals(False)
         self.val_radio.blockSignals(False)
 
-    def set_mode_num(self, num):
+    def set_mode_num(self, num, is_checked=None):
         """Set mode number based on selected mode radio button."""
-        sender = self.sender()
-        if not sender.isChecked():
+        if is_checked is None:
+            sender = self.sender()
+            if sender:
+                is_checked = sender.isChecked()
+            else:
+                is_checked = True
+
+        if not is_checked:
             return
         self.mode_num = num
         if self.mode_num == 2:

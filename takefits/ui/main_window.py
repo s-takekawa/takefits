@@ -6440,11 +6440,6 @@ class MainWindow(FITSViewer):
             return
 
         self._last_regrid_params = dict(params)
-        self.record_action(
-            "compute_regrid",
-            params={"params": dict(params)},
-            replace_tag="panel:regrid",
-        )
         self._regrid_thread = QThread(self)
         header_copy = self.header.copy() if hasattr(self, "header") and self.header is not None else None
         self._regrid_worker = Regridder(

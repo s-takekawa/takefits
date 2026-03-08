@@ -1131,10 +1131,7 @@ class ColorSettingsPanel(QWidget):
     def closeEvent(self,event):
         self.current_settings["color_pattern"] = self.colorscale_combo.currentText()
         ColorSettingsPanel.settings[self.mode] = dict(self.current_settings)
-        try:
-            self.colorscale_combo.currentIndexChanged.disconnect(self.change_color_scale)
-        except TypeError:
-            pass
+        pass
         try:
             plt.close(self.fig)
         except Exception:

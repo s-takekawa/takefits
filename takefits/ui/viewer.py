@@ -3417,8 +3417,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         marker_mgr = getattr(self, 'marker_manager', None)
         
         if plane == 'xy':
-            xpix = self._get_shared_xpix()
-            ypix = self._get_shared_ypix()
+            k = max(0, min(k, self.data.shape[0 if self.data.ndim == 3 else 1] - 1))
+            xpix = max(0, min(self._get_shared_xpix(), self.data.shape[-1] - 1))
+            ypix = max(0, min(self._get_shared_ypix(), self.data.shape[-2] - 1))
             z = self.format_pix.convert_chpix_to_world(self.plane, xpix, ypix, k)
             z_str = self.format_pix.convert_chval_to_world_str(self.plane, z)
             
@@ -3517,8 +3518,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                             zy_canvas.blit(zy_overlay.bbox)
 
         elif plane == 'xz':
-            xpix = self._get_shared_xpix()
-            zpix = self._get_shared_zpix()
+            k = max(0, min(k, self.data.shape[-2]))
+            xpix = max(0, min(self._get_shared_xpix(), self.data.shape[-1] - 1))
+            zpix = max(0, min(self._get_shared_zpix(), self.data.shape[0 if self.data.ndim == 3 else 1] - 1))
             z = self.format_pix.convert_chpix_to_world(self.plane, xpix, k, zpix)
             z_str = self.format_pix.convert_chval_to_world_str(self.plane, z)
             
@@ -3593,8 +3595,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                             zy_canvas.blit(zy_overlay.bbox)
 
         elif plane == 'zy':
-            ypix = self._get_shared_ypix()
-            xpix = self._get_shared_xpix()
+            k = max(0, min(k, self.data.shape[-1] - 1))
+            ypix = max(0, min(self._get_shared_ypix(), self.data.shape[-2] - 1))
+            xpix = max(0, min(self._get_shared_xpix(), self.data.shape[0 if self.data.ndim == 3 else 1] - 1))
             z = self.format_pix.convert_chpix_to_world(self.plane, k, ypix, xpix)
             z_str = self.format_pix.convert_chval_to_world_str(self.plane, z)
             
@@ -3732,10 +3735,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             return
         self._contour_layer_id = layer_id
 
-        try:
-            manager.contour_updated.disconnect(self.refresh_display_after_contour_update)
-        except TypeError:
-            pass
+        # Removed manual manager.contour_updated.disconnect(self.refresh_display_after_contour_update)
         try:
             manager.contour_updated.connect(self.refresh_display_after_contour_update)
         except Exception as e:

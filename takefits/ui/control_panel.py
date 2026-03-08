@@ -274,28 +274,19 @@ class ControlPanel(QWidget):
 
     def open_chmap_settings(self):
         """Opens the Channel Map settings panel."""
-        needs_new_panel = False
-        if self.chmap_settings_panel is None:
-            needs_new_panel = True
-        else:
+        if self.chmap_settings_panel is not None:
             try:
-                needs_new_panel = not self.chmap_settings_panel.isVisible()
-            except Exception:
-                # Widget may already be deleted
+                if not self.chmap_settings_panel.isVisible():
+                    self.chmap_settings_panel.show()
+                self.chmap_settings_panel.raise_()
+                self.chmap_settings_panel.activateWindow()
+                return
+            except RuntimeError:
                 self.chmap_settings_panel = None
-                needs_new_panel = True
 
-        if needs_new_panel:
-            self.chmap_settings_panel = ChannelMapSettingPanel(self.fits_viewer, self.subwindows)
-            try:
-                self.chmap_settings_panel.destroyed.disconnect(self.on_chmap_settings_closed)
-            except Exception:
-                pass
-            self.chmap_settings_panel.destroyed.connect(self.on_chmap_settings_closed)
-
+        self.chmap_settings_panel = ChannelMapSettingPanel(self.fits_viewer, self.subwindows)
         self.chmap_settings_panel.show()
-        self.chmap_settings_panel.raise_()
-        self.chmap_settings_panel.activateWindow()
+        self.chmap_settings_panel.destroyed.connect(self.on_chmap_settings_closed)
 
     def on_chmap_settings_closed(self):
         """Slot called when Channel Map panel is closed."""
@@ -303,15 +294,19 @@ class ControlPanel(QWidget):
 
     def open_clump_finding_panel(self):
         """Opens the Clump Finding panel."""
-        if self.clump_finding_panel is None:
-            self.clump_finding_panel = ClumpFindingPanel(self.fits_viewer, self.subwindows)
-            self.clump_finding_panel.show()
-            try: self.clump_finding_panel.destroyed.disconnect(self.on_clump_finding_panel_closed)
-            except TypeError: pass
-            self.clump_finding_panel.destroyed.connect(self.on_clump_finding_panel_closed)
-        else:
-            self.clump_finding_panel.raise_()
-            self.clump_finding_panel.activateWindow()
+        if self.clump_finding_panel is not None:
+            try:
+                if not self.clump_finding_panel.isVisible():
+                    self.clump_finding_panel.show()
+                self.clump_finding_panel.raise_()
+                self.clump_finding_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.clump_finding_panel = None
+
+        self.clump_finding_panel = ClumpFindingPanel(self.fits_viewer, self.subwindows)
+        self.clump_finding_panel.show()
+        self.clump_finding_panel.destroyed.connect(self.on_clump_finding_panel_closed)
 
     def on_clump_finding_panel_closed(self):
         """Slot called when Clump Finding panel is closed."""
@@ -319,22 +314,26 @@ class ControlPanel(QWidget):
 
     def open_color_settings(self):
         """Opens the Color Settings panel."""
-        if self.color_settings_panel is None:
-            seed = getattr(self.fits_viewer, "_seed_main_color_panel_settings_from_current_image", None)
-            if callable(seed):
-                try:
-                    seed()
-                except Exception:
-                    pass
-            # Pass fits_viewer and subwindows to the panel
-            self.color_settings_panel = ColorSettingsPanel(self.fits_viewer, self.subwindows)
-            self.color_settings_panel.show()
-            try: self.color_settings_panel.destroyed.disconnect(self.on_color_settings_closed)
-            except TypeError: pass
-            self.color_settings_panel.destroyed.connect(self.on_color_settings_closed)
-        else:
-            self.color_settings_panel.raise_()
-            self.color_settings_panel.activateWindow()
+        if self.color_settings_panel is not None:
+            try:
+                if not self.color_settings_panel.isVisible():
+                    self.color_settings_panel.show()
+                self.color_settings_panel.raise_()
+                self.color_settings_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.color_settings_panel = None
+
+        seed = getattr(self.fits_viewer, "_seed_main_color_panel_settings_from_current_image", None)
+        if callable(seed):
+            try:
+                seed()
+            except Exception:
+                pass
+        # Pass fits_viewer and subwindows to the panel
+        self.color_settings_panel = ColorSettingsPanel(self.fits_viewer, self.subwindows)
+        self.color_settings_panel.show()
+        self.color_settings_panel.destroyed.connect(self.on_color_settings_closed)
 
     def on_color_settings_closed(self):
         """Slot called when Color Settings panel is closed."""
@@ -348,15 +347,19 @@ class ControlPanel(QWidget):
 
     def open_scaling_panel(self):
         """Opens the Scaling settings panel."""
-        if self.scaling_panel is None:
-            self.scaling_panel = ScalingPanel(self.fits_viewer, self.subwindows)
-            self.scaling_panel.show()
-            try: self.scaling_panel.destroyed.disconnect(self.on_scaling_panel_closed)
-            except TypeError: pass
-            self.scaling_panel.destroyed.connect(self.on_scaling_panel_closed)
-        else:
-            self.scaling_panel.raise_()
-            self.scaling_panel.activateWindow()
+        if self.scaling_panel is not None:
+            try:
+                if not self.scaling_panel.isVisible():
+                    self.scaling_panel.show()
+                self.scaling_panel.raise_()
+                self.scaling_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.scaling_panel = None
+
+        self.scaling_panel = ScalingPanel(self.fits_viewer, self.subwindows)
+        self.scaling_panel.show()
+        self.scaling_panel.destroyed.connect(self.on_scaling_panel_closed)
 
     def on_scaling_panel_closed(self):
         """Slot called when Scaling panel is closed."""
@@ -364,15 +367,19 @@ class ControlPanel(QWidget):
 
     def open_unit_conversion_panel(self):
         """Opens the Unit Conversion settings panel."""
-        if self.unit_conversion_panel is None:
-            self.unit_conversion_panel = UnitConversionPanel(self.fits_viewer, self.subwindows)
-            self.unit_conversion_panel.show()
-            try: self.unit_conversion_panel.destroyed.disconnect(self.on_unit_conversion_panel_closed)
-            except TypeError: pass
-            self.unit_conversion_panel.destroyed.connect(self.on_unit_conversion_panel_closed)
-        else:
-            self.unit_conversion_panel.raise_()
-            self.unit_conversion_panel.activateWindow()
+        if self.unit_conversion_panel is not None:
+            try:
+                if not self.unit_conversion_panel.isVisible():
+                    self.unit_conversion_panel.show()
+                self.unit_conversion_panel.raise_()
+                self.unit_conversion_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.unit_conversion_panel = None
+
+        self.unit_conversion_panel = UnitConversionPanel(self.fits_viewer, self.subwindows)
+        self.unit_conversion_panel.show()
+        self.unit_conversion_panel.destroyed.connect(self.on_unit_conversion_panel_closed)
 
     def on_unit_conversion_panel_closed(self):
         """Slot called when Unit Conversion panel is closed."""
@@ -380,15 +387,19 @@ class ControlPanel(QWidget):
 
     def open_pvd_settings(self):
         """Opens the PV Diagram panel."""
-        if self.pvd_panel is None:
-            self.pvd_panel = PVdiagram(self.fits_viewer)
-            self.pvd_panel.show()
-            try: self.pvd_panel.destroyed.disconnect(self.on_pvd_closed)
-            except TypeError: pass
-            self.pvd_panel.destroyed.connect(self.on_pvd_closed)
-        else:
-            self.pvd_panel.raise_()
-            self.pvd_panel.activateWindow()
+        if self.pvd_panel is not None:
+            try:
+                if not self.pvd_panel.isVisible():
+                    self.pvd_panel.show()
+                self.pvd_panel.raise_()
+                self.pvd_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.pvd_panel = None
+
+        self.pvd_panel = PVdiagram(self.fits_viewer)
+        self.pvd_panel.show()
+        self.pvd_panel.destroyed.connect(self.on_pvd_closed)
 
     def on_pvd_closed(self):
         """Slot called when PV Diagram panel is closed."""
@@ -396,25 +407,18 @@ class ControlPanel(QWidget):
 
     def open_integ_settings(self):
         """Opens the Integration settings panel."""
-        panel = self.integ_settings_panel
-        if panel is not None:
+        if self.integ_settings_panel is not None:
             try:
-                visible = panel.isVisible()
-            except RuntimeError:
-                panel = None
-                self.integ_settings_panel = None
-            else:
-                if not visible:
-                    panel.show()
-                panel.raise_()
-                panel.activateWindow()
+                if not self.integ_settings_panel.isVisible():
+                    self.integ_settings_panel.show()
+                self.integ_settings_panel.raise_()
+                self.integ_settings_panel.activateWindow()
                 return
+            except RuntimeError:
+                self.integ_settings_panel = None
+
         self.integ_settings_panel = IntegSettingsPanel(self.fits_viewer, self.subwindows)
         self.integ_settings_panel.show()
-        try:
-            self.integ_settings_panel.destroyed.disconnect(self.on_integ_settings_closed)
-        except TypeError:
-            pass
         self.integ_settings_panel.destroyed.connect(self.on_integ_settings_closed)
 
     def on_integ_settings_closed(self):
@@ -426,13 +430,19 @@ class ControlPanel(QWidget):
         self.fits_viewer.open_cutout_dialog(use_view_bounds=True)
 
     def open_mask_settings(self):
-        if self.mask_settings_panel is None:
-            self.mask_settings_panel = MaskSettingsPanel(self.fits_viewer, self.subwindows)
-            self.mask_settings_panel.destroyed.connect(self.on_mask_settings_closed)
-            self.mask_settings_panel.show()
-        else:
-            self.mask_settings_panel.raise_()
-            self.mask_settings_panel.activateWindow()
+        if self.mask_settings_panel is not None:
+            try:
+                if not self.mask_settings_panel.isVisible():
+                    self.mask_settings_panel.show()
+                self.mask_settings_panel.raise_()
+                self.mask_settings_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.mask_settings_panel = None
+
+        self.mask_settings_panel = MaskSettingsPanel(self.fits_viewer, self.subwindows)
+        self.mask_settings_panel.show()
+        self.mask_settings_panel.destroyed.connect(self.on_mask_settings_closed)
 
     def on_mask_settings_closed(self):
         self.mask_settings_panel = None
@@ -447,31 +457,35 @@ class ControlPanel(QWidget):
                 "Spectrum is available only for 3D/4D cube data.",
             )
             return
-        if self.spec_window is None:
-            self.spec_window = SpecWindow(self.fits_viewer)
-            
-            # --- Signal Wiring (Refactoring Pilot) ---
-            # Connect FITSViewer position update to SpecWindow
-            if hasattr(self.fits_viewer, 'position_updated'):
-                self.fits_viewer.position_updated.connect(self.spec_window.update_position)
 
-            # Connect SpecWindow channel change to FITSViewer slider and subwindows cursor
-            self.spec_window.channel_changed.connect(self.broadcast_channel_update)
+        if self.spec_window is not None:
+            try:
+                if not self.spec_window.isVisible():
+                    self.spec_window.show()
+                self.spec_window.raise_()
+                self.spec_window.activateWindow()
+                return
+            except RuntimeError:
+                self.spec_window = None
 
-            # Connect SubWindows position update to SpecWindow
-            if self.subwindows:
-                for sub in self.subwindows:
-                    if sub and hasattr(sub, 'position_updated'):
-                        sub.position_updated.connect(self.spec_window.update_position)
+        self.spec_window = SpecWindow(self.fits_viewer)
+        
+        # --- Signal Wiring (Refactoring Pilot) ---
+        # Connect FITSViewer position update to SpecWindow
+        if hasattr(self.fits_viewer, 'position_updated'):
+            self.fits_viewer.position_updated.connect(self.spec_window.update_position)
 
-            self.spec_window.show()
+        # Connect SpecWindow channel change to FITSViewer slider and subwindows cursor
+        self.spec_window.channel_changed.connect(self.broadcast_channel_update)
 
-            try: self.spec_window.destroyed.disconnect(self.on_spec_window_closed)
-            except TypeError: pass
-            self.spec_window.destroyed.connect(self.on_spec_window_closed)
-        else:
-            self.spec_window.raise_()
-            self.spec_window.activateWindow()
+        # Connect SubWindows position update to SpecWindow
+        if self.subwindows:
+            for sub in self.subwindows:
+                if sub and hasattr(sub, 'position_updated'):
+                    sub.position_updated.connect(self.spec_window.update_position)
+
+        self.spec_window.show()
+        self.spec_window.destroyed.connect(self.on_spec_window_closed)
 
     def broadcast_channel_update(self, channel):
         """
@@ -525,26 +539,29 @@ class ControlPanel(QWidget):
                 "Baseline is available only for 3D/4D cube data.",
             )
             return
-        if self.baseline_panel is None:
-            self.baseline_panel = BaselinePanel(self.fits_viewer, self.subwindows)
 
-            if hasattr(self.fits_viewer, 'position_updated'):
-                self.fits_viewer.position_updated.connect(self.baseline_panel.update_position)
-
-            if self.subwindows:
-                for sub in self.subwindows:
-                    if sub and hasattr(sub, 'position_updated'):
-                        sub.position_updated.connect(self.baseline_panel.update_position)
-
-            self.baseline_panel.show()
+        if self.baseline_panel is not None:
             try:
-                self.baseline_panel.destroyed.disconnect(self.on_baseline_panel_closed)
-            except TypeError:
-                pass
-            self.baseline_panel.destroyed.connect(self.on_baseline_panel_closed)
-        else:
-            self.baseline_panel.raise_()
-            self.baseline_panel.activateWindow()
+                if not self.baseline_panel.isVisible():
+                    self.baseline_panel.show()
+                self.baseline_panel.raise_()
+                self.baseline_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.baseline_panel = None
+
+        self.baseline_panel = BaselinePanel(self.fits_viewer, self.subwindows)
+
+        if hasattr(self.fits_viewer, 'position_updated'):
+            self.fits_viewer.position_updated.connect(self.baseline_panel.update_position)
+
+        if self.subwindows:
+            for sub in self.subwindows:
+                if sub and hasattr(sub, 'position_updated'):
+                    sub.position_updated.connect(self.baseline_panel.update_position)
+
+        self.baseline_panel.show()
+        self.baseline_panel.destroyed.connect(self.on_baseline_panel_closed)
 
     def on_baseline_panel_closed(self):
         """Slot called when Baseline panel is closed."""
@@ -552,39 +569,49 @@ class ControlPanel(QWidget):
 
     def open_smooth_settings(self):
         """Opens the Smoothing settings panel."""
-        if self.smooth_settings_panel is None:
-            self.smooth_settings_panel = SmoothSettingsPanel(self.fits_viewer, self.subwindows)
-            self.smooth_settings_panel.show()
-            try: self.smooth_settings_panel.destroyed.disconnect(self.on_smooth_settings_closed)
-            except TypeError: pass
-            self.smooth_settings_panel.destroyed.connect(self.on_smooth_settings_closed)
-        else:
-            self.smooth_settings_panel.raise_()
-            self.smooth_settings_panel.activateWindow()
+        if self.smooth_settings_panel is not None:
+            try:
+                if not self.smooth_settings_panel.isVisible():
+                    self.smooth_settings_panel.show()
+                self.smooth_settings_panel.raise_()
+                self.smooth_settings_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.smooth_settings_panel = None
+
+        self.smooth_settings_panel = SmoothSettingsPanel(self.fits_viewer, self.subwindows)
+        self.smooth_settings_panel.show()
+        self.smooth_settings_panel.destroyed.connect(self.on_smooth_settings_closed)
 
     def open_contour_panel(self):
-        if self.contour_panel is None:
-            # Ensure primary viewers are registered before inspecting manager targets.
-            register = getattr(self.fits_viewer, "_register_contour_layer", None)
-            if callable(register):
-                register()
-            for sub in self.subwindows or []:
-                sub_register = getattr(sub, "_register_contour_layer", None)
-                if callable(sub_register):
-                    sub_register()
+        if self.contour_panel is not None:
+            try:
+                if not self.contour_panel.isVisible():
+                    self.contour_panel.show()
+                self.contour_panel.raise_()
+                self.contour_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.contour_panel = None
 
-            default_targets = ContourManager.instance().layer_ids_for_owner(self.fits_viewer)
-            if not default_targets:
-                # Fallback to any layer if main viewer not registered yet.
-                registered = ContourManager.instance().registered_layers()
-                if registered:
-                    default_targets = [next(iter(registered.keys()))]
-            self.contour_panel = ContourPanel(self, default_targets=default_targets)
-            self.contour_panel.destroyed.connect(self.on_contour_panel_closed)
-            self.contour_panel.show()
-        else:
-            self.contour_panel.raise_()
-            self.contour_panel.activateWindow()
+        # Ensure primary viewers are registered before inspecting manager targets.
+        register = getattr(self.fits_viewer, "_register_contour_layer", None)
+        if callable(register):
+            register()
+        for sub in self.subwindows or []:
+            sub_register = getattr(sub, "_register_contour_layer", None)
+            if callable(sub_register):
+                sub_register()
+
+        default_targets = ContourManager.instance().layer_ids_for_owner(self.fits_viewer)
+        if not default_targets:
+            # Fallback to any layer if main viewer not registered yet.
+            registered = ContourManager.instance().registered_layers()
+            if registered:
+                default_targets = [next(iter(registered.keys()))]
+        self.contour_panel = ContourPanel(self, default_targets=default_targets)
+        self.contour_panel.show()
+        self.contour_panel.destroyed.connect(self.on_contour_panel_closed)
 
     def on_contour_panel_closed(self):
         self.contour_panel = None
@@ -595,15 +622,19 @@ class ControlPanel(QWidget):
 
     def open_arithmetic_panel(self):
         """Opens the Cube Arithmetic panel."""
-        if self.arithmetic_panel is None:
-            self.arithmetic_panel = CubeArithmeticPanel(self.fits_viewer, self.subwindows)
-            self.arithmetic_panel.show()
-            try: self.arithmetic_panel.destroyed.disconnect(self.on_arithmetic_panel_closed)
-            except TypeError: pass
-            self.arithmetic_panel.destroyed.connect(self.on_arithmetic_panel_closed)
-        else:
-            self.arithmetic_panel.raise_()
-            self.arithmetic_panel.activateWindow()
+        if self.arithmetic_panel is not None:
+            try:
+                if not self.arithmetic_panel.isVisible():
+                    self.arithmetic_panel.show()
+                self.arithmetic_panel.raise_()
+                self.arithmetic_panel.activateWindow()
+                return
+            except RuntimeError:
+                self.arithmetic_panel = None
+
+        self.arithmetic_panel = CubeArithmeticPanel(self.fits_viewer, self.subwindows)
+        self.arithmetic_panel.show()
+        self.arithmetic_panel.destroyed.connect(self.on_arithmetic_panel_closed)
             
     def on_arithmetic_panel_closed(self):
         self.arithmetic_panel = None

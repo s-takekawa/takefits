@@ -734,12 +734,5 @@ class ContourPanel(QDialog):
         self.refresh_targets()
 
     def closeEvent(self, event):
-        try:
-            self.manager.targets_changed.disconnect(self.refresh_targets)
-        except Exception:
-            pass
-        try:
-            self.manager.contour_updated.disconnect(self._on_contour_updated)
-        except Exception:
-            pass
+        pass
         super().closeEvent(event)

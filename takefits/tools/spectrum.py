@@ -1566,14 +1566,7 @@ class SpecWindow(QWidget):
              return None, "Application state not initialized"
 
     def closeEvent(self, event):
-        try:
-            # Signal disconnection is handled automatically by PySide/PyQt usually,
-            # but explicit disconnect is fine if specific cleanup is needed.
-            # self.common_instance usage is removed.
-            if hasattr(self.fits_viewer, 'region_manager'):
-                self.fits_viewer.region_manager.selected_region_changed.disconnect(self.on_region_changed)
-        except (TypeError, RuntimeError):
-            pass
+        pass
 
         SpecWindow.is_on = False
         super().closeEvent(event)
