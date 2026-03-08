@@ -1,0 +1,315 @@
+"""Polynomial baseline subtraction usecases."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple, Union
+import warnings
+
+import numpy as np
+
+from takefits.core.app_state import AppState
+from .utils import axis_world_to_pixel, get_axis_ctype, parse_world_coordinate
+
+
+WorldRange = Tuple[Union[float, str], Union[float, str]]
+
+
+@dataclass
+class BaselineSubtractionResult:
+    """Container for baseline subtraction outputs."""
+
+    subtracted_data: np.ndarray
+    baseline_model: np.ndarray
+    order: int
+    world_ranges: List[Tuple[float, float]]
+    pixel_ranges: List[Tuple[int, int]]
+    n_total_spectra: int
+    n_fitted_spectra: int
+
+
+def _default_reference_pixel(state: AppState) -> Optional[Tuple[float, ...]]:
+    if state.wcs is None:
+        return None
+    naxis = int(getattr(state.wcs, "naxis", 0) or 0)
+    if naxis <= 0:
+        return None
+
+    ref = [0.0] * naxis
+    try:
+        crpix = np.asarray(state.wcs.wcs.crpix, dtype=float).reshape(-1)
+        for idx in range(min(naxis, crpix.size)):
+            ref[idx] = float(crpix[idx] - 1.0)
+    except Exception:
+        pass
+
+    if naxis >= 1:
+        ref[0] = float(getattr(state.cursor, "xpix", ref[0]))
+    if naxis >= 2:
+        ref[1] = float(getattr(state.cursor, "ypix", ref[1]))
+    if naxis >= 3:
+        ref[2] = float(getattr(state, "current_z", ref[2]))
+    if naxis >= 4:
+        ref[3] = float(getattr(state, "current_s", ref[3]))
+    return tuple(ref)
+
+
+def _normalize_reference_pixel(
+    state: AppState,
+    reference_pixel: Optional[Sequence[float]],
+) -> Optional[Tuple[float, ...]]:
+    fallback = _default_reference_pixel(state)
+    if reference_pixel is None:
+        return fallback
+    if state.wcs is None:
+        return None
+    naxis = int(getattr(state.wcs, "naxis", 0) or 0)
+    if naxis <= 0:
+        return None
+
+    values = list(fallback or ([0.0] * naxis))
+    try:
+        supplied = list(reference_pixel)
+    except Exception:
+        supplied = []
+    for idx in range(min(naxis, len(supplied))):
+        try:
+            values[idx] = float(supplied[idx])
+        except Exception:
+            continue
+    return tuple(values)
+
+
+def _spectral_wcs_axis(state: AppState, *, data_ndim: int) -> int:
+    spectral_meta = getattr(state, "spectral_metadata", {}) or {}
+    axis_index = spectral_meta.get("axis_index")
+    try:
+        axis_index_int = int(axis_index)
+        if axis_index_int >= 1:
+            return axis_index_int - 1
+    except Exception:
+        pass
+
+    wcs = getattr(state, "wcs", None)
+    if wcs is not None and hasattr(wcs, "wcs"):
+        try:
+            for idx, ctype in enumerate(list(getattr(wcs.wcs, "ctype", []) or [])):
+                token = str(ctype or "").upper()
+                if any(tag in token for tag in ("VRAD", "VELO", "VOPT", "FREQ", "WAVE")):
+                    return int(idx)
+        except Exception:
+            pass
+
+    # numpy axis 0 (z) corresponds to WCS axis (ndim-1) for (z, y, x) ordering
+    return int(max(0, data_ndim - 1))
+
+
+def _world_ranges_to_channel_mask(
+    state: AppState,
+    *,
+    world_ranges: Sequence[WorldRange],
+    n_channels: int,
+    spectral_wcs_axis: int,
+    reference_pixel: Optional[Tuple[float, ...]],
+) -> Tuple[np.ndarray, List[Tuple[float, float]], List[Tuple[int, int]]]:
+    if state.wcs is None:
+        raise ValueError("WCS is required for world-range baseline subtraction.")
+    if not world_ranges:
+        raise ValueError("At least one world range is required.")
+    if n_channels <= 0:
+        raise ValueError("No spectral channels available.")
+
+    ctype = get_axis_ctype(state, spectral_wcs_axis)
+    mask = np.zeros(int(n_channels), dtype=bool)
+    normalized_world_ranges: List[Tuple[float, float]] = []
+    pixel_ranges: List[Tuple[int, int]] = []
+
+    for idx, entry in enumerate(world_ranges, start=1):
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise ValueError(f"Invalid world range at index {idx}: expected (min, max).")
+        raw_lo, raw_hi = entry
+        try:
+            world_lo = (
+                parse_world_coordinate(raw_lo, ctype)
+                if isinstance(raw_lo, str)
+                else float(raw_lo)
+            )
+            world_hi = (
+                parse_world_coordinate(raw_hi, ctype)
+                if isinstance(raw_hi, str)
+                else float(raw_hi)
+            )
+        except Exception as exc:
+            raise ValueError(f"Invalid world range values at index {idx}: {entry}") from exc
+        if not (np.isfinite(world_lo) and np.isfinite(world_hi)):
+            raise ValueError(f"Non-finite world range at index {idx}: {entry}")
+
+        pix_lo = axis_world_to_pixel(
+            state,
+            world_lo,
+            spectral_wcs_axis,
+            reference_pixel=reference_pixel,
+        )
+        pix_hi = axis_world_to_pixel(
+            state,
+            world_hi,
+            spectral_wcs_axis,
+            reference_pixel=reference_pixel,
+        )
+
+        p0 = int(np.floor(min(float(pix_lo), float(pix_hi))))
+        p1 = int(np.ceil(max(float(pix_lo), float(pix_hi))))
+        p0 = max(0, p0)
+        p1 = min(int(n_channels) - 1, p1)
+        if p0 > p1:
+            continue
+        mask[p0 : p1 + 1] = True
+        normalized_world_ranges.append((float(world_lo), float(world_hi)))
+        pixel_ranges.append((int(p0), int(p1)))
+
+    if not np.any(mask):
+        raise ValueError("No valid channels selected from world ranges.")
+    return mask, normalized_world_ranges, pixel_ranges
+
+
+def _fit_baseline_single_cube(
+    cube: np.ndarray,
+    *,
+    channel_mask: np.ndarray,
+    order: int,
+) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    if cube.ndim != 3:
+        raise ValueError(f"Expected 3D cube, got {cube.ndim}D.")
+    n_channels = int(cube.shape[0])
+    if channel_mask.shape != (n_channels,):
+        raise ValueError("channel_mask shape does not match spectral axis length.")
+
+    out_dtype = cube.dtype if np.issubdtype(cube.dtype, np.floating) else np.float32
+    subtracted = np.asarray(cube, dtype=out_dtype).copy()
+    model = np.full(cube.shape, np.nan, dtype=out_dtype)
+    x_axis = np.arange(n_channels, dtype=float)
+
+    total_spectra = int(np.prod(cube.shape[1:]))
+    fitted_spectra = 0
+
+    rank_warning = getattr(np, "RankWarning", Warning)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", rank_warning)
+        for iy, ix in np.ndindex(cube.shape[1], cube.shape[2]):
+            spectrum = np.asarray(cube[:, iy, ix], dtype=float)
+            finite = np.isfinite(spectrum)
+            fit_mask = finite & channel_mask
+            if int(np.count_nonzero(fit_mask)) < (int(order) + 1):
+                continue
+            try:
+                coeffs = np.polyfit(x_axis[fit_mask], spectrum[fit_mask], int(order))
+                baseline = np.polyval(coeffs, x_axis)
+            except Exception:
+                continue
+
+            corrected = spectrum - baseline
+            corrected[~finite] = np.nan
+
+            model[:, iy, ix] = np.asarray(baseline, dtype=out_dtype)
+            subtracted[:, iy, ix] = np.asarray(corrected, dtype=out_dtype)
+            fitted_spectra += 1
+
+    return subtracted, model, total_spectra, fitted_spectra
+
+
+def compute_polynomial_baseline_subtraction(
+    state: AppState,
+    *,
+    world_ranges: Sequence[WorldRange],
+    order: int = 1,
+    reference_pixel: Optional[Sequence[float]] = None,
+) -> BaselineSubtractionResult:
+    """
+    Compute polynomial baseline subtraction from world-coordinate line-free ranges.
+
+    Args:
+        state: App state with loaded data/WCS.
+        world_ranges: List of (min_world, max_world) ranges.
+        order: Polynomial order (>=0).
+        reference_pixel: Optional full WCS reference pixel tuple for world->pixel conversion.
+
+    Returns:
+        BaselineSubtractionResult with subtracted data and baseline model.
+    """
+    if state.data is None:
+        raise ValueError("No data loaded.")
+    if int(order) < 0:
+        raise ValueError("Polynomial order must be >= 0.")
+
+    data = np.asarray(state.data)
+    if data.ndim < 3:
+        raise ValueError("Baseline subtraction requires 3D/4D cube data.")
+
+    working_ndim = 3 if data.ndim == 4 else data.ndim
+    spectral_wcs_axis = _spectral_wcs_axis(state, data_ndim=working_ndim)
+    ref_pixel = _normalize_reference_pixel(state, reference_pixel)
+    n_channels = int(data.shape[1] if data.ndim == 4 else data.shape[0])
+    channel_mask, normalized_world_ranges, pixel_ranges = _world_ranges_to_channel_mask(
+        state,
+        world_ranges=world_ranges,
+        n_channels=n_channels,
+        spectral_wcs_axis=spectral_wcs_axis,
+        reference_pixel=ref_pixel,
+    )
+
+    order_int = int(order)
+    if data.ndim == 3:
+        subtracted, model, n_total, n_fit = _fit_baseline_single_cube(
+            data,
+            channel_mask=channel_mask,
+            order=order_int,
+        )
+    else:
+        out_dtype = data.dtype if np.issubdtype(data.dtype, np.floating) else np.float32
+        subtracted = np.asarray(data, dtype=out_dtype).copy()
+        model = np.full(data.shape, np.nan, dtype=out_dtype)
+        n_total = 0
+        n_fit = 0
+        for s_idx in range(int(data.shape[0])):
+            s_sub, s_model, s_total, s_fit = _fit_baseline_single_cube(
+                np.asarray(data[s_idx]),
+                channel_mask=channel_mask,
+                order=order_int,
+            )
+            subtracted[s_idx] = s_sub
+            model[s_idx] = s_model
+            n_total += int(s_total)
+            n_fit += int(s_fit)
+
+    return BaselineSubtractionResult(
+        subtracted_data=subtracted,
+        baseline_model=model,
+        order=order_int,
+        world_ranges=normalized_world_ranges,
+        pixel_ranges=pixel_ranges,
+        n_total_spectra=int(n_total),
+        n_fitted_spectra=int(n_fit),
+    )
+
+
+def apply_baseline_subtraction(
+    state: AppState,
+    *,
+    world_ranges: Sequence[WorldRange],
+    order: int = 1,
+    reference_pixel: Optional[Sequence[float]] = None,
+) -> AppState:
+    """Apply polynomial baseline subtraction in-place to state.data."""
+    result = compute_polynomial_baseline_subtraction(
+        state,
+        world_ranges=world_ranges,
+        order=order,
+        reference_pixel=reference_pixel,
+    )
+    state.data = result.subtracted_data
+    spectral_meta = dict(getattr(state, "spectral_metadata", {}) or {})
+    spectral_meta["baseline_last_order"] = int(result.order)
+    spectral_meta["baseline_last_world_ranges"] = [list(pair) for pair in result.world_ranges]
+    spectral_meta["baseline_last_pixel_ranges"] = [list(pair) for pair in result.pixel_ranges]
+    state.spectral_metadata = spectral_meta
+    return state
+

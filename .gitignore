@@ -25,3 +25,6 @@ env/
 # --- Application Configuration & User Data ---
 # Ignore the config directory containing generated files (config.yaml, subplot_params.yaml, takefits.range, etc.)
 config/
+
+# --- Proprietary / Excluded Modules ---
+logic/scimes/
