@@ -1,9 +1,8 @@
 # Takefits
 
 [![PyPI version](https://img.shields.io/pypi/v/takefits)](https://pypi.org/project/takefits/)
-[![ORCID](https://img.shields.io/badge/ORCID-0000--0001--8147--6817-A6CE39?logo=orcid&logoColor=white)](https://orcid.org/0000-0001-8147-6817)
 
-Takefits is a GUI-based astronomical FITS viewer and analysis tool developed by Shunya Takekawa.
+Takefits is a GUI-based astronomical FITS viewer and analysis tool developed by Shunya Takekawa. <a href="https://orcid.org/0000-0001-8147-6817"><img src="https://orcid.org/sites/default/files/images/orcid_16x16.png" alt="ORCID iD" /></a>
 
 ## Requirements
 
