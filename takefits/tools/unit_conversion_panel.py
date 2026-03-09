@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLineEdit, QPushButton, QLabel,
     QHBoxLayout, QMessageBox, QComboBox, QFormLayout, QGroupBox,
 )
+from PySide6.QtCore import Qt
 from takefits.ui.save_fits_dialog import SaveFITS
 from datetime import datetime
 
@@ -35,6 +36,7 @@ class UnitConversionPanel(QWidget):
     
     def __init__(self, fits_viewer, subwindows):
         super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.fits_viewer = fits_viewer
         self.subwindows = subwindows
         self.original_data = None  # Defer copying data
@@ -1519,7 +1521,6 @@ class UnitConversionPanel(QWidget):
                 return
             if choice == "discard":
                 self._discard_pending_close_changes()
-        self.destroyed.emit()
         super().closeEvent(event)
 
     # ------------------------------------------------------------------

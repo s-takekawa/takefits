@@ -1751,5 +1751,4 @@ class ClumpFindingPanel(QWidget):
                 return
             if choice == "discard":
                 self.clear_results()
-        self.destroyed.emit()
         super().closeEvent(event)

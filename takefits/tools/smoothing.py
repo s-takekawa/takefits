@@ -9,10 +9,11 @@ from takefits.tools.base_panel import clear_action_preview_record, confirm_pendi
 import time
 import os
 
-class SmoothSettingsPanel(QDialog): 
+class SmoothSettingsPanel(QDialog):
     def __init__(self, fits_viewer, subwindows):
         super().__init__()
-        self.fits_viewer = fits_viewer        
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.fits_viewer = fits_viewer
         self.header = self.fits_viewer.header
         self.wcs = self.fits_viewer.wcs
         self.subwindows = subwindows
@@ -794,7 +795,6 @@ class SmoothSettingsPanel(QDialog):
             if choice == "discard":
                 self.reset_smoothing()
         super().closeEvent(event)
-        self.destroyed.emit()
 
     def resync_after_workspace_restore(self):
         self._has_pending_changes = bool(has_action_record_tag(self.fits_viewer, self._action_record_tag))

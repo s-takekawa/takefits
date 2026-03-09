@@ -9,6 +9,7 @@ This module provides BaseToolPanel which extracts common patterns from all tool 
 - Close event handling
 """
 from PySide6.QtWidgets import QWidget, QMessageBox, QApplication
+from PySide6.QtCore import Qt
 
 
 def confirm_pending_close(
@@ -254,6 +255,7 @@ class BaseToolPanel(QWidget):
             subwindows: List of subwindow viewers (optional)
         """
         super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.fits_viewer = fits_viewer
         self.subwindows = subwindows if subwindows is not None else []
         self._setup_panel()
@@ -373,5 +375,4 @@ class BaseToolPanel(QWidget):
                 self.discard_pending_changes()
             else:
                 self.on_keep_pending_changes()
-        self.destroyed.emit()
         super().closeEvent(event)

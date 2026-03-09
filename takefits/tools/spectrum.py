@@ -38,6 +38,7 @@ class SpecWindow(QWidget):
     
     def __init__(self, fits_viewer):
         super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.fits_viewer = fits_viewer
         self.wcs = self.fits_viewer.wcs
         self.config = self.fits_viewer.displaymap.config
@@ -1566,11 +1567,8 @@ class SpecWindow(QWidget):
              return None, "Application state not initialized"
 
     def closeEvent(self, event):
-        pass
-
         SpecWindow.is_on = False
         super().closeEvent(event)
-        self.destroyed.emit()
 
 
 

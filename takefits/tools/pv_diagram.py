@@ -111,6 +111,7 @@ class PVNavigationToolbar(MyNavigationToolbar):
 class PVdiagram(QMainWindow):
     def __init__(self, fits_viewer):
         super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.fits_viewer = fits_viewer
         self.wcs = self.fits_viewer.wcs
         if self.fits_viewer.data.ndim == 3:
@@ -2593,6 +2594,9 @@ class PVdiagram(QMainWindow):
         ColorSettingsPanel.settings[ColorMode.INTEG]['min_val'] = None
         ColorSettingsPanel.settings[ColorMode.INTEG]['max_val'] = None
 
-        self._set_canvas_cursor(Qt.CursorShape.ArrowCursor)
+        try:
+            plt.close(self.pv_fig)
+        except Exception:
+            pass
 
-        self.destroyed.emit()
+        self._set_canvas_cursor(Qt.CursorShape.ArrowCursor)

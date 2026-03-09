@@ -141,6 +141,7 @@ class ChannelMapWindow(QMainWindow):
             parent (QWidget): Parent widget.
         """
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.color_settings_panel = None
         self._contour_layer_id = None
         self._contour_title_connected = False
@@ -2436,12 +2437,6 @@ class ChannelMapWindow(QMainWindow):
             self.toolbar._subplot_dialog.close()
             self.toolbar._subplot_dialog = None
         super().closeEvent(event)
-        #event.accept()
-        try:
-            self.destroyed.emit()
-        except Exception:
-            pass
-
 
     def initialize_ranges(self):
         if self.fits_viewer.data.ndim == 3:
@@ -2987,6 +2982,7 @@ class ChannelMapWindow(QMainWindow):
 class ChannelMapSettingPanel(QDialog):
     def __init__(self, fits_viewer, subwindows):
         super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.fits_viewer = fits_viewer
         self.wcs = self.fits_viewer.wcs
         self.subwindows = subwindows

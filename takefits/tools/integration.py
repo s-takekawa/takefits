@@ -45,6 +45,7 @@ from takefits.core.region import CircleRegion, RectangleRegion, EllipseRegion, C
 class IntegSettingsPanel(QDialog):
     def __init__(self, fits_viewer, subwindows):
         super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.filename = fits_viewer.filename
         self.fits_viewer = fits_viewer
         self.color_settings_panel = None
@@ -909,7 +910,6 @@ class IntegSettingsPanel(QDialog):
                 action_name="compute_moment",
             )
         super().closeEvent(event)
-        self.destroyed.emit()
 
 
 class IntegResultWindow(QMainWindow):

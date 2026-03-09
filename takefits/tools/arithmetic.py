@@ -122,6 +122,7 @@ class CubeArithmeticPanel(QWidget):
     
     def __init__(self, fits_viewer, subwindows, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.fits_viewer = fits_viewer
         self.subwindows = subwindows
         self._action_record_tag = "panel:arithmetic"
@@ -657,5 +658,4 @@ class CubeArithmeticPanel(QWidget):
                 self.original_data_map.clear()
                 self.original_bunit_map.clear()
                 self._has_restored_preview = False
-        self.destroyed.emit() 
         super().closeEvent(event)
