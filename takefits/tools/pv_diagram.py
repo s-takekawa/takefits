@@ -788,14 +788,14 @@ class PVdiagram(QMainWindow):
             self.color_settings_panel.activateWindow()
 
     def on_color_settings_closed(self):
-        if self.color_settings_panel is not None:
+        try:
             integ_settings = ColorSettingsPanel.settings[ColorMode.INTEG]
             self.color_pattern = integ_settings['color_pattern']
             self.min_val = integ_settings['min_val']
             self.max_val = integ_settings['max_val']
             if self.min_val is not None and self.max_val is not None:
                 self.is_clim_fixed = True
-                
+
             # Set colormap with bad color
             config = self.fits_viewer.config_manager.config
             bad_color = config.get('bad_color', 'black')
@@ -804,8 +804,9 @@ class PVdiagram(QMainWindow):
             self.pv_im.set_cmap(cmap)
             self.pv_im.set_clim(self.min_val, self.max_val)
             self.pv_canvas.draw()
-            self.color_settings_panel.close()
-            self.color_settings_panel = None
+        except Exception:
+            pass
+        self.color_settings_panel = None
 
     def save_fits(self):
         """Saves the current PV diagram data using core usecase."""

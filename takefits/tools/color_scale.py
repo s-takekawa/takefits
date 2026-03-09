@@ -45,6 +45,7 @@ class ColorSettingsPanel(QWidget):
 
     def __init__(self, fits_viewer, subwindows=None, data=None, config=None, color_pattern=None, bad_color=None, filename = None, mode = ColorMode.MAIN):
         super().__init__()
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.fits_viewer = fits_viewer
         self.subwindows = subwindows
         self.mode = mode
