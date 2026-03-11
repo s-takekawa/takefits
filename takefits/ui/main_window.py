@@ -16,7 +16,7 @@ from takefits.core.annotation_serialization import (
     snapshot_marker_specs,
     snapshot_region_specs,
 )
-from takefits.core.history_provenance import build_processing_history_lines
+from takefits.core.history_provenance import build_processing_history_lines_with_action
 from takefits.core.workspace_restore import (
     build_workspace_restore_diagnostics,
     build_workspace_restore_status_line,
@@ -3290,6 +3290,7 @@ class MainWindow(FITSViewer):
         mode_map = {
             "main": ColorMode.MAIN,
             "integration": ColorMode.INTEG,
+            "pv": ColorMode.PV,
             "channel": ColorMode.CHANNEL,
         }
         state = {}
@@ -3978,11 +3979,28 @@ class MainWindow(FITSViewer):
         )
         global_state["main"] = dict(main_panel_settings)
         self._color_panel_hint_main = dict(main_panel_settings)
+        pv_panel = getattr(getattr(self, "control_panel", None), "pvd_panel", None)
+        pv_image = getattr(pv_panel, "im", None) if pv_panel is not None else None
+        if pv_image is not None:
+            pv_live = self._extract_live_color_panel_settings(getattr(pv_panel, "color_settings_panel", None))
+            pv_hint = getattr(pv_panel, "_color_panel_hint", None)
+            pv_fallback = self._normalize_color_panel_settings(
+                pv_live,
+                fallback=pv_hint,
+            )
+            pv_fallback = self._normalize_color_panel_settings(pv_fallback, fallback=global_state.get("pv"))
+            pv_panel_settings = self._derive_panel_settings_from_image(pv_image, fallback=pv_fallback)
+            global_state["pv"] = dict(pv_panel_settings)
+            try:
+                setattr(pv_panel, "_color_panel_hint", dict(pv_panel_settings))
+            except Exception:
+                pass
         payload = {
             "schema": 2,
             "global": global_state,
             "main": dict(global_state.get("main", {}) or {}),
             "integration": dict(global_state.get("integration", {}) or {}),
+            "pv": dict(global_state.get("pv", {}) or {}),
             "channel": dict(global_state.get("channel", {}) or {}),
             "main_panel_settings": dict(main_panel_settings),
             "main_viewers": {},
@@ -4342,6 +4360,16 @@ class MainWindow(FITSViewer):
                 targets.append((window, [im]))
             return targets
 
+        if mode == "pv":
+            panel = getattr(getattr(self, "control_panel", None), "pvd_panel", None)
+            if panel is None:
+                return targets
+            im = getattr(panel, "im", None)
+            if im is None:
+                return targets
+            targets.append((panel, [im]))
+            return targets
+
         if mode == "channel":
             for window in list(getattr(self, "channel_map_windows", []) or []):
                 if window is None:
@@ -4447,6 +4475,7 @@ class MainWindow(FITSViewer):
         mode_map = {
             "main": ColorMode.MAIN,
             "integration": ColorMode.INTEG,
+            "pv": ColorMode.PV,
             "channel": ColorMode.CHANNEL,
         }
         global_state = color_state.get("global")
@@ -4454,6 +4483,7 @@ class MainWindow(FITSViewer):
             global_state = {
                 "main": color_state.get("main"),
                 "integration": color_state.get("integration"),
+                "pv": color_state.get("pv"),
                 "channel": color_state.get("channel"),
             }
         for name, mode in mode_map.items():
@@ -4466,7 +4496,7 @@ class MainWindow(FITSViewer):
 
         # Apply global settings first (for backward compatibility), then
         # override with per-panel image state when available.
-        for mode_name in ("main", "integration", "channel"):
+        for mode_name in ("main", "integration", "pv", "channel"):
             settings = global_state.get(mode_name)
             if isinstance(settings, dict):
                 self._apply_color_state_to_mode(mode_name, settings)
@@ -6475,33 +6505,12 @@ class MainWindow(FITSViewer):
             self._regrid_panel.on_regrid_finished(True)
         save_header = header.copy() if hasattr(header, "copy") else header
         if save_header is not None and hasattr(save_header, "add_history"):
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            save_header.add_history(f"Regrid executed by takefits on {timestamp}")
-            save_header.add_history(f"Source file: {os.path.basename(self.filename)}")
-
-            params = dict(getattr(self, "_last_regrid_params", {}) or {})
-            mode_key = str(params.get("mode") or "").strip().lower()
-            if mode_key:
-                mode_label = {
-                    "manual": "Manual",
-                    "template_fits": "Template FITS",
-                    "reproject_system": "Reproject System",
-                }.get(mode_key, mode_key)
-                save_header.add_history(f"Mode: {mode_label}")
-
-            target = str(params.get("target_system") or "").strip()
-            if target:
-                save_header.add_history(f"Target System: {target}")
-
-            template_path = str(params.get("template_path") or "").strip()
-            if template_path:
-                save_header.add_history(f"Template file: {os.path.basename(template_path)}")
-
-            interpolation = str(params.get("interpolation") or "").strip()
-            if interpolation:
-                save_header.add_history(f"Interpolation: {interpolation}")
-
-            for entry in build_processing_history_lines(self):
+            history_entries = build_processing_history_lines_with_action(
+                self,
+                "compute_regrid",
+                {"params": dict(getattr(self, "_last_regrid_params", {}) or {})},
+            )
+            for entry in history_entries:
                 save_header.add_history(entry)
 
         saver = SaveFITS(data, save_header, self.filename, original_header=self.header)

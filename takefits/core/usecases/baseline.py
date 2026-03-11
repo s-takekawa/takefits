@@ -8,6 +8,7 @@ import warnings
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.core.io.save_fits import write_fits
 from .utils import axis_world_to_pixel, get_axis_ctype, parse_world_coordinate
 
 
@@ -25,6 +26,10 @@ class BaselineSubtractionResult:
     pixel_ranges: List[Tuple[int, int]]
     n_total_spectra: int
     n_fitted_spectra: int
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return tuple(np.asarray(self.subtracted_data).shape)
 
 
 def _default_reference_pixel(state: AppState) -> Optional[Tuple[float, ...]]:
@@ -291,6 +296,19 @@ def compute_polynomial_baseline_subtraction(
     )
 
 
+def _apply_baseline_result_to_state(
+    state: AppState,
+    result: BaselineSubtractionResult,
+) -> AppState:
+    state.data = result.subtracted_data
+    spectral_meta = dict(getattr(state, "spectral_metadata", {}) or {})
+    spectral_meta["baseline_last_order"] = int(result.order)
+    spectral_meta["baseline_last_world_ranges"] = [list(pair) for pair in result.world_ranges]
+    spectral_meta["baseline_last_pixel_ranges"] = [list(pair) for pair in result.pixel_ranges]
+    state.spectral_metadata = spectral_meta
+    return state
+
+
 def apply_baseline_subtraction(
     state: AppState,
     *,
@@ -305,11 +323,57 @@ def apply_baseline_subtraction(
         order=order,
         reference_pixel=reference_pixel,
     )
-    state.data = result.subtracted_data
-    spectral_meta = dict(getattr(state, "spectral_metadata", {}) or {})
-    spectral_meta["baseline_last_order"] = int(result.order)
-    spectral_meta["baseline_last_world_ranges"] = [list(pair) for pair in result.world_ranges]
-    spectral_meta["baseline_last_pixel_ranges"] = [list(pair) for pair in result.pixel_ranges]
-    state.spectral_metadata = spectral_meta
-    return state
+    return _apply_baseline_result_to_state(state, result)
 
+
+def export_baseline_model_fits(
+    state: AppState,
+    output_path: str,
+    history_entries: Optional[list] = None,
+    result: Optional[BaselineSubtractionResult] = None,
+    baseline_model: Optional[np.ndarray] = None,
+) -> str:
+    """
+    Export a polynomial baseline model cube to FITS.
+
+    Args:
+        state: AppState with original header info.
+        output_path: Path for output FITS file.
+        history_entries: Optional list of HISTORY entries.
+        result: Optional baseline result whose model should be exported.
+        baseline_model: Optional explicit baseline model array.
+
+    Returns:
+        The output file path.
+    """
+    from datetime import datetime
+    from astropy.io import fits
+
+    model = baseline_model
+    if model is None and result is not None:
+        model = result.baseline_model
+    if model is None:
+        raise ValueError("No baseline model available for export.")
+
+    data_to_save = np.asarray(model)
+    header = state.header.copy() if state.header is not None else fits.Header()
+    header["NAXIS"] = data_to_save.ndim
+    for idx, dim in enumerate(data_to_save.shape[::-1], start=1):
+        header[f"NAXIS{idx}"] = int(dim)
+
+    finite = data_to_save[np.isfinite(data_to_save)]
+    if finite.size > 0:
+        header["DATAMIN"] = float(np.min(finite))
+        header["DATAMAX"] = float(np.max(finite))
+    else:
+        header.pop("DATAMIN", None)
+        header.pop("DATAMAX", None)
+
+    header.add_history(
+        f"Baseline model exported using takefits on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    if history_entries:
+        for entry in history_entries:
+            header.add_history(entry)
+
+    return write_fits(output_path, data_to_save, header)

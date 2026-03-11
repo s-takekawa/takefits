@@ -1191,7 +1191,11 @@ class ChannelMapWindow(QMainWindow):
                 if self.wcs.world_axis_physical_types[i] is None: axis_type.append(None)
                 else: axis_type.append(self.wcs.world_axis_physical_types[i].split('.')[-1])
             if 'glon' in ax.coords:
-                ax.coords['glon'].set_coord_type(coord_wrap = self.config.get('coord_wrap'), coord_type = 'longitude')
+                try:
+                    coord_wrap = float(self.config.get('coord_wrap', 180)) * u.deg
+                except Exception:
+                    coord_wrap = 180 * u.deg
+                ax.coords['glon'].set_coord_type(coord_wrap=coord_wrap, coord_type='longitude')
             axis_format_decimal = np.isin(axis_type, ['lon', 'lat'])
             if self.config.get('decimal') == False: axis_format_decimal = [False for _ in axis_format_decimal]
             

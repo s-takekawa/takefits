@@ -20,7 +20,15 @@ from datetime import datetime
 from scipy.ndimage import find_objects
 from scipy import ndimage
 
-from takefits.core.usecases import run_clumpfind, run_fellwalker, run_dendrogram, ClumpResult, check_scimes_availability, generate_catalog
+from takefits.core.usecases import (
+    run_clumpfind,
+    run_fellwalker,
+    run_dendrogram,
+    ClumpResult,
+    check_scimes_availability,
+    generate_catalog,
+    export_clump_mask,
+)
 from takefits.core.history_provenance import build_processing_history_lines
 from takefits.core.contour_manager import ContourManager, ContourParameters, ContourSegment, ContourItemState, ContourState
 from takefits.tools.base_panel import (
@@ -64,6 +72,7 @@ class ClumpFindingPanel(QWidget):
         self.contour_items = []
         self.mask_overlay = None
         self.catalog = []
+        self._last_clump_result = None
 
         self._label_view_active = False
         self._baseline_data = None
@@ -455,30 +464,25 @@ class ClumpFindingPanel(QWidget):
         self.use_scimes = QCheckBox("Use SCIMES clustering")
         
         # Check availability
-        scimes_available = check_scimes_availability()
+        scimes_available, scimes_error = check_scimes_availability()
 
         if not scimes_available:
-            self.use_scimes.setVisible(False)
-            # We also don't add them to layout or hide logic
+            self.use_scimes.setEnabled(False)
+            self.use_scimes.setToolTip(f"SCIMES module is not installed or available.\nError: {scimes_error}")
         else:
             self.use_scimes.setToolTip("Apply SCIMES spectral clustering to group dendrogram leaves")
-            # Signal connected later after scimes_isol is created
 
-        if scimes_available:
-            layout.addWidget(self.use_scimes, 4, 0, 1, 2)
+        layout.addWidget(self.use_scimes, 4, 0, 1, 2)
 
         self.scimes_isol = QCheckBox("Include isolated leaves")
         self.scimes_isol.setChecked(True)
         self.scimes_isol.setEnabled(False) # Default disabled until SCIMES checked
         
-        # If available, connect usage toggle to isolation enable
-        if scimes_available:
-            self.use_scimes.toggled.connect(self.scimes_isol.setEnabled)
-            self.use_scimes.toggled.connect(lambda checked: self.output_mode_combo.setDisabled(checked)) 
-            self.use_scimes.toggled.connect(lambda _checked: self._update_projected_availability())
-            layout.addWidget(self.scimes_isol, 5, 0, 1, 2)
-        else:
-            self.scimes_isol.setVisible(False)
+        # Connect usage toggle to isolation enable (always connect)
+        self.use_scimes.toggled.connect(self.scimes_isol.setEnabled)
+        self.use_scimes.toggled.connect(lambda checked: self.output_mode_combo.setDisabled(checked)) 
+        self.use_scimes.toggled.connect(lambda _checked: self._update_projected_availability())
+        layout.addWidget(self.scimes_isol, 5, 0, 1, 2)
 
         # SCIMES criteria (3D use-case) - includes User K
         crit_group = QGroupBox("SCIMES Options")
@@ -508,11 +512,8 @@ class ClumpFindingPanel(QWidget):
         crit_layout.addWidget(self.user_k_input, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
 
         crit_group.setEnabled(False)
-        if scimes_available:
-            self.use_scimes.toggled.connect(crit_group.setEnabled)
-            layout.addWidget(crit_group, 6, 0, 1, 2)
-        else:
-            crit_group.setVisible(False)
+        self.use_scimes.toggled.connect(crit_group.setEnabled)
+        layout.addWidget(crit_group, 6, 0, 1, 2)
 
         layout.setHorizontalSpacing(8)
         layout.setRowStretch(7, 1)
@@ -647,6 +648,7 @@ class ClumpFindingPanel(QWidget):
 
         self.result_mask = result.mask
         self.catalog = result.catalog
+        self._last_clump_result = result
         
         self._last_run_metadata = {
             "Algorithm": "ClumpFind",
@@ -682,6 +684,7 @@ class ClumpFindingPanel(QWidget):
 
         self.result_mask = result.mask
         self.catalog = result.catalog
+        self._last_clump_result = result
         
         self._last_run_metadata = {
             "Algorithm": "FellWalker",
@@ -765,6 +768,7 @@ class ClumpFindingPanel(QWidget):
 
         self.result_mask = result.mask
         self.catalog = result.catalog
+        self._last_clump_result = result
         
         self.dendro_handler = None # Using usecase, we don't hold the handler reference anymore (unless we wanted to cache for re-runs)
         # Caching logic is moved to usecase or lost?
@@ -818,6 +822,7 @@ class ClumpFindingPanel(QWidget):
         self.result_mask = None
         self._base_result_mask = None
         self.catalog = []
+        self._last_clump_result = None
         self._label_color_map = {}
         self.count_label.setText("Detected: -- clumps")
         self.status_label.setText("Status: Ready")
@@ -1448,8 +1453,6 @@ class ClumpFindingPanel(QWidget):
             QMessageBox.information(self, "Export", "No mask data to export.")
             return
 
-        from astropy.io import fits
-
         # User requested to remove 'test_' from filename if present
         raw_base = os.path.basename(self.fits_viewer.filename)
         base_name = os.path.splitext(raw_base)[0].replace("test_", "")
@@ -1464,43 +1467,38 @@ class ClumpFindingPanel(QWidget):
             return
 
         try:
-            new_header = None
-            if self.header is not None:
-                new_header = self.header.copy()
-                for key in ['SIMPLE', 'BITPIX', 'NAXIS', 'EXTEND', 'BSCALE', 'BZERO', 'BLANK', 'BUNIT']:
-                    if key in new_header:
-                        del new_header[key]
-                naxis = int(new_header.get('NAXIS', 0) or 0)
-                for i in range(1, naxis + 1):
-                    k = f'NAXIS{i}'
-                    if k in new_header:
-                        del new_header[k]
+            state = self.get_app_state()
+            if state is None:
+                raise ValueError("AppState not available")
 
-            if 'DATAMIN' in new_header or 'DATAMAX' in new_header:
-                with np.errstate(all='ignore'):
-                    data_min = float(np.min(self.result_mask))
-                    data_max = float(np.max(self.result_mask))
-                new_header['DATAMIN'] = data_min
-                new_header['DATAMAX'] = data_max
+            result = self._last_clump_result
+            if result is None:
+                parameters = dict(self._last_run_metadata.get("Parameters") or {})
+                algorithm_label = str(self._last_run_metadata.get("Algorithm") or "unknown")
+                algorithm_map = {
+                    "ClumpFind": "clumpfind",
+                    "FellWalker": "fellwalker",
+                    "Dendrogram": "dendrogram",
+                    "SCIMES": "scimes",
+                }
+                base_mask = self._base_result_mask if self._base_result_mask is not None else self.result_mask
+                mask = np.asarray(base_mask, dtype=np.int32)
+                labels = np.unique(mask)
+                n_clumps = int(np.count_nonzero(labels > 0))
+                result = ClumpResult(
+                    mask=mask,
+                    n_clumps=n_clumps,
+                    catalog=list(self.catalog or []),
+                    algorithm=algorithm_map.get(algorithm_label, algorithm_label.lower()),
+                    parameters=parameters,
+                )
 
-            hdu = fits.PrimaryHDU(self.result_mask.astype(np.int32), header=new_header)
-            
-            # Add History
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            hdu.header.add_history(f"Clump Finding Mask generated by takefits on {timestamp}")
-            hdu.header.add_history(f"Source file: {os.path.basename(self.fits_viewer.filename)}")
-
-            if self._last_run_metadata:
-                algo = self._last_run_metadata.get("Algorithm", "Unknown")
-                hdu.header.add_history(f"Algorithm: {algo}")
-                params = self._last_run_metadata.get("Parameters", {})
-                for k, v in params.items():
-                    hdu.header.add_history(f"  {k}: {v}")
-            for entry in build_processing_history_lines(self.fits_viewer):
-                hdu.header.add_history(entry)
-
-            hdu.writeto(path, overwrite=True)
-
+            export_clump_mask(
+                state,
+                result,
+                path,
+                history_entries=build_processing_history_lines(self.fits_viewer),
+            )
             QMessageBox.information(self, "Export", f"Mask exported to:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Failed to export mask:\n{e}")

@@ -2,6 +2,7 @@ from matplotlib.axes import Axes
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import astropy.units as u
 from typing import TYPE_CHECKING
 
 from takefits.logic.data_tools import (
@@ -18,6 +19,13 @@ if TYPE_CHECKING:
 class TransparentOverlayAxes(Axes):
     def contains(self, mouseevent):
         return False, {}
+
+
+def _coord_wrap_quantity(value, default):
+    try:
+        return float(value) * u.deg
+    except Exception:
+        return float(default) * u.deg
 
 class DisplayMap:
     def __init__(
@@ -425,7 +433,7 @@ class DisplayMap:
             ctype_str = (axis_ctype[idx] or '').upper()
             ctype_head = ctype_str.split('-')[0]
             if ctype_head.startswith('RA'):
-                coord.set_coord_type('longitude', coord_wrap=360)
+                coord.set_coord_type('longitude', coord_wrap=360 * u.deg)
                 if self.decimal:
                     coord.set_format_unit('deg', decimal=True)
                 else:
@@ -435,7 +443,10 @@ class DisplayMap:
                 coord.set_format_unit('deg', decimal=self.decimal)
             elif any(keyword in ctype_head for keyword in ['GLON', 'GLAT', 'OFFSET']):
                 if 'GLON' in ctype_head:
-                    coord.set_coord_type('longitude', coord_wrap=self.coord_wrap)
+                    coord.set_coord_type(
+                        'longitude',
+                        coord_wrap=_coord_wrap_quantity(self.coord_wrap, 180),
+                    )
                 else:
                     coord.set_coord_type('latitude')
                 coord.set_format_unit('deg', decimal=self.decimal)

@@ -15,9 +15,8 @@ from takefits.tools.color_scale import ColorSettingsPanel, ColorMode
 from takefits.core.contour_manager import ContourManager, ContourItem
 from takefits.core.coordinate import CoordinateConverter
 from astropy.wcs.utils import proj_plane_pixel_scales
-from takefits.core.history_provenance import build_processing_history_lines
+from takefits.core.history_provenance import build_processing_history_lines_with_action
 from takefits.core.usecases import compute_pv, set_pv_endpoints, export_pv_fits, export_figure
-from datetime import datetime
 
 
 class PVNavigationToolbar(MyNavigationToolbar):
@@ -128,14 +127,15 @@ class PVdiagram(QMainWindow):
         self.color_settings_panel = None
         self._contour_layer_id: Optional[str] = None
         self._contour_title_connected = False
-        integ_settings = ColorSettingsPanel.settings[ColorMode.INTEG]
+        pv_settings = ColorSettingsPanel.settings[ColorMode.PV]
         self.color_pattern = (
-            integ_settings['color_pattern'] or
+            pv_settings['color_pattern'] or
             ColorSettingsPanel.settings[ColorMode.MAIN]['color_pattern'] or
             self.fits_viewer.displaymap.config.get('colorscale')
         )
-        self.min_val = integ_settings['min_val']
-        self.max_val = integ_settings['max_val']
+        self.min_val = pv_settings['min_val']
+        self.max_val = pv_settings['max_val']
+        self._color_panel_hint = dict(pv_settings or {})
 
         if self.min_val is not None and self.max_val is not None:
             self.is_clim_fixed = True
@@ -152,6 +152,7 @@ class PVdiagram(QMainWindow):
         self.drag_start = None
         self.initial_line_start = None
         self.initial_line_end = None
+        self._pending_precise_world_line = None
 
         # For rotate mode: center, initial angle, and line length
         self.center = None
@@ -726,6 +727,7 @@ class PVdiagram(QMainWindow):
                 self.startLonEdit.text(), self.startLatEdit.text()
             )
             start_x, start_y = start_pix[0], start_pix[1]
+            exact_start = (float(start_x), float(start_y))
 
             self.startXSpin.blockSignals(True)
             self.startYSpin.blockSignals(True)
@@ -739,6 +741,7 @@ class PVdiagram(QMainWindow):
                 self.endLonEdit.text(), self.endLatEdit.text()
             )
             end_x, end_y = end_pix[0], end_pix[1]
+            exact_end = (float(end_x), float(end_y))
 
             self.endXSpin.blockSignals(True)
             self.endYSpin.blockSignals(True)
@@ -746,6 +749,10 @@ class PVdiagram(QMainWindow):
             self.endYSpin.setValue(end_y)
             self.endXSpin.blockSignals(False)
             self.endYSpin.blockSignals(False)
+
+            # Preserve full-precision endpoints for this update; the spinboxes
+            # remain rounded for display only.
+            self._pending_precise_world_line = (exact_start, exact_end)
             
             # If successful, trigger arrow update
             self.apply_controls()
@@ -771,10 +778,61 @@ class PVdiagram(QMainWindow):
         self.endLonEdit.blockSignals(False)
         self.endLatEdit.blockSignals(False)
 
+    def _seed_color_panel_settings_from_current_image(self):
+        settings = {
+            "min_val": None,
+            "max_val": None,
+            "log_scale": False,
+            "gamma_value": 1.0,
+            "invert": False,
+            "color_pattern": None,
+        }
+        raw = dict(ColorSettingsPanel.settings.get(ColorMode.PV, {}) or {})
+        if isinstance(raw, dict):
+            settings.update(raw)
+        hint = getattr(self, "_color_panel_hint", None)
+        if isinstance(hint, dict):
+            settings.update(hint)
+
+        image = getattr(self, "im", None)
+        if image is not None:
+            try:
+                clim = image.get_clim()
+                if clim is not None:
+                    settings["min_val"] = float(clim[0])
+                    settings["max_val"] = float(clim[1])
+            except Exception:
+                pass
+            try:
+                settings["log_scale"] = isinstance(getattr(image, "norm", None), mpl.colors.LogNorm)
+            except Exception:
+                pass
+            try:
+                cmap_name = str(getattr(image.get_cmap(), "name", "") or "")
+                if cmap_name.endswith("_r"):
+                    base = cmap_name[:-2]
+                    if base and base != "from_list":
+                        settings["color_pattern"] = base
+                        settings["invert"] = True
+                elif cmap_name and cmap_name != "from_list":
+                    settings["color_pattern"] = cmap_name
+                    settings["invert"] = False
+            except Exception:
+                pass
+        try:
+            settings["gamma_value"] = float(settings.get("gamma_value", 1.0) or 1.0)
+        except Exception:
+            settings["gamma_value"] = 1.0
+
+        self._color_panel_hint = dict(settings)
+        ColorSettingsPanel.settings[ColorMode.PV] = dict(settings)
+        return settings
+
     def open_color_settings(self):
+        self._seed_color_panel_settings_from_current_image()
         if self.color_settings_panel is None:
             self.color_settings_panel = ColorSettingsPanel(
-                mode=ColorMode.INTEG,
+                mode=ColorMode.PV,
                 fits_viewer=self,
                 data=self.data,
                 config=self.fits_viewer.displaymap.config,
@@ -790,10 +848,14 @@ class PVdiagram(QMainWindow):
 
     def on_color_settings_closed(self):
         try:
-            integ_settings = ColorSettingsPanel.settings[ColorMode.INTEG]
-            self.color_pattern = integ_settings['color_pattern']
-            self.min_val = integ_settings['min_val']
-            self.max_val = integ_settings['max_val']
+            self._color_panel_hint = dict(ColorSettingsPanel.settings.get(ColorMode.PV, {}) or {})
+            pattern = str(self._color_panel_hint.get("color_pattern") or "")
+            if pattern:
+                if bool(self._color_panel_hint.get("invert")) and not pattern.endswith("_r"):
+                    pattern = f"{pattern}_r"
+                self.color_pattern = pattern
+            self.min_val = self._color_panel_hint['min_val']
+            self.max_val = self._color_panel_hint['max_val']
             if self.min_val is not None and self.max_val is not None:
                 self.is_clim_fixed = True
 
@@ -815,25 +877,31 @@ class PVdiagram(QMainWindow):
             QMessageBox.warning(self, "Save Error", "Please draw a PV slice on the main window first before saving.")
             return
 
-        # Prepare history
-        history = [
-            f"PV Diagram created by takefits on {datetime.now().isoformat()}",
-            f"Source file: {self.fits_viewer.filename}",
-            f"Slice Start (pix): ({self.line_start[0]:.2f}, {self.line_start[1]:.2f})",
-            f"Slice End (pix): ({self.line_end[0]:.2f}, {self.line_end[1]:.2f})"
-        ]
+        action_params = {
+            "width": float(self.sliceWidthSpin.value()),
+        }
+        if int(self.weight_mode) != 0:
+            action_params["weight_mode"] = int(self.weight_mode)
         try:
             start_world = self.coord_converter.pix_to_world(self.line_start[0], self.line_start[1])
             end_world = self.coord_converter.pix_to_world(self.line_end[0], self.line_end[1])
-            history.append(f"Slice Start (world): ({start_world[0]}, {start_world[1]})")
-            history.append(f"Slice End (world): ({end_world[0]}, {end_world[1]})")
+            action_params["start_world"] = [f"{float(start_world[0]):.6f}", f"{float(start_world[1]):.6f}"]
+            action_params["end_world"] = [f"{float(end_world[0]):.6f}", f"{float(end_world[1]):.6f}"]
         except Exception:
-            history.append("Could not convert slice endpoints to world coordinates.")
-        
-        history.append(f"Slice Width (pix): {self.sliceWidthSpin.value()}")
-        interp_mode = "Gaussian" if self.weight_mode == 1 else "Bilinear"
-        history.append(f"Interpolation Mode: {interp_mode}")
-        history.extend(build_processing_history_lines(self.fits_viewer))
+            action_params.update(
+                {
+                    "x0": float(self.line_start[0]),
+                    "y0": float(self.line_start[1]),
+                    "x1": float(self.line_end[0]),
+                    "y1": float(self.line_end[1]),
+                }
+            )
+
+        history = build_processing_history_lines_with_action(
+            self.fits_viewer,
+            "compute_pv",
+            action_params,
+        )
 
         # Get AppState
         app_state = self.get_app_state()
@@ -1117,8 +1185,13 @@ class PVdiagram(QMainWindow):
         self.update_pv_diagram()
 
     def apply_controls(self):
-        gui_start = (self.startXSpin.value(), self.startYSpin.value())
-        gui_end = (self.endXSpin.value(), self.endYSpin.value())
+        precise_line = self._pending_precise_world_line
+        if precise_line is not None:
+            gui_start, gui_end = precise_line
+            self._pending_precise_world_line = None
+        else:
+            gui_start = (self.startXSpin.value(), self.startYSpin.value())
+            gui_end = (self.endXSpin.value(), self.endYSpin.value())
         tol_coord = 1e-2
         if (self.line_start is None or self.line_end is None or
             np.hypot(gui_start[0] - self.line_start[0], gui_start[1] - self.line_start[1]) > tol_coord or
@@ -1674,11 +1747,11 @@ class PVdiagram(QMainWindow):
             self.pv_ax.set_ylabel(vel_label)
 
         # Update color scale limits
-        integ_settings = ColorSettingsPanel.settings[ColorMode.INTEG]
-        if integ_settings['min_val'] is not None and integ_settings['max_val'] is not None:
-            if not self.is_clim_fixed or self.min_val != integ_settings['min_val'] or self.max_val != integ_settings['max_val']:
-                self.min_val = integ_settings['min_val']
-                self.max_val = integ_settings['max_val']
+        pv_settings = ColorSettingsPanel.settings[ColorMode.PV]
+        if pv_settings['min_val'] is not None and pv_settings['max_val'] is not None:
+            if not self.is_clim_fixed or self.min_val != pv_settings['min_val'] or self.max_val != pv_settings['max_val']:
+                self.min_val = pv_settings['min_val']
+                self.max_val = pv_settings['max_val']
                 self.is_clim_fixed = True
 
         if self.is_clim_fixed:
@@ -2591,8 +2664,8 @@ class PVdiagram(QMainWindow):
         if self.color_settings_panel is not None:
             self.color_settings_panel.close()
             self.color_settings_panel = None
-        ColorSettingsPanel.settings[ColorMode.INTEG]['min_val'] = None
-        ColorSettingsPanel.settings[ColorMode.INTEG]['max_val'] = None
+        ColorSettingsPanel.settings[ColorMode.PV]['min_val'] = None
+        ColorSettingsPanel.settings[ColorMode.PV]['max_val'] = None
 
         try:
             plt.close(self.pv_fig)

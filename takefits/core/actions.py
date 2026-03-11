@@ -70,7 +70,7 @@ class ActionRegistry:
         }
 
         for param_name, param in sig.parameters.items():
-            if param_name == 'state': # Skip injected state
+            if param_name in {'state', 'result'}: # Skip injected values
                 continue
                 
             python_type = type_hints.get(param_name, Any)
@@ -147,6 +147,61 @@ def _apply_regrid(state: AppState, params: Dict[str, Any]) -> AppState:
     state.header = result.header
     state.wcs = result.wcs
     return state
+
+
+def _export_pv_from_result(
+    state: AppState,
+    result: Any,
+    output_path: str,
+    x0: Optional[float] = None,
+    y0: Optional[float] = None,
+    x1: Optional[float] = None,
+    y1: Optional[float] = None,
+    is_swapped: bool = False,
+    history_entries: Optional[List[str]] = None,
+) -> str:
+    if x0 is None:
+        x0 = getattr(state, "pv_x0", None)
+    if y0 is None:
+        y0 = getattr(state, "pv_y0", None)
+    if x1 is None:
+        x1 = getattr(state, "pv_x1", None)
+    if y1 is None:
+        y1 = getattr(state, "pv_y1", None)
+    if any(value is None for value in (x0, y0, x1, y1)):
+        raise ValueError("PV export requires slice endpoints or a prior compute_pv action.")
+    return usecases.export_pv_fits(
+        state,
+        result,
+        output_path,
+        x0=float(x0),
+        y0=float(y0),
+        x1=float(x1),
+        y1=float(y1),
+        is_swapped=is_swapped,
+        history_entries=history_entries,
+    )
+
+
+def _apply_baseline_subtraction_with_result(
+    state: AppState,
+    world_ranges: List[List[float]],
+    order: int = 1,
+    reference_pixel: Optional[List[float]] = None,
+):
+    result = usecases.compute_polynomial_baseline_subtraction(
+        state,
+        world_ranges=world_ranges,
+        order=order,
+        reference_pixel=reference_pixel,
+    )
+    state.data = result.subtracted_data
+    spectral_meta = dict(getattr(state, "spectral_metadata", {}) or {})
+    spectral_meta["baseline_last_order"] = int(result.order)
+    spectral_meta["baseline_last_world_ranges"] = [list(pair) for pair in result.world_ranges]
+    spectral_meta["baseline_last_pixel_ranges"] = [list(pair) for pair in result.pixel_ranges]
+    state.spectral_metadata = spectral_meta
+    return result
 
 def _wrap_load_fits(filepath: str, hdu: int = 0) -> str:
     # This action updates the GLOBAL state (simulated here for now)
@@ -257,15 +312,17 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_pv_fits",
         description="Export PV data to FITS.",
-        handler=usecases.export_pv_fits,
+        handler=_export_pv_from_result,
         params_schema={
             "type": "object",
             "properties": {
                 "output_path": {"type": "string"},
                 "x0": {"type": "number"}, "y0": {"type": "number"},
-                "x1": {"type": "number"}, "y1": {"type": "number"}
+                "x1": {"type": "number"}, "y1": {"type": "number"},
+                "is_swapped": {"type": "boolean"},
+                "history_entries": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["output_path", "x0", "y0", "x1", "y1"]
+            "required": ["output_path"]
         }
     )
 
@@ -436,7 +493,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="apply_baseline_subtraction",
         description="Apply polynomial baseline subtraction using world-coordinate line-free ranges.",
-        handler=usecases.apply_baseline_subtraction,
+        handler=_apply_baseline_subtraction_with_result,
         params_schema={
             "type": "object",
             "properties": {
@@ -463,6 +520,20 @@ def register_default_actions(registry: ActionRegistry):
                 },
             },
             "required": ["world_ranges"],
+        },
+    )
+
+    registry.register(
+        name="export_baseline_model_fits",
+        description="Export the most recent baseline model to FITS.",
+        handler=usecases.export_baseline_model_fits,
+        params_schema={
+            "type": "object",
+            "properties": {
+                "output_path": {"type": "string"},
+                "history_entries": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["output_path"],
         },
     )
 
@@ -599,7 +670,8 @@ def register_default_actions(registry: ActionRegistry):
         params_schema={
             "type": "object",
             "properties": {
-                "output_path": {"type": "string", "description": "Output FITS file path."}
+                "output_path": {"type": "string", "description": "Output FITS file path."},
+                "history_entries": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["output_path"]
         }
@@ -662,7 +734,8 @@ def register_default_actions(registry: ActionRegistry):
             "type": "object",
             "properties": {
                 "output_path": {"type": "string", "description": "Output FITS file path."},
-                "source_filename": {"type": "string", "description": "Original source filename."}
+                "source_filename": {"type": "string", "description": "Original source filename."},
+                "history_entries": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["output_path"]
         }
@@ -772,6 +845,40 @@ def register_default_actions(registry: ActionRegistry):
                     "minItems": 2, "maxItems": 2
                 },
                 "title": {"type": "string"}
+            },
+            "required": ["output_path"]
+        }
+    )
+
+    registry.register(
+        name="export_moment_fits",
+        description="Compute and export moment map as FITS file.",
+        handler=usecases.export_moment_map_fits,
+        params_schema={
+            "type": "object",
+            "properties": {
+                "output_path": {"type": "string"},
+                "moment_type": {"type": "string", "enum": ["moment0", "moment1", "moment2", "average", "peak"]},
+                "axis": {"type": "integer"},
+                "pixel_range": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2
+                },
+                "world_range": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2
+                },
+                "history_entries": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "display_fits_axes": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 2, "maxItems": 2
+                }
             },
             "required": ["output_path"]
         }

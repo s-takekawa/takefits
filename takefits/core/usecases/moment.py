@@ -1,15 +1,25 @@
 """Moment map usecases."""
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union, Literal
+import os
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 
 from takefits.core.app_state import AppState
-from .utils import axis_world_to_pixel, update_datamin_datamax_if_present
+from .utils import axis_pixel_to_world, axis_world_to_pixel, update_datamin_datamax_if_present
 
 
 MomentType = Literal["moment0", "moment1", "moment2", "average", "peak"]
+
+
+_MOMENT_HISTORY_PREFIX = "Integration executed by takefits on "
+_MOMENT_HISTORY_FIELD_PREFIXES = (
+    ("Source file:", "source_file"),
+    ("Mode:", "mode"),
+    ("Axis:", "axis"),
+    ("Clipping:", "clipping"),
+)
 
 
 def _normalize_unit_text(unit) -> str:
@@ -45,6 +55,180 @@ def _canonical_moment_type(moment_type: str) -> str:
         "sigma": "sigma",
     }
     return aliases.get(key, key)
+
+
+def _format_history_scalar(value: Union[float, int, str, None]) -> str:
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, int):
+        return str(value)
+    return str(value)
+
+
+def _moment_axis_name(integration_axis: int) -> str:
+    axis_name = "Unknown"
+    if integration_axis == 0:
+        axis_name = "Z (Depth/Spectral)"
+    elif integration_axis == 1:
+        axis_name = "Y (Lat/Dec)"
+    elif integration_axis == 2:
+        axis_name = "X (Lon/RA)"
+    return axis_name
+
+
+def _moment_range_label(
+    source: Any,
+    integration_axis: int,
+    history_metadata: Optional[dict] = None,
+) -> str:
+    metadata = history_metadata or {}
+    metadata_label = str(metadata.get("range_label") or "").strip()
+    if metadata_label and metadata_label.lower() != "range":
+        return metadata_label
+
+    fits_axis = {0: 3, 1: 2, 2: 1}.get(int(integration_axis), 3)
+    header = getattr(source, "header", None)
+    ctype = ""
+    if header is not None:
+        try:
+            ctype = str(header.get(f"CTYPE{fits_axis}", "") or "").strip()
+        except Exception:
+            ctype = ""
+
+    if not ctype:
+        wcs = getattr(source, "wcs", None)
+        if wcs is not None:
+            try:
+                ctype = str(wcs.wcs.ctype[fits_axis - 1] or "").strip()
+            except Exception:
+                ctype = ""
+
+    base = ctype.split("-")[0].strip() if ctype else ""
+    return base or f"Axis {fits_axis}"
+
+
+def _moment_range_history_line(
+    source: Any,
+    integration_axis: int,
+    range_text: str,
+    history_metadata: Optional[dict] = None,
+) -> str:
+    return f"{_moment_range_label(source, integration_axis, history_metadata)}: {range_text}"
+
+
+def _parse_moment_history_field(line: str, block_meta: dict) -> bool:
+    for prefix, key in _MOMENT_HISTORY_FIELD_PREFIXES:
+        if line.startswith(prefix):
+            block_meta[key] = line[len(prefix):].strip()
+            return True
+
+    if line.startswith("Range:"):
+        block_meta["range"] = line[len("Range:"):].strip()
+        block_meta["range_label"] = "Range"
+        return True
+
+    if ":" not in line or "range" in block_meta:
+        return False
+
+    label, value = line.split(":", 1)
+    label = label.strip()
+    value = value.strip()
+    if not label or not value or " " in label:
+        return False
+
+    block_meta["range_label"] = label
+    block_meta["range"] = value
+    return True
+
+
+def _sanitize_moment_history_entries(history_entries: Optional[list]) -> Tuple[dict, List[str]]:
+    entries = [str(entry) for entry in (history_entries or []) if entry is not None]
+    metadata: dict = {}
+    sanitized: List[str] = []
+    idx = 0
+
+    while idx < len(entries):
+        line = entries[idx]
+        if not line.startswith(_MOMENT_HISTORY_PREFIX):
+            sanitized.append(line)
+            idx += 1
+            continue
+
+        block_meta: dict = {}
+        idx += 1
+        while idx < len(entries):
+            field_line = entries[idx]
+            if _parse_moment_history_field(field_line, block_meta):
+                idx += 1
+                continue
+            else:
+                break
+
+        if not metadata and block_meta:
+            metadata = block_meta
+
+    return metadata, sanitized
+
+
+def _format_history_range_from_world_range(
+    world_range: Tuple[Union[float, str], Union[float, str]],
+) -> str:
+    return f"{_format_history_scalar(world_range[0])} to {_format_history_scalar(world_range[1])}"
+
+
+def _format_history_range_from_pixel_range(
+    state: AppState,
+    pixel_range: Tuple[float, float],
+    integration_axis: int,
+) -> str:
+    lo = float(pixel_range[0])
+    hi = float(pixel_range[1])
+    if lo > hi:
+        lo, hi = hi, lo
+
+    if state.wcs is not None:
+        wcs_axis = {0: 2, 1: 1, 2: 0}.get(int(integration_axis), 2)
+        try:
+            world_lo = axis_pixel_to_world(state, lo, wcs_axis)
+            world_hi = axis_pixel_to_world(state, hi, wcs_axis)
+            return f"{_format_history_scalar(world_lo)} to {_format_history_scalar(world_hi)}"
+        except Exception:
+            pass
+
+    return f"ch {_format_history_scalar(lo)} to {_format_history_scalar(hi)}"
+
+
+def _derive_history_range_text(
+    state: AppState,
+    integration_axis: int,
+    history_metadata: dict,
+    pixel_range: Optional[Tuple[float, float]] = None,
+    world_range: Optional[Tuple[Union[float, str], Union[float, str]]] = None,
+) -> str:
+    if world_range is not None:
+        return _format_history_range_from_world_range(world_range)
+
+    if pixel_range is not None:
+        return _format_history_range_from_pixel_range(state, pixel_range, integration_axis)
+
+    history_range = str(history_metadata.get("range", "") or "").strip()
+    if history_range and history_range.lower() != "none to none":
+        return history_range
+
+    if state.integ_min is not None and state.integ_max is not None:
+        return (
+            f"{_format_history_scalar(state.integ_min)} to "
+            f"{_format_history_scalar(state.integ_max)}"
+        )
+
+    if state.integ_min_pix is not None and state.integ_max_pix is not None:
+        return _format_history_range_from_pixel_range(
+            state,
+            (float(state.integ_min_pix), float(state.integ_max_pix)),
+            integration_axis,
+        )
+
+    return "full range"
 
 
 def _axis_unit_for_integration_axis(state: AppState, integration_axis: int) -> str:
@@ -629,6 +813,48 @@ def compute_moment(
 
     raise ValueError(f"Unknown moment type: {moment_type}")
 
+def export_moment_map_fits(
+    state: AppState,
+    output_path: str,
+    moment_type: str = "moment0",
+    axis: int = 0,
+    pixel_range: Optional[Tuple[float, float]] = None,
+    world_range: Optional[Tuple[Union[float, str], Union[float, str]]] = None,
+    history_entries: Optional[list] = None,
+    display_fits_axes: Optional[Tuple[int, int]] = None,
+) -> str:
+    """
+    Compute a moment map and export it as a FITS file (for CLI actions).
+
+    Args:
+        state: AppState containing data and parameters
+        output_path: Path for output FITS file
+        moment_type: Type of moment map (e.g., "moment0")
+        axis: Axis to integrate along (0=z, 1=y, 2=x)
+        pixel_range: Integration range in pixels
+        world_range: Integration range in world coords
+        history_entries: Optional list of HISTORY entries
+        display_fits_axes: Original FITS axes to keep as (axis1, axis2)
+    """
+    moment_data = compute_moment(
+        state=state,
+        moment_type=moment_type,
+        axis=axis,
+        pixel_range=pixel_range,
+        world_range=world_range,
+    )
+    return export_moment_fits(
+        state=state,
+        moment_data=moment_data,
+        output_path=output_path,
+        moment_type=moment_type,
+        history_entries=history_entries,
+        display_fits_axes=display_fits_axes,
+        integration_axis=axis,
+        pixel_range=pixel_range,
+        world_range=world_range,
+    )
+
 
 def export_moment_fits(
     state: AppState,
@@ -638,6 +864,8 @@ def export_moment_fits(
     history_entries: Optional[list] = None,
     display_fits_axes: Optional[Tuple[int, int]] = None,
     integration_axis: int = 0,
+    pixel_range: Optional[Tuple[float, float]] = None,
+    world_range: Optional[Tuple[Union[float, str], Union[float, str]]] = None,
 ) -> str:
     """
     Export a moment map to a FITS file.
@@ -652,6 +880,8 @@ def export_moment_fits(
             Examples: (1,2)=XY, (1,3)=XZ, (3,2)=ZY.
         integration_axis: Numpy axis integrated in the source cube
             (0=z/spectral, 1=y, 2=x). Used for BUNIT inference.
+        pixel_range: Optional integration range in pixels for HISTORY generation.
+        world_range: Optional integration range in world coordinates for HISTORY generation.
 
     Returns:
         The output file path
@@ -735,9 +965,64 @@ def export_moment_fits(
         header["BUNIT"] = inferred_bunit
 
     # Add history
-    if history_entries:
-        for entry in history_entries:
-            header.add_history(entry)
+    from datetime import datetime
+
+    full_history = []
+    history_metadata, sanitized_history_entries = _sanitize_moment_history_entries(history_entries)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    full_history.append(f"Integration executed by takefits on {timestamp}")
+
+    metadata_source_file = str(history_metadata.get("source_file") or "").strip()
+    filepath = getattr(state, "filepath", None)
+    safe_filepath = (
+        metadata_source_file
+        or (os.path.basename(filepath) if filepath else "unknown_source.fits")
+    )
+    full_history.append(f"Source file: {safe_filepath}")
+
+    mode_map = {
+        'int': 'Integration', 'moment0': 'Integration', 'moment1': 'Moment 1', 'moment2': 'Moment 2',
+        'average': 'Average', 'peak_int': 'Peak Intensity', 'peak': 'Peak Intensity', 
+        'peak_corrd': 'Peak Coordinate', 'median_int': 'Median', 'rms': 'RMS',
+        'sigma': 'Sigma (Std Dev)'
+    }
+    mode_str = str(history_metadata.get("mode") or "").strip() or mode_map.get(moment_type, moment_type)
+    full_history.append(f"Mode: {mode_str}")
+    
+    axis_name = _moment_axis_name(integration_axis)
+    full_history.append(f"Axis: {axis_name}")
+
+    range_str = _derive_history_range_text(
+        state,
+        integration_axis,
+        history_metadata,
+        pixel_range=pixel_range,
+        world_range=world_range,
+    )
+    full_history.append(
+        _moment_range_history_line(
+            state,
+            integration_axis,
+            range_str,
+            history_metadata=history_metadata,
+        )
+    )
+
+    clip_thresh = history_metadata.get(
+        "clipping",
+        getattr(state, 'clip_threshold', getattr(state, 'moment_clip', 'None')),
+    )
+    full_history.append(f"Clipping: {clip_thresh}")
+
+    if sanitized_history_entries:
+        for entry in sanitized_history_entries:
+            full_history.append(entry)
+
+    # Add back to header retaining order
+    if 'HISTORY' in header:
+        del header['HISTORY']
+    for entry in full_history:
+        header.add_history(entry)
 
     update_datamin_datamax_if_present(header, moment_data)
 

@@ -5,6 +5,7 @@ import os
 import json
 import uuid
 from typing import List, Optional
+import astropy.units as u
 from PySide6.QtWidgets import QWidget, QMainWindow, QDialog, QGridLayout, QGroupBox, QVBoxLayout, QComboBox, QLineEdit, QPushButton, QRadioButton, QCheckBox, QLabel, QButtonGroup, QMessageBox, QFileDialog
 from PySide6.QtCore import Qt, QTimer, QSignalBlocker
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
@@ -32,7 +33,10 @@ from takefits.core.annotation_serialization import (
     snapshot_marker_specs,
     snapshot_region_specs,
 )
-from takefits.core.history_provenance import build_processing_history_lines
+from takefits.core.history_provenance import (
+    build_processing_history_lines,
+    build_processing_history_lines_with_action,
+)
 from takefits.tools.base_panel import (
     clear_action_preview_record,
     confirm_pending_close,
@@ -477,7 +481,13 @@ class IntegSettingsPanel(QDialog):
         min_world = getattr(self, "min_input", None)
         max_world = getattr(self, "max_input", None)
         if min_world is not None and max_world is not None:
-            payload["world_range"] = [str(min_world), str(max_world)]
+            world_range = []
+            for value in (min_world, max_world):
+                try:
+                    world_range.append(float(str(value)))
+                except (TypeError, ValueError):
+                    world_range.append(str(value))
+            payload["world_range"] = world_range
         if clip_threshold is not None:
             payload["clip_threshold"] = float(clip_threshold)
         tag = str(action_tag or "").strip()
@@ -1431,7 +1441,11 @@ class IntegResultWindow(QMainWindow):
             if self.wcs.world_axis_physical_types[i] is None: axis_type.append(None)
             else: axis_type.append(self.wcs.world_axis_physical_types[i].split('.')[-1])
         if 'glon' in self.ax.coords:
-            self.ax.coords['glon'].set_coord_type(coord_wrap = config.get('coord_wrap'), coord_type = 'longitude')
+            try:
+                coord_wrap = float(config.get('coord_wrap', 180)) * u.deg
+            except Exception:
+                coord_wrap = 180 * u.deg
+            self.ax.coords['glon'].set_coord_type(coord_wrap=coord_wrap, coord_type='longitude')
         axis_format_decimal = np.isin(axis_type, ['lon', 'lat'])
         if config.get('decimal') == False: axis_format_decimal = [False for _ in axis_format_decimal]
         
@@ -4006,6 +4020,11 @@ class IntegResultWindow(QMainWindow):
         ContourManager.instance().unregister_layer(self._contour_layer_id)
         self._contour_layer_id = None
 
+    def get_app_state(self):
+        session_state = getattr(getattr(self, "action_session", None), "state", None)
+        if session_state is not None:
+            return session_state
+        return getattr(self, "app_state", None)
 
     def save_fits(self):
         # Generate default filename
@@ -4020,43 +4039,54 @@ class IntegResultWindow(QMainWindow):
         if not filename:
              return
 
-        # Prepare History
-        history = []
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        history.append(f"Integration executed by takefits on {timestamp}")
-        history.append(f"Source file: {os.path.basename(self.fits_viewer.filename)}")
-
-        if self.history_metadata:
-             mode_map = {
-                'int': 'Integration', 'mom1': 'Moment 1', 'mom2': 'Moment 2',
-                'average': 'Average', 'peak_int': 'Peak Intensity', 
-                'peak_corrd': 'Peak Coordinate', 'median_int': 'Median', 'rms': 'RMS',
-                'sigma': 'Sigma (Std Dev)'
-            }
-             mode_str = mode_map.get(self.history_metadata.get('mode'), self.history_metadata.get('mode'))
-             history.append(f"Mode: {mode_str}")
-             
-             axis_idx = self.history_metadata.get('axis')
-             axis_name = "Unknown"
-             if axis_idx == 0: axis_name = "Z (Depth/Spectral)" 
-             elif axis_idx == 1: axis_name = "Y (Lat/Dec)"
-             elif axis_idx == 2: axis_name = "X (Lon/RA)"
-             history.append(f"Axis: {axis_name}")
-             history.append(f"Range: {self.history_metadata.get('range')}")
-             history.append(f"Clipping: {self.history_metadata.get('clipping')}")
-
-        history.extend(build_processing_history_lines(self.fits_viewer))
-
         # Robustly get spectral metadata
         spec_meta = getattr(self.fits_viewer, 'spectral_metadata', {})
+        source_state = self.get_app_state()
+        history = build_processing_history_lines(self.fits_viewer)
+        if not history:
+            fallback_params = {
+                "moment_type": self.integ_mode,
+                "axis": int(getattr(self, "integ_axis", 0) or 0),
+            }
+            if source_state is not None:
+                if (
+                    getattr(source_state, "integ_min", None) is not None
+                    and getattr(source_state, "integ_max", None) is not None
+                ):
+                    fallback_params["world_range"] = [
+                        source_state.integ_min,
+                        source_state.integ_max,
+                    ]
+                elif (
+                    getattr(source_state, "integ_min_pix", None) is not None
+                    and getattr(source_state, "integ_max_pix", None) is not None
+                ):
+                    fallback_params["pixel_range"] = [
+                        source_state.integ_min_pix,
+                        source_state.integ_max_pix,
+                    ]
+                clip_threshold = getattr(source_state, "clip_threshold", None)
+                if clip_threshold is None:
+                    clip_threshold = getattr(source_state, "moment_clip", None)
+                if clip_threshold is not None:
+                    fallback_params["clip_threshold"] = clip_threshold
+            history = build_processing_history_lines_with_action(
+                self.fits_viewer,
+                "compute_moment",
+                fallback_params,
+            )
 
         # Construct AppState for export
         state = AppState(
              data=None, # Not needed for export meta
              wcs=self.wcs, # Original WCS
              header=self.fits_viewer.header,
-             spectral_metadata=spec_meta
+             filepath=getattr(source_state, "filepath", None) or getattr(self.fits_viewer, "filename", None),
+             spectral_metadata=spec_meta,
+             integ_min=getattr(source_state, "integ_min", None),
+             integ_max=getattr(source_state, "integ_max", None),
+             integ_min_pix=getattr(source_state, "integ_min_pix", None),
+             integ_max_pix=getattr(source_state, "integ_max_pix", None),
         )
         plane_axes_map = {
             'xy': (1, 2),

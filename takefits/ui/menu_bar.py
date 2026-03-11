@@ -1,8 +1,9 @@
-from PySide6.QtWidgets import QMenu
+from PySide6.QtWidgets import QMenu, QMessageBox
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtCore import Qt
 from takefits.ui.config_panel import ConfigPanel
 from takefits.logic.show_header import ShowHeader
+from takefits.core.version import APP_NAME, APP_VERSION
 from takefits.core.wcs_frames import (
     available_display_frames,
     display_frame_label,
@@ -52,6 +53,10 @@ class MenuBar:
         file_menu.addSeparator()
         file_menu.addAction(self.save_recipe_action)
         file_menu.addAction(self.load_recipe_action)
+        file_menu.addSeparator()
+        self.show_header_action = QAction("Show Header", self.parent)
+        self.show_header_action.triggered.connect(self.open_header_panel)
+        file_menu.addAction(self.show_header_action)
 
         # Actions Menu (avoid macOS auto-injected Edit entries like Writing Tools / Emoji & Symbols)
         edit_menu = menubar.addMenu("Actions")
@@ -84,11 +89,7 @@ class MenuBar:
 
         # Window Menu
         window_menu = menubar.addMenu("Window")
-        
-        header_action = QAction('Show Header', self.parent)
-        window_menu.addAction(header_action)
-        header_action.triggered.connect(self.open_header_panel)
-        
+
         self.control_panel_action = QAction("ToolsPanel", self.parent, checkable=True)
         window_menu.addAction(self.control_panel_action)
         self.control_panel_action.triggered.connect(self.toggle_control_panel)
@@ -269,7 +270,13 @@ class MenuBar:
         self.load_regions_action = QAction("Load Regions...", self.parent)
         self.load_regions_action.triggered.connect(self.parent.load_regions_dialog)
         region_menu.addAction(self.load_regions_action)
-        
+
+        # About (placed in macOS application menu via AboutRole)
+        about_action = QAction("About...", self.parent)
+        about_action.setMenuRole(QAction.MenuRole.AboutRole)
+        about_action.triggered.connect(self.show_about)
+        file_menu.addAction(about_action)
+
     def enable_plane_menu(self, enabled):
         available = bool(enabled)
         self.sub1_action.setEnabled(available)
@@ -510,6 +517,20 @@ class MenuBar:
         self.header_panel.resize(300, 400)
         self.header_panel.show()
         
+    def show_about(self):
+        dlg = QMessageBox(self.parent)
+        dlg.setWindowTitle("About")
+        dlg.setTextFormat(Qt.TextFormat.RichText)
+        dlg.setText(
+            f'<table cellpadding="4">'
+            f'<tr><td><b>{APP_NAME}</b>&nbsp; version {APP_VERSION}</td>'
+            f'<td><a href="https://github.com/s-takekawa/takefits">GitHub</a></td></tr>'
+            # f'<tr><td>&copy; Shunya Takekawa</td>'
+            # f'<td><a href="https://orcid.org/0000-0001-8147-6817">ORCID</a></td></tr>'
+            f'</table>'
+        )
+        dlg.exec()
+
     def open_arithmetic_panel(self):
         if self.parent.control_panel.arithmetic_panel is None:
             self.parent.control_panel.open_arithmetic_panel()

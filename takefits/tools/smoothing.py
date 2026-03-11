@@ -707,65 +707,8 @@ class SmoothSettingsPanel(QDialog):
             new_header['BMIN'] = float(self.new_bmin)
             new_header['BPA'] = float(self.new_bpa)
 
-        # Add HISTORY
-        from datetime import datetime
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        new_header.add_history(f"Smoothing executed by takefits on {timestamp}")
-        new_header.add_history(f"Source file: {os.path.basename(original_filename)}")
-        
-        if self.gaussian_radio.isChecked():
-            kernel_type = "Gaussian"
-        elif self.boxcar_radio.isChecked():
-            kernel_type = "Boxcar"
-        else:
-            kernel_type = "Hanning"
-        new_header.add_history(f"Kernel: {kernel_type}")
-        
-        
-        if self.checkbox.isChecked(): # Target resolution enabled
-            # Log Original Resolution if available
-            if self.bmaj_exists and self.bmin_exists and self.bpa_exists:
-                orig_bmaj = f"{self.original_bmaj * 3600:.3g}"
-                orig_bmin = f"{self.original_bmin * 3600:.3g}"
-                orig_bpa = f"{self.original_bpa:.3g}"
-                new_header.add_history(f"Original Resolution: BMAJ={orig_bmaj} arcsec, BMIN={orig_bmin} arcsec, BPA={orig_bpa} deg")
-            
-            tbmaj = f"{self.new_bmaj * 3600:.3g}"
-            tbmin = f"{self.new_bmin * 3600:.3g}"
-            tbpa = f"{self.new_bpa:.3g}"
-            new_header.add_history(f"Target Resolution: BMAJ={tbmaj} arcsec, BMIN={tbmin} arcsec, BPA={tbpa} deg")
+        # Use common centralized processing history
 
-            # Calculate and log Convolving Kernel dimensions
-            try:
-                # Inputs are in arcsec and degrees
-                current_bmaj = float(self.bmaj_current.text())
-                current_bmin = float(self.bmin_current.text())
-                current_bpa = float(self.bpa_current.text())
-                
-                target_bmaj_val = self.new_bmaj * 3600
-                target_bmin_val = self.new_bmin * 3600
-                target_bpa_val = self.new_bpa
-
-                k_maj_sq = target_bmaj_val**2 - current_bmaj**2
-                k_min_sq = target_bmin_val**2 - current_bmin**2
-                
-                k_maj = np.sqrt(k_maj_sq) if k_maj_sq > 0 else 0.0
-                k_min = np.sqrt(k_min_sq) if k_min_sq > 0 else 0.0
-                k_pa = target_bpa_val - current_bpa
-                
-                new_header.add_history(f"Convolving Kernel: BMAJ={k_maj:.3g} arcsec, BMIN={k_min:.3g} arcsec, BPA={k_pa:.3g} deg")
-            except ValueError:
-                pass
-
-        elif self.hanning_radio.isChecked():
-            new_header.add_history("Hanning smoothing: velocity-axis 3-channel [0.25, 0.5, 0.25]")
-        else:
-            sx = self.x_spinbox.value()
-            sy = self.y_spinbox.value()
-            sz = self.z_spinbox.value() if self.subwindows else 0.0
-            new_header.add_history(f"Smoothness Factors (Sigma pix): X={sx}, Y={sy}, Z={sz}")
-        
-        new_header.add_history("NaN Handling: Preserve original NaN pixels")
         for entry in build_processing_history_lines(self.fits_viewer):
             new_header.add_history(entry)
 

@@ -221,18 +221,23 @@ def run_dendrogram(
     )
 
 
-def check_scimes_availability() -> bool:
+def check_scimes_availability() -> tuple[bool, str]:
     """
     Check if SCIMES is available.
 
     Returns:
-        True if SCIMES (logic.scimes) is available.
+        (True, "") if SCIMES is available.
+        (False, error_message) if it is not.
     """
     try:
         from takefits.logic.dendro_handler import DendroHandler
-        return DendroHandler.is_scimes_available()
-    except ImportError:
-        return False
+        try:
+            import takefits.logic.scimes
+            return True, ""
+        except ImportError as e:
+            return False, f"SCIMES module missing dependency: {e}"
+    except ImportError as e:
+        return False, f"astrodendro or other dendro dependency missing: {e}"
 
 
 def generate_catalog(state: AppState, mask: np.ndarray) -> List[Dict[str, Any]]:

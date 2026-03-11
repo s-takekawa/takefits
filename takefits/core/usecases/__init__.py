@@ -10,7 +10,7 @@ import numpy as np
 from takefits.core.app_state import AppState, create_app_state, MarkerSpec, RegionSpec
 from .regrid import RegridResult, compute_regrid
 from .export import export_data_fits, export_figure
-from .moment import MomentType, compute_moment, export_moment_fits
+from .moment import MomentType, compute_moment, export_moment_fits, export_moment_map_fits
 from .pv import compute_pv, export_pv_fits, set_pv_endpoints
 from .visualization import export_moment_image, export_channel_map_image
 from .smoothing import (
@@ -48,6 +48,7 @@ from .baseline import (
     BaselineSubtractionResult,
     compute_polynomial_baseline_subtraction,
     apply_baseline_subtraction,
+    export_baseline_model_fits,
 )
 from .channel_map import ChannelMapResult, compute_channel_map, channel_labels_to_world
 from .cutout import CutoutResult, compute_cutout, export_cutout_fits

@@ -609,28 +609,6 @@ class CubeArithmeticPanel(QWidget):
                 new_header.pop('DATAMIN', None)
                 new_header.pop('DATAMAX', None)
             
-            # Add HISTORY to header
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            new_header.add_history(f"Arithmetic operation by takefits on {timestamp}")
-            new_header.add_history(f"Source file: {self.fits_viewer.filename}")
-            new_header.add_history(f"Formula: {expr_str}")
-            
-            # Record Source Files
-            name_a = self.variables.get("A", {}).get("name", "N/A")
-            new_header.add_history(f"A: {name_a}")
-            
-            if "B" in self.variables:
-                name_b = self.variables["B"].get("name", "N/A")
-                new_header.add_history(f"B: {name_b}")
-            
-            # Record BUNIT information in HISTORY
-            if original_bunit:
-                if preserves_unit:
-                    new_header.add_history(f"BUNIT preserved: {original_bunit}")
-                else:
-                    new_header.add_history(f"Original BUNIT removed: {original_bunit} (unit may have changed)")
-
             for entry in build_processing_history_lines(self.fits_viewer):
                 new_header.add_history(entry)
             

@@ -3812,61 +3812,76 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         if xy_state is None or xy_state.canvas is None or xy_state.overlay_ax is None:
             self._perf_end(perf_token)
             return
-
-        # If background is None, rebuild it from a clean frame.
+        updates_enabled = None
         if xy_state._background is None:
-            rebuilt = None
-            refresh_bg = getattr(self, "_refresh_overlay_background", None)
-            if callable(refresh_bg):
+            if hasattr(xy_state.canvas, "updatesEnabled") and hasattr(xy_state.canvas, "setUpdatesEnabled"):
                 try:
-                    rebuilt = refresh_bg('xy')
+                    updates_enabled = bool(xy_state.canvas.updatesEnabled())
+                    xy_state.canvas.setUpdatesEnabled(False)
                 except Exception:
-                    rebuilt = None
-            if rebuilt is None:
+                    updates_enabled = None
+        try:
+            # If background is None, rebuild it from a clean frame.
+            if xy_state._background is None:
+                rebuilt = None
+                refresh_bg = getattr(self, "_refresh_overlay_background", None)
+                if callable(refresh_bg):
+                    try:
+                        rebuilt = refresh_bg('xy')
+                    except Exception:
+                        rebuilt = None
+                if rebuilt is None:
+                    try:
+                        xy_state.canvas.draw()
+                    except Exception:
+                        pass
+                    rebuilt = xy_state.copy_overlay_background()
+                xy_state._background = rebuilt
+                if xy_state._background is None:
+                    # Fallback to full redraw if we can't capture background
+                    xy_state.canvas.draw_idle()
+                    return
+
+            xy_state.canvas.restore_region(xy_state._background)
+
+            # Draw artists (on overlay_ax)
+            xy_state.overlay_ax.draw_artist(xy_state.vline)
+            xy_state.overlay_ax.draw_artist(xy_state.hline)
+            xy_cpoint = getattr(xy_state, "cpoint", None)
+            if xy_cpoint is not None and xy_cpoint.get_visible():
+                xy_state.overlay_ax.draw_artist(xy_cpoint)
+
+            if xy_state.chlabel:
+                xy_state.overlay_ax.draw_artist(xy_state.chlabel)
+            if hasattr(self, 'control_panel'):
+                if self.control_panel.pvd_panel is not None and self.control_panel.pvd_panel.arrow_artist is not None:
+                    xy_state.overlay_ax.draw_artist(self.control_panel.pvd_panel.arrow_artist)
+                    for indicator in self.control_panel.pvd_panel.width_indicators:
+                        xy_state.overlay_ax.draw_artist(indicator)
+                    if self.control_panel.pvd_panel.pos_indicator_on_arrow is not None:
+                        xy_state.overlay_ax.draw_artist(self.control_panel.pvd_panel.pos_indicator_on_arrow)
+
+            if hasattr(self, 'region_manager'):
+                self.region_manager.draw_regions_for_blit()
+
+            # Keep HPBW visible even in lightweight drag redraws.
+            if xy_state.hpbw:
+                xy_state.hpbw.update_position()
+
+            if hasattr(self, 'marker_manager') and self.marker_manager is not None:
+                self.marker_manager.draw_markers_for_blit('xy')
+
+            xy_state.canvas.blit(xy_state.overlay_ax.bbox)
+            self._blit_colorbar_foreground_for_state(xy_state, force=False)
+        finally:
+            if updates_enabled is not None:
                 try:
-                    xy_state.canvas.draw()
+                    xy_state.canvas.setUpdatesEnabled(bool(updates_enabled))
+                    if updates_enabled:
+                        xy_state.canvas.update()
                 except Exception:
                     pass
-                rebuilt = xy_state.copy_overlay_background()
-            xy_state._background = rebuilt
-            if xy_state._background is None:
-                # Fallback to full redraw if we can't capture background
-                xy_state.canvas.draw_idle()
-                self._perf_end(perf_token)
-                return
-
-        xy_state.canvas.restore_region(xy_state._background)
-
-        # Draw artists (on overlay_ax)
-        xy_state.overlay_ax.draw_artist(xy_state.vline)
-        xy_state.overlay_ax.draw_artist(xy_state.hline)
-        xy_cpoint = getattr(xy_state, "cpoint", None)
-        if xy_cpoint is not None and xy_cpoint.get_visible():
-            xy_state.overlay_ax.draw_artist(xy_cpoint)
-
-        if xy_state.chlabel:
-            xy_state.overlay_ax.draw_artist(xy_state.chlabel)
-        if hasattr(self, 'control_panel'):
-            if self.control_panel.pvd_panel is not None and self.control_panel.pvd_panel.arrow_artist is not None:
-                xy_state.overlay_ax.draw_artist(self.control_panel.pvd_panel.arrow_artist)
-                for indicator in self.control_panel.pvd_panel.width_indicators:
-                    xy_state.overlay_ax.draw_artist(indicator)
-                if self.control_panel.pvd_panel.pos_indicator_on_arrow is not None:
-                    xy_state.overlay_ax.draw_artist(self.control_panel.pvd_panel.pos_indicator_on_arrow)
-
-        if hasattr(self, 'region_manager'):
-            self.region_manager.draw_regions_for_blit()
-
-        # Keep HPBW visible even in lightweight drag redraws.
-        if xy_state.hpbw:
-            xy_state.hpbw.update_position()
-
-        if hasattr(self, 'marker_manager') and self.marker_manager is not None:
-            self.marker_manager.draw_markers_for_blit('xy')
-
-        xy_state.canvas.blit(xy_state.overlay_ax.bbox)
-        self._blit_colorbar_foreground_for_state(xy_state, force=False)
-        self._perf_end(perf_token)
+            self._perf_end(perf_token)
 
 
     def redraw_overlay_for_plane(self, plane=None, *, lightweight: bool = False):
@@ -3897,14 +3912,37 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             return
 
         if background is None:
-            canvas.draw_idle()
-            return
+            rebuilt = None
+            refresh_bg = getattr(self, "_refresh_overlay_background", None)
+            if callable(refresh_bg):
+                try:
+                    rebuilt = refresh_bg(plane)
+                except Exception:
+                    rebuilt = None
+            background = rebuilt if rebuilt is not None else state._background
+            if background is None:
+                canvas.draw_idle()
+                return
 
         try:
             canvas.restore_region(background)
         except Exception:
-            canvas.draw_idle()
-            return
+            rebuilt = None
+            refresh_bg = getattr(self, "_refresh_overlay_background", None)
+            if callable(refresh_bg):
+                try:
+                    rebuilt = refresh_bg(plane)
+                except Exception:
+                    rebuilt = None
+            background = rebuilt if rebuilt is not None else state._background
+            if background is None:
+                canvas.draw_idle()
+                return
+            try:
+                canvas.restore_region(background)
+            except Exception:
+                canvas.draw_idle()
+                return
 
         for artist in (state.hline, state.vline, getattr(state, "cpoint", None), state.chlabel):
             if artist is None:

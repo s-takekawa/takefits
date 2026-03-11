@@ -134,6 +134,16 @@ def compute_pv(
     if any(v is None for v in [x0, y0, x1, y1]):
         raise ValueError("PV slice endpoints not specified")
 
+    width_value = 0.0 if width is None else float(width)
+    set_pv_endpoints(
+        state,
+        x0=float(x0),
+        y0=float(y0),
+        x1=float(x1),
+        y1=float(y1),
+        width=width_value,
+    )
+
     data = state.data
 
     # Handle 4D data by selecting current S slice
@@ -171,7 +181,7 @@ def compute_pv(
 
         pv = np.zeros((n_vel, num_samples), dtype=np.float64)
 
-        if width <= 0:
+        if width_value <= 0:
             # Simple interpolation along the line (no width)
             for v in range(n_vel):
                 pv[v, :] = map_coordinates(
@@ -181,8 +191,8 @@ def compute_pv(
 
         elif weight_mode == 0:
             # Bilinear interpolation averaged over width
-            n_width = max(1, int(round(width)))
-            offsets = np.linspace(-width / 2, width / 2, n_width)
+            n_width = max(1, int(round(width_value)))
+            offsets = np.linspace(-width_value / 2, width_value / 2, n_width)
 
             for v in range(n_vel):
                 values = np.full((n_width, num_samples), np.nan, dtype=np.float64)
@@ -208,9 +218,9 @@ def compute_pv(
 
         elif weight_mode == 1:
             # Gaussian weighted interpolation
-            sigma = width / (2.0 * np.sqrt(2.0 * np.log(2)))
-            n_offsets = int(np.ceil(width * 2)) + 1
-            offsets = np.linspace(-width / 2, width / 2, n_offsets)
+            sigma = width_value / (2.0 * np.sqrt(2.0 * np.log(2)))
+            n_offsets = int(np.ceil(width_value * 2)) + 1
+            offsets = np.linspace(-width_value / 2, width_value / 2, n_offsets)
             weights = np.exp(-0.5 * (offsets / sigma) ** 2)
             weights /= weights.sum()
 

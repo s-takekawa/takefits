@@ -1,8 +1,31 @@
 #!/usr/bin/env python3
 
+import ctypes
+import ctypes.util
 import json
 import os
+import platform
 import sys
+
+if platform.system() == "Darwin":
+    try:
+        _cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+        _cf.CFBundleGetMainBundle.restype = ctypes.c_void_p
+        _cf.CFBundleGetInfoDictionary.restype = ctypes.c_void_p
+        _cf.CFBundleGetInfoDictionary.argtypes = [ctypes.c_void_p]
+        _cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+        _cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+        _cf.CFDictionarySetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        _cf.CFRelease.argtypes = [ctypes.c_void_p]
+        _bundle = _cf.CFBundleGetMainBundle()
+        _info = _cf.CFBundleGetInfoDictionary(_bundle)
+        _key = _cf.CFStringCreateWithCString(None, b"CFBundleName", 0x08000100)
+        _val = _cf.CFStringCreateWithCString(None, b"Takefits", 0x08000100)
+        _cf.CFDictionarySetValue(_info, _key, _val)
+        _cf.CFRelease(_key)
+        _cf.CFRelease(_val)
+    except Exception:
+        pass
 from PySide6.QtCore import QEvent, QObject, QSettings, QThread, QTimer, Qt, Slot
 from PySide6.QtWidgets import QApplication, QFileDialog, QAbstractItemView
 import matplotlib as mpl
@@ -80,7 +103,7 @@ def choose_fits_file():
     # Nudge focus after show so keyboard navigation works immediately
     def focus_file_view():
         if dialog.isVisible():
-            QApplication.setActiveWindow(dialog)
+            dialog.activateWindow()
             dialog.setFocus(Qt.FocusReason.ActiveWindowFocusReason)
             for view in dialog.findChildren(QAbstractItemView):
                 view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -156,6 +179,8 @@ def main():
     warnings.simplefilter('ignore', AstropyWarning)
     warnings.simplefilter('ignore', AstropyUserWarning)
     
+    print(f"{APP_NAME} version {APP_VERSION}")
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)

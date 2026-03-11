@@ -3,12 +3,20 @@ from matplotlib.axes import Axes
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
+import astropy.units as u
 
 from takefits.logic.data_tools import fast_nanminmax, estimate_array_nbytes, MEMMAP_THRESHOLD_BYTES
 
 class TransparentOverlayAxes(Axes):
     def contains(self, mouseevent):
         return False, {}
+
+
+def _coord_wrap_quantity(value, default):
+    try:
+        return float(value) * u.deg
+    except Exception:
+        return float(default) * u.deg
 
 class DisplayMap:
     def __init__(self, data, header, wcs, config):
@@ -378,7 +386,7 @@ class DisplayMap:
 
             if unit_str == 'deg':
                 if 'RA' in ctype_str:
-                    coord.set_coord_type('longitude', coord_wrap=360)
+                    coord.set_coord_type('longitude', coord_wrap=360 * u.deg)
                     coord.set_format_unit('hour', decimal=False) # hms
                 elif 'DEC' in ctype_str:
                     coord.set_coord_type('latitude')
@@ -386,7 +394,10 @@ class DisplayMap:
 
                 elif any(keyword in ctype_str for keyword in ['GLON', 'GLAT', 'OFFSET']):
                     if 'GLON' in ctype_str:
-                        coord.set_coord_type('longitude', coord_wrap=self.coord_wrap)
+                        coord.set_coord_type(
+                            'longitude',
+                            coord_wrap=_coord_wrap_quantity(self.coord_wrap, 180),
+                        )
                     else: 
                         coord.set_coord_type('latitude')
                     

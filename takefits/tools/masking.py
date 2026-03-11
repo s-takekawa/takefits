@@ -26,6 +26,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 
 from takefits.core import usecases
+from takefits.core.app_state import create_app_state
 from takefits.core.history_provenance import build_processing_history_lines
 from takefits.tools.base_panel import BaseToolPanel, clear_action_preview_record, has_action_record_tag, record_action_preview
 from takefits.tools.base_panel import capture_preferred_cursor_snapshot, replay_action_history_to_current_cursor
@@ -37,6 +38,7 @@ class MaskSettingsPanel(BaseToolPanel):
         self.original_data = None
         self.current_mask = None
         self.last_mask_history_entries = []
+        self._mask_export_metadata = {}
         self._has_pending_changes = False
         self._action_record_tag = "panel:mask"
         super().__init__(fits_viewer, subwindows)
@@ -492,6 +494,10 @@ class MaskSettingsPanel(BaseToolPanel):
             self.current_mask = current_mask
             symbol = "<" if condition == "less_than" else ">"
             self.last_mask_history_entries = [f"Threshold mask: value {symbol} {threshold}"]
+            self._mask_export_metadata = {
+                "threshold": float(threshold),
+                "condition": condition,
+            }
             self._update_data_and_displays(masked_data, "[MASK ACTIVE]")
             self._record_preview_action(
                 "apply_mask_threshold",
@@ -533,6 +539,7 @@ class MaskSettingsPanel(BaseToolPanel):
                     "noise_method={noise_method}"
                 ).format(**params),
             ]
+            self._mask_export_metadata = {}
             status = f"[MOMENT MASK: {preset}/{polarity}]"
             self._update_data_and_displays(masked_data, status)
             self._record_preview_action("apply_mask_moment_recipe", params)
@@ -579,6 +586,7 @@ class MaskSettingsPanel(BaseToolPanel):
 
             self.current_mask = current_mask
             self.last_mask_history_entries = [f"External mask applied: {os.path.basename(filename)}"]
+            self._mask_export_metadata = {}
             self._update_data_and_displays(masked_data, f"[EXTERNAL MASK: {os.path.basename(filename)}]")
             self._record_preview_action(
                 "apply_mask_external",
@@ -604,6 +612,7 @@ class MaskSettingsPanel(BaseToolPanel):
             self.fits_viewer.setWindowTitle(self.fits_viewer.original_window_title)
         self.current_mask = None
         self.last_mask_history_entries = []
+        self._mask_export_metadata = {}
         self._has_pending_changes = False
 
     def _record_preview_action(self, action_name: str, params: dict) -> None:
@@ -687,15 +696,8 @@ class MaskSettingsPanel(BaseToolPanel):
         try:
             new_header = self._get_sanitized_header()
             finite = np.isfinite(self.fits_viewer.data)
-            if np.any(finite):
-                new_header["DATAMIN"] = float(np.nanmin(self.fits_viewer.data))
-                new_header["DATAMAX"] = float(np.nanmax(self.fits_viewer.data))
+            new_header["DATAMAX"] = float(np.nanmax(self.fits_viewer.data))
 
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            new_header.add_history(f"Data masked using takefits on {timestamp}")
-            new_header.add_history(f"Source file: {os.path.basename(self.fits_viewer.filename)}")
-            for entry in self.last_mask_history_entries:
-                new_header.add_history(entry)
             for entry in build_processing_history_lines(self.fits_viewer):
                 new_header.add_history(entry)
 
@@ -711,39 +713,35 @@ class MaskSettingsPanel(BaseToolPanel):
 
         try:
             mask_data = np.where(self.current_mask, 1.0, 0.0).astype(np.float32)
-            new_header = self.fits_viewer.header.copy()
+            save_dialog = SaveFITS(mask_data, self.fits_viewer.header, self.fits_viewer.filename)
+            default_filename = save_dialog.generate_new_filename("mask")
+            filename, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save FITS File",
+                default_filename,
+                "FITS Files (*.fits);;All Files (*)",
+            )
+            if not filename:
+                return
 
-            original_naxis = int(new_header.get("NAXIS", 0) or 0)
-            for key in (
-                "SIMPLE",
-                "BITPIX",
-                "NAXIS",
-                "EXTEND",
-                "BSCALE",
-                "BZERO",
-                "DATAMIN",
-                "DATAMAX",
-                "BUNIT",
-            ):
-                if key in new_header:
-                    del new_header[key]
-            for axis_index in range(1, original_naxis + 1):
-                axis_key = f"NAXIS{axis_index}"
-                if axis_key in new_header:
-                    del new_header[axis_key]
+            state = getattr(self.fits_viewer, "app_state", None)
+            if state is None:
+                state = create_app_state(
+                    data=getattr(self.fits_viewer, "data", None),
+                    header=getattr(self.fits_viewer, "header", None),
+                    wcs=getattr(self.fits_viewer, "wcs", None),
+                    filepath=getattr(self.fits_viewer, "filename", None),
+                )
 
-            hdu = fits.PrimaryHDU(data=mask_data, header=new_header)
-
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            hdu.header.add_history(f"Mask file generated by takefits on {timestamp}")
-            hdu.header.add_history(f"Source file: {os.path.basename(self.fits_viewer.filename)}")
-            for entry in self.last_mask_history_entries:
-                hdu.header.add_history(entry)
-            for entry in build_processing_history_lines(self.fits_viewer):
-                hdu.header.add_history(entry)
-
-            save_dialog = SaveFITS(hdu.data, hdu.header, self.fits_viewer.filename)
-            save_dialog.save(suffix="mask")
+            usecases.export_mask_fits(
+                state,
+                mask_data,
+                filename,
+                history_entries=build_processing_history_lines(self.fits_viewer),
+                mask_as_float=True,
+                **dict(self._mask_export_metadata),
+            )
+            QMessageBox.information(self, "Save Successful", f"FITS successfully saved as: {filename}")
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"An error occurred while saving the mask file: {exc}")
 

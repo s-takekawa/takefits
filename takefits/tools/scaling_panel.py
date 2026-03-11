@@ -210,7 +210,15 @@ class ScalingPanel(BaseToolPanel):
             print(f"Warning: Could not update DATAMIN/DATAMAX in header. Error: {e}")
 
         from takefits.ui.save_fits_dialog import SaveFITS
-        new_header.add_history(f"Source file: {self.fits_viewer.filename}")
+
+        if self._history_entry:
+            history_lines = list(new_header.get('HISTORY', []))
+            filtered_lines = [line for line in history_lines if line not in self._history_entry]
+            if 'HISTORY' in new_header:
+                new_header.remove('HISTORY', remove_all=True, ignore_missing=True)
+            for line in filtered_lines:
+                new_header.add_history(line)
+
         for entry in build_processing_history_lines(self.fits_viewer):
             new_header.add_history(entry)
         save_fits = SaveFITS(data_to_save, new_header, self.fits_viewer.filename)

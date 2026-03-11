@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib import colormaps
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
-from takefits.core.color import ColorMode
+from takefits.core.color import ColorMode, default_color_settings_map
 from takefits.core.custom_colormap import CustomColormap, ColorDefinitions
 from takefits.logic.data_tools import (
     estimate_array_nbytes,
@@ -34,14 +34,7 @@ class ColorSettingsPanel(QWidget):
     bad_color = None
     filename = None
     
-    settings = {
-        ColorMode.MAIN: {"min_val": None, "max_val": None, "log_scale": False,
-                    "gamma_value": 1.0, "invert": False, "color_pattern": None},
-        ColorMode.INTEG: {"min_val": None, "max_val": None, "log_scale": False,
-                     "gamma_value": 1.0, "invert": False, "color_pattern": None},
-        ColorMode.CHANNEL: {"min_val": None, "max_val": None, "log_scale": False,
-                       "gamma_value": 1.0, "invert": False, "color_pattern": None}
-    }
+    settings = default_color_settings_map()
 
     def __init__(self, fits_viewer, subwindows=None, data=None, config=None, color_pattern=None, bad_color=None, filename = None, mode = ColorMode.MAIN):
         super().__init__()
@@ -52,6 +45,7 @@ class ColorSettingsPanel(QWidget):
         self._shared_history_record_pending = False
         self._shared_history_record_reason = ""
         self._suppress_shared_history_recording = True
+        self._pending_overlay_refresh_cids = {}
         self.current_settings = ColorSettingsPanel.settings[self.mode]
         
         if config is None: self.config = self.fits_viewer.displaymap.config
@@ -79,6 +73,9 @@ class ColorSettingsPanel(QWidget):
         elif mode == ColorMode.INTEG:
             self.hist_color = 'skyblue'
             self.vline_color = 'deepskyblue'
+        elif mode == ColorMode.PV:
+            self.hist_color = 'mediumturquoise'
+            self.vline_color = 'teal'
         elif mode == ColorMode.CHANNEL:
             self.hist_color = 'yellowgreen'
             self.vline_color = 'olivedrab'
@@ -574,6 +571,7 @@ class ColorSettingsPanel(QWidget):
 
             self._reapply_colorbar_style_for_changed_viewers(self._current_colorbar_config())
             self._refresh_overlay_after_color_change()
+            self._schedule_overlay_refresh_after_next_draw()
         finally:
             self._defer_restore_colorbar_layout_after_pending_update()
 
@@ -639,6 +637,74 @@ class ColorSettingsPanel(QWidget):
             seen.add(marker)
             deduped.append(viewer)
         return deduped
+
+    def _redraw_viewer_overlay_after_color_change(self, viewer):
+        if viewer is None:
+            return
+        redraw_for_plane = getattr(viewer, "redraw_overlay_for_plane", None)
+        if callable(redraw_for_plane):
+            plane = str(getattr(viewer, "plane", "") or "")
+            try:
+                if plane in ("xy", "xz", "zy"):
+                    redraw_for_plane(plane)
+                else:
+                    redraw_for_plane()
+                return
+            except Exception:
+                pass
+        redraw_main = getattr(viewer, "redraw_main_overlay_and_blit", None)
+        if callable(redraw_main):
+            try:
+                redraw_main()
+                return
+            except Exception:
+                pass
+        canvas = getattr(viewer, "canvas", None)
+        if canvas is not None:
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+    def _schedule_overlay_refresh_after_next_draw(self):
+        for viewer in self._iter_changed_viewers_for_color_update():
+            canvas = getattr(viewer, "canvas", None)
+            if canvas is None:
+                continue
+            marker = id(canvas)
+            if marker in self._pending_overlay_refresh_cids:
+                continue
+
+            def _on_draw(_event, *, marker=marker, canvas=canvas, viewer=viewer):
+                cid = self._pending_overlay_refresh_cids.pop(marker, None)
+                if cid is not None:
+                    try:
+                        canvas.mpl_disconnect(cid)
+                    except Exception:
+                        pass
+                self._redraw_viewer_overlay_after_color_change(viewer)
+
+            try:
+                cid = canvas.mpl_connect("draw_event", _on_draw)
+            except Exception:
+                continue
+            self._pending_overlay_refresh_cids[marker] = cid
+
+    def _disconnect_pending_overlay_refreshes(self):
+        pending = list(self._pending_overlay_refresh_cids.items())
+        self._pending_overlay_refresh_cids.clear()
+        for marker, cid in pending:
+            if cid is None:
+                continue
+            for viewer in self._iter_changed_viewers_for_color_update():
+                canvas = getattr(viewer, "canvas", None)
+                if canvas is None or id(canvas) != marker:
+                    continue
+                try:
+                    canvas.mpl_disconnect(cid)
+                except Exception:
+                    pass
+                break
 
     def _iter_colorbar_targets_for_viewer(self, viewer):
         targets = []
@@ -737,7 +803,7 @@ class ColorSettingsPanel(QWidget):
             if not isinstance(config, dict):
                 root = getattr(viewer, "fits_viewer", None)
                 config = getattr(getattr(root, "config_manager", None), "config", None)
-        elif self.mode == ColorMode.INTEG:
+        elif self.mode in (ColorMode.INTEG, ColorMode.PV):
             getter = getattr(viewer, "_get_colorbar_config", None)
             if callable(getter):
                 try:
@@ -767,55 +833,8 @@ class ColorSettingsPanel(QWidget):
         return previous
 
     def _refresh_overlay_after_color_change(self):
-        def _redraw_viewer_overlay(viewer):
-            if viewer is None:
-                return
-            redraw_for_plane = getattr(viewer, "redraw_overlay_for_plane", None)
-            if callable(redraw_for_plane):
-                plane = str(getattr(viewer, "plane", "") or "")
-                try:
-                    if plane in ("xy", "xz", "zy"):
-                        redraw_for_plane(plane)
-                    else:
-                        redraw_for_plane()
-                    return
-                except Exception:
-                    pass
-            redraw_main = getattr(viewer, "redraw_main_overlay_and_blit", None)
-            if callable(redraw_main):
-                try:
-                    redraw_main()
-                    return
-                except Exception:
-                    pass
-            canvas = getattr(viewer, "canvas", None)
-            if canvas is not None:
-                try:
-                    canvas.draw_idle()
-                except Exception:
-                    pass
-
-        root = self._resolve_main_viewer()
-        if self.mode == ColorMode.MAIN and root is not None:
-            redraw_for_plane = getattr(root, "redraw_overlay_for_plane", None)
-            if callable(redraw_for_plane):
-                viewer_for_plane = getattr(root, "_viewer_for_plane", None)
-                for plane in ("xy", "xz", "zy"):
-                    if plane != "xy":
-                        viewer = viewer_for_plane(plane) if callable(viewer_for_plane) else None
-                        if viewer is None:
-                            continue
-                    try:
-                        redraw_for_plane(plane)
-                    except Exception:
-                        continue
-                return
-            _redraw_viewer_overlay(root)
-            return
-
-        _redraw_viewer_overlay(self.fits_viewer)
-        for window in list(self.subwindows or []):
-            _redraw_viewer_overlay(window)
+        for viewer in self._iter_changed_viewers_for_color_update():
+            self._redraw_viewer_overlay_after_color_change(viewer)
 
     def update_histogram(self):
         data = np.asanyarray(self.data).ravel()
@@ -1132,7 +1151,7 @@ class ColorSettingsPanel(QWidget):
     def closeEvent(self,event):
         self.current_settings["color_pattern"] = self.colorscale_combo.currentText()
         ColorSettingsPanel.settings[self.mode] = dict(self.current_settings)
-        pass
+        self._disconnect_pending_overlay_refreshes()
         try:
             plt.close(self.fig)
         except Exception:

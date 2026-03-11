@@ -258,12 +258,23 @@ class ActionSession:
 
         handler = action.handler
         accepts_state = _handler_accepts_state(handler)
+        accepts_result = _handler_accepts_result(handler)
         call_params = _filter_handler_kwargs(handler, params)
 
-        if accepts_state:
+        if accepts_state and accepts_result:
+            if self.state is None:
+                raise ValueError(f"Action '{name}' requires state, but no state is loaded.")
+            if self.last_result is None:
+                raise ValueError(f"Action '{name}' requires a previous result, but none is available.")
+            result = handler(state=self.state, result=self.last_result, **call_params)
+        elif accepts_state:
             if self.state is None:
                 raise ValueError(f"Action '{name}' requires state, but no state is loaded.")
             result = handler(state=self.state, **call_params)
+        elif accepts_result:
+            if self.last_result is None:
+                raise ValueError(f"Action '{name}' requires a previous result, but none is available.")
+            result = handler(result=self.last_result, **call_params)
         else:
             result = handler(**call_params)
 
@@ -285,6 +296,14 @@ def _handler_accepts_state(handler: Any) -> bool:
     return "state" in sig.parameters
 
 
+def _handler_accepts_result(handler: Any) -> bool:
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return False
+    return "result" in sig.parameters
+
+
 def _filter_handler_kwargs(handler: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Keep only keyword arguments accepted by the handler.
@@ -304,7 +323,7 @@ def _filter_handler_kwargs(handler: Any, params: Dict[str, Any]) -> Dict[str, An
 
     allowed: set[str] = set()
     for param in values:
-        if param.name == "state":
+        if param.name in {"state", "result"}:
             continue
         if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
             allowed.add(param.name)

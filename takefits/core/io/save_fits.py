@@ -1,6 +1,7 @@
 """Headless FITS save helpers (no PyQt dependencies)."""
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -33,5 +34,7 @@ def write_fits(output_path: str, data: Any, header: Any, *, overwrite: bool = Tr
     from astropy.io import fits
 
     update_datamin_datamax_if_present(header, data)
-    fits.writeto(output_path, data, header, overwrite=overwrite)
-    return output_path
+    target = Path(output_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fits.writeto(target, data, header, overwrite=overwrite)
+    return str(target)

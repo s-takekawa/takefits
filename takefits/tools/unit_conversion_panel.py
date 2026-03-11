@@ -1314,7 +1314,12 @@ class UnitConversionPanel(QWidget):
         new_header = self._prepare_header_for_save(is_data_being_flipped_back=revert_flip)
         new_header['DATAMIN'] = data_min
         new_header['DATAMAX'] = data_max
-        new_header.add_history(f"Source file: {self.fits_viewer.filename}")
+
+        stale_history_lines = []
+        for lines in self._history_categories.values():
+            stale_history_lines.extend(str(line) for line in lines if line)
+        self._remove_history_lines(new_header, stale_history_lines)
+
         for entry in build_processing_history_lines(self.fits_viewer):
             new_header.add_history(entry)
 

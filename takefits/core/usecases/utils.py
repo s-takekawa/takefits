@@ -215,9 +215,13 @@ def world_bounds_to_pixel_bounds(
     pix_array = np.array(pixel_values)
     pixel_bounds = []
     for axis in range(naxis):
-        pmin = int(np.floor(pix_array[:, axis].min()))
-        pmax = int(np.ceil(pix_array[:, axis].max()))
-        pixel_bounds.append((pmin, pmax))
+        lo = float(pix_array[:, axis].min())
+        hi = float(pix_array[:, axis].max())
+        start = int(np.floor(lo - 0.5)) + 1
+        stop = int(np.ceil(hi + 0.5))
+        if stop <= start:
+            stop = start + 1
+        pixel_bounds.append((start, stop))
 
     return pixel_bounds
 
