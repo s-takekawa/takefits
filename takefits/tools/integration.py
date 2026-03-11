@@ -980,8 +980,9 @@ class IntegResultWindow(QMainWindow):
         self.marker_manager.set_active_plane(self.plane)
         self.marker_panel = None
         self.marker_mode_enabled = False
-        self._colorbar_autolayout_pending = False
         self._colorbar_auto_layout_override = None
+        self._colorbar_layout_from_draw_event = False
+        self._colorbar_sync_redraw_in_progress = False
         self._colorbar_auto_anchor_sig = None
         self._setup_marker_action_bridge()
 
@@ -1725,26 +1726,32 @@ class IntegResultWindow(QMainWindow):
         if marker_manager is not None and marker_manager.is_dragging():
             return
         self._updating_overlay = True
+        needs_redraw = False
 
-        # Sync overlay with main axes and refresh background
-        self.overlay_ax.set_position(self.ax.get_position())
-        self._position_click_label()
-        self._schedule_colorbar_auto_layout_if_anchor_changed(force=False)
-        vline_visible = self.click_v_line.get_visible()
-        hline_visible = self.click_h_line.get_visible()
-        self._capture_overlay_background()
+        try:
+            # Sync overlay with main axes and refresh background
+            self.overlay_ax.set_position(self.ax.get_position())
+            self._position_click_label()
+            self._colorbar_layout_from_draw_event = True
+            try:
+                self._schedule_colorbar_auto_layout_if_anchor_changed(force=False)
+            finally:
+                self._colorbar_layout_from_draw_event = False
+            vline_visible = self.click_v_line.get_visible()
+            hline_visible = self.click_h_line.get_visible()
+            self._capture_overlay_background()
 
-        has_regions = bool(region_manager and region_manager.regions)
-        has_markers = bool(marker_manager and marker_manager.markers_for_plane(self.plane))
-        needs_redraw = (
-            vline_visible
-            or hline_visible
-            or has_regions
-            or has_markers
-            or self.hpbw is not None
-        )
-
-        self._updating_overlay = False
+            has_regions = bool(region_manager and region_manager.regions)
+            has_markers = bool(marker_manager and marker_manager.markers_for_plane(self.plane))
+            needs_redraw = (
+                vline_visible
+                or hline_visible
+                or has_regions
+                or has_markers
+                or self.hpbw is not None
+            )
+        finally:
+            self._updating_overlay = False
 
         if needs_redraw:
             QTimer.singleShot(0, self.redraw_main_overlay_and_blit)
@@ -2465,10 +2472,57 @@ class IntegResultWindow(QMainWindow):
             return False
 
     def _is_colorbar_auto_layout_enabled(self) -> bool:
+        root = getattr(self, "fits_viewer", None)
+        resolver = getattr(root, "_get_main_viewer", None)
+        if callable(resolver):
+            try:
+                root = resolver()
+            except Exception:
+                pass
+        if bool(getattr(root, "_workspace_colorbar_restore_in_progress", False)):
+            return False
         override = getattr(self, "_colorbar_auto_layout_override", None)
         if override is not None:
             return bool(override)
         return bool(self._get_colorbar_config().get("colorbar_auto_layout", False))
+
+    def _request_canvas_redraw(self, *, immediate: bool = False) -> bool:
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return False
+
+        root = getattr(self, "fits_viewer", None)
+        resolver = getattr(root, "_get_main_viewer", None)
+        if callable(resolver):
+            try:
+                root = resolver()
+            except Exception:
+                pass
+
+        dispatcher = getattr(root, "_request_canvas_redraw", None)
+        if callable(dispatcher):
+            try:
+                return bool(dispatcher(canvas, immediate=immediate))
+            except Exception:
+                pass
+
+        draw_name = "draw" if immediate else "draw_idle"
+        draw = getattr(canvas, draw_name, None)
+        if callable(draw):
+            try:
+                draw()
+                return True
+            except Exception:
+                pass
+        if not immediate:
+            draw = getattr(canvas, "draw", None)
+            if callable(draw):
+                try:
+                    draw()
+                    return True
+                except Exception:
+                    pass
+        return False
 
     def _get_colorbar_config(self):
         config_mgr = getattr(self, "config_manager", None)
@@ -2540,7 +2594,7 @@ class IntegResultWindow(QMainWindow):
         ColorSettingsPanel.apply_colorbar_settings(cax=self.cax, colorbar=self.colorbar, config=config)
         self._set_colorbar_zorder()
 
-    def _apply_colorbar_auto_layout(self, force: bool = False) -> bool:
+    def _apply_colorbar_auto_layout(self, force: bool = False, *, redraw: bool = True) -> bool:
         if not force and not self._is_colorbar_auto_layout_enabled():
             return False
         if bool(getattr(self, "_applying_colorbar_auto_layout", False)):
@@ -2558,7 +2612,6 @@ class IntegResultWindow(QMainWindow):
             fig_h_px = float(getattr(getattr(fig, "bbox", None), "height", 0.0) or 0.0)
         except Exception:
             return False
-
         if len(ax_bounds) != 4 or len(cbar_bounds) != 4:
             return False
         if ax_bounds[2] <= 0.0 or ax_bounds[3] <= 0.0:
@@ -2577,7 +2630,6 @@ class IntegResultWindow(QMainWindow):
         thickness_px = config.get("colorbar_thickness_px", 24.0)
         length_mode = str(config.get("colorbar_length_mode", "ratio") or "ratio")
         length_value = config.get("colorbar_length_value", 1.0)
-
         current_orientation = self._current_colorbar_orientation()
         target_orientation = orientation_for_placement(
             placement,
@@ -2620,7 +2672,8 @@ class IntegResultWindow(QMainWindow):
             self.cax.set_gid("colorbar")
             self._set_colorbar_zorder()
             if getattr(self, "canvas", None) is not None:
-                self.canvas.draw_idle()
+                if redraw:
+                    self._request_canvas_redraw()
         finally:
             self._applying_colorbar_auto_layout = False
         return True
@@ -2633,18 +2686,16 @@ class IntegResultWindow(QMainWindow):
             return
         if not self._is_colorbar_auto_layout_enabled():
             return
-        if bool(getattr(self, "_colorbar_autolayout_pending", False)):
+        if bool(getattr(self, "_colorbar_sync_redraw_in_progress", False)):
             return
-        self._colorbar_autolayout_pending = True
-
-        def _run():
-            self._colorbar_autolayout_pending = False
-            if not force and bool(getattr(self, "_suspend_colorbar_auto_layout", False)):
-                return
-            if self._is_colorbar_auto_layout_enabled():
-                self._apply_colorbar_auto_layout(force=force)
-
-        QTimer.singleShot(0, _run)
+        from_draw_event = bool(getattr(self, "_colorbar_layout_from_draw_event", False))
+        changed = bool(self._apply_colorbar_auto_layout(force=force, redraw=not from_draw_event))
+        if changed and from_draw_event:
+            self._colorbar_sync_redraw_in_progress = True
+            try:
+                self._request_canvas_redraw(immediate=True)
+            finally:
+                self._colorbar_sync_redraw_in_progress = False
 
     def _colorbar_layout_anchor_signature(self):
         ax = getattr(self, "ax", None)
@@ -3576,7 +3627,7 @@ class IntegResultWindow(QMainWindow):
                 pass
             if getattr(self, "canvas", None) is not None:
                 try:
-                    self.canvas.draw_idle()
+                    self._request_canvas_redraw()
                 except Exception:
                     pass
 
@@ -3704,9 +3755,6 @@ class IntegResultWindow(QMainWindow):
         if new_state:
             # If turning ON, snap to the correct position immediately.
             self._schedule_colorbar_auto_layout(force=True)
-        else:
-            # If turning OFF, clear pending auto-layout requests.
-            self._colorbar_autolayout_pending = False
 
         return True
 

@@ -230,6 +230,117 @@ def build_workspace_restore_status_line(
     return "Panel visibility/geometry restored. Different FITS with incompatible WCS; range restore skipped."
 
 
+def resolve_workspace_main_colorbar_layouts(colorbar_state: Dict[str, Any] | Any) -> Dict[str, Any]:
+    """
+    Resolve saved main/sub-viewer colorbar layouts with consistent fallbacks.
+
+    The workspace payload can store:
+    - `main_viewers.xy/xz/zy`: per-viewer bounds
+    - `main`: legacy/shared bounds
+    - `global`: config-only fallback
+    """
+    resolved = {
+        "primary": {},
+        "per_plane": {},
+    }
+    if not isinstance(colorbar_state, dict):
+        return resolved
+
+    global_state = colorbar_state.get("global")
+    if not isinstance(global_state, dict):
+        global_state = {}
+
+    main_state = colorbar_state.get("main")
+    if not isinstance(main_state, dict):
+        main_state = {}
+
+    main_viewers = colorbar_state.get("main_viewers")
+    if not isinstance(main_viewers, dict):
+        main_viewers = {}
+
+    primary = {}
+    xy_state = main_viewers.get("xy")
+    if isinstance(xy_state, dict):
+        primary = dict(xy_state)
+    elif main_state:
+        primary = dict(main_state)
+    else:
+        for candidate in main_viewers.values():
+            if isinstance(candidate, dict) and candidate:
+                primary = dict(candidate)
+                break
+    if not primary and global_state:
+        primary = dict(global_state)
+
+    resolved["primary"] = primary
+
+    for plane in ("xy", "xz", "zy"):
+        entry = main_viewers.get(plane)
+        if isinstance(entry, dict) and entry:
+            resolved["per_plane"][plane] = dict(entry)
+        elif primary:
+            resolved["per_plane"][plane] = dict(primary)
+
+    return resolved
+
+
+def invalidate_workspace_restore_blit_cache(target: Any) -> bool:
+    """
+    Drop cached draw/blit state before workspace-restored limits are repainted.
+
+    Workspace restore can queue axis-limit changes with draw_idle() and then
+    immediately re-blit cursor overlays. If the stale pre-restore background is
+    still cached, the old image can be restored on top of the new zoomed view.
+    """
+    if target is None:
+        return False
+
+    plane = str(getattr(target, "plane", "") or "").strip().lower()
+    invalidate_plane = getattr(target, "_invalidate_plane_background", None)
+    if callable(invalidate_plane) and plane in {"xy", "xz", "zy"}:
+        try:
+            invalidate_plane(plane)
+            return True
+        except Exception:
+            pass
+
+    invalidated = False
+
+    invalidate_image = getattr(target, "_invalidate_image_background", None)
+    if callable(invalidate_image):
+        try:
+            invalidate_image()
+            invalidated = True
+        except Exception:
+            pass
+
+    state = getattr(target, "state", None)
+    if state is not None:
+        for attr in ("image_background", "_background"):
+            if hasattr(state, attr):
+                try:
+                    setattr(state, attr, None)
+                    invalidated = True
+                except Exception:
+                    pass
+
+    if hasattr(target, "_background"):
+        try:
+            setattr(target, "_background", None)
+            invalidated = True
+        except Exception:
+            pass
+
+    if hasattr(target, "_background_initialized"):
+        try:
+            setattr(target, "_background_initialized", False)
+            invalidated = True
+        except Exception:
+            pass
+
+    return invalidated
+
+
 __all__ = [
     "normalize_wcs_axis_type",
     "normalize_wcs_unit",
@@ -238,4 +349,6 @@ __all__ = [
     "build_workspace_restore_diagnostics",
     "compute_range_restore_mode",
     "build_workspace_restore_status_line",
+    "resolve_workspace_main_colorbar_layouts",
+    "invalidate_workspace_restore_blit_cache",
 ]

@@ -571,7 +571,16 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
         self._update_colorbar_geometry_config(pos_x, pos_y, width, height)
 
-    def _apply_colorbar_geometry_to_state(self, state, pos_x: float, pos_y: float, width: float, height: float):
+    def _apply_colorbar_geometry_to_state(
+        self,
+        state,
+        pos_x: float,
+        pos_y: float,
+        width: float,
+        height: float,
+        *,
+        redraw: bool = True,
+    ):
         if state is None or state.cax is None:
             return
         try:
@@ -580,11 +589,42 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self._set_colorbar_zorder_for_state(state)
         except Exception:
             return
-        if state.canvas is not None:
+        if redraw and state.canvas is not None:
             try:
-                state.canvas.draw_idle()
+                self._request_canvas_redraw(state.canvas)
             except Exception:
                 pass
+
+    def _request_canvas_redraw(self, canvas=None, *, immediate: bool = False) -> bool:
+        target = canvas if canvas is not None else getattr(self, "canvas", None)
+        if target is None:
+            return False
+
+        main = self._get_main_viewer()
+        dispatcher = getattr(main, "_request_canvas_redraw", None)
+        if callable(dispatcher) and main is not self:
+            try:
+                return bool(dispatcher(target, immediate=immediate))
+            except Exception:
+                pass
+
+        draw_name = "draw" if immediate else "draw_idle"
+        draw = getattr(target, draw_name, None)
+        if callable(draw):
+            try:
+                draw()
+                return True
+            except Exception:
+                pass
+        if not immediate:
+            draw = getattr(target, "draw", None)
+            if callable(draw):
+                try:
+                    draw()
+                    return True
+                except Exception:
+                    pass
+        return False
 
     def _set_colorbar_zorder_for_state(self, state, zorder: float = 300.0):
         if state is None:
@@ -689,6 +729,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
     def _is_colorbar_auto_layout_enabled(self) -> bool:
         main = self._get_main_viewer()
+        if bool(getattr(main, "_workspace_colorbar_restore_in_progress", False)):
+            return False
         config_mgr = getattr(main, "config_manager", None) if main is not None else None
         config = getattr(config_mgr, "config", None)
         if not isinstance(config, dict):
@@ -898,7 +940,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             except Exception:
                 pass
 
-    def _apply_colorbar_auto_layout(self, force: bool = False) -> bool:
+    def _apply_colorbar_auto_layout(self, force: bool = False, *, redraw: bool = True) -> bool:
         main = self._get_main_viewer()
         if main is not None and main is not self:
             apply_layout = getattr(main, "_apply_colorbar_auto_layout", None)
@@ -927,7 +969,6 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             placement,
             fallback=config.get("colorbar_orientation", "vertical"),
         )
-
         def _collect_targets():
             targets = {}
             for plane in ("xy", "xz", "zy"):
@@ -1004,7 +1045,14 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 for payload in targets.values():
                     state = payload["state"]
                     target_x, target_y, target_w, target_h = payload["target"]
-                    self._apply_colorbar_geometry_to_state(state, target_x, target_y, target_w, target_h)
+                    self._apply_colorbar_geometry_to_state(
+                        state,
+                        target_x,
+                        target_y,
+                        target_w,
+                        target_h,
+                        redraw=redraw,
+                    )
 
                 anchor = targets.get("xy")
                 if anchor is None:
@@ -1023,19 +1071,18 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             return
         if not self._is_colorbar_auto_layout_enabled():
             return
-        if bool(getattr(self, "_colorbar_autolayout_pending", False)):
+        if bool(getattr(self, "_colorbar_sync_redraw_in_progress", False)):
             return
-
-        self._colorbar_autolayout_pending = True
-
-        def _run():
-            self._colorbar_autolayout_pending = False
-            if not force and bool(getattr(self, "_suspend_colorbar_auto_layout", False)):
-                return
-            if self._is_colorbar_auto_layout_enabled():
-                self._apply_colorbar_auto_layout(force=force)
-
-        QTimer.singleShot(0, _run)
+        from_draw_event = bool(getattr(self, "_colorbar_layout_from_draw_event", False))
+        changed = bool(self._apply_colorbar_auto_layout(force=force, redraw=not from_draw_event))
+        if changed and from_draw_event:
+            canvas = getattr(self, "canvas", None)
+            if canvas is not None:
+                self._colorbar_sync_redraw_in_progress = True
+                try:
+                    self._request_canvas_redraw(canvas, immediate=True)
+                finally:
+                    self._colorbar_sync_redraw_in_progress = False
 
     def _colorbar_layout_anchor_signature(self):
         state = getattr(self, "state", None)
@@ -1090,9 +1137,6 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             if new_state:
                 # If turning ON, snap to the correct position immediately
                 self._schedule_colorbar_auto_layout(force=True)
-            else:
-                # If turning OFF, just ensure we don't hold any pending layout requests
-                self._colorbar_autolayout_pending = False
                 
         return True
 
@@ -1181,87 +1225,87 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         if getattr(self, '_updating_overlay', False):
             return
         self._updating_overlay = True
-        
-        self.overlay_ax.set_position(self.ax.get_position())
-        self._position_click_label()
-        self._schedule_colorbar_auto_layout_if_anchor_changed(force=False)
-        self._invalidate_image_background()
+        try:
+            self.overlay_ax.set_position(self.ax.get_position())
+            self._position_click_label()
+            self._colorbar_layout_from_draw_event = True
+            try:
+                self._schedule_colorbar_auto_layout_if_anchor_changed(force=False)
+            finally:
+                self._colorbar_layout_from_draw_event = False
+            self._invalidate_image_background()
 
-        hidden_regions = []
-        hidden_markers = []
-        region_manager = getattr(self, 'region_manager', None)
-        if region_manager is not None:
-            hidden_regions = region_manager.prepare_for_background_capture()
-        marker_manager = getattr(self, 'marker_manager', None)
-        if marker_manager is not None:
-            hidden_markers = marker_manager.prepare_for_background_capture(self.plane)
+            hidden_regions = []
+            hidden_markers = []
+            region_manager = getattr(self, 'region_manager', None)
+            if region_manager is not None:
+                hidden_regions = region_manager.prepare_for_background_capture()
+            marker_manager = getattr(self, 'marker_manager', None)
+            if marker_manager is not None:
+                hidden_markers = marker_manager.prepare_for_background_capture(self.plane)
 
-        vline_visible = self.vline.get_visible()
-        hline_visible = self.hline.get_visible()
-        cpoint_visible = bool(getattr(self, "cpoint", None) is not None and self.cpoint.get_visible())
-        self.vline.set_visible(False)
-        self.hline.set_visible(False)
-        if getattr(self, "cpoint", None) is not None:
-            self.cpoint.set_visible(False)
-        # Here we just capture current state.
-        background = self.canvas.copy_from_bbox(self.overlay_ax.bbox)
-        # Update both instance and state cache
-        self._background = background
-        self._background_initialized = True
-        if hasattr(self, 'state') and self.state is not None:
-             self.state.update_background(background)
-        
-        ### update cursor lines ###
-        self.vline.set_visible(vline_visible)
-        self.hline.set_visible(hline_visible)
-        cursor_x = getattr(self.state, "cursor_x", None) if hasattr(self, "state") else None
-        cursor_y = getattr(self.state, "cursor_y", None) if hasattr(self, "state") else None
-        # Use coordinator for coordinates
-        if self.plane == 'xy':
-            xval = cursor_x if cursor_x is not None else self._get_shared_xpix()
-            yval = cursor_y if cursor_y is not None else self._get_shared_ypix()
-            self.vline.set_xdata([xval])
-            self.hline.set_ydata([yval])
-        elif self.plane == 'xz':
-            xval = cursor_x if cursor_x is not None else self._get_shared_xpix()
-            yval = cursor_y if cursor_y is not None else self._get_shared_zpix()
-            self.vline.set_xdata([xval])
-            self.hline.set_ydata([yval])
-        elif self.plane == 'zy':
-            xval = cursor_x if cursor_x is not None else self._get_shared_zpix()
-            yval = cursor_y if cursor_y is not None else self._get_shared_ypix()
-            self.vline.set_xdata([xval])
-            self.hline.set_ydata([yval])
-        self._set_crosshair_point_for_plane(self.plane, x=xval, y=yval)
-        if getattr(self, "cpoint", None) is not None:
-            self.cpoint.set_visible(cpoint_visible)
-        self.overlay_ax.draw_artist(self.vline)
-        self.overlay_ax.draw_artist(self.hline)
-        if getattr(self, "cpoint", None) is not None and self.cpoint.get_visible():
-            self.overlay_ax.draw_artist(self.cpoint)
-
-        pending_hidden = getattr(self, '_pending_region_restore', [])
-        restore_batches = []
-        if hidden_regions:
-            restore_batches.append(hidden_regions)
-        if pending_hidden:
-            restore_batches.append(pending_hidden)
-            self._pending_region_restore = []
-
-        if region_manager is not None:
-            for batch in restore_batches:
-                region_manager.restore_after_background_capture(batch)
-        if marker_manager is not None:
-            if hidden_markers:
-                marker_manager.restore_after_background_capture(hidden_markers)
-            marker_manager.draw_markers_for_blit()
+            vline_visible = self.vline.get_visible()
+            hline_visible = self.hline.get_visible()
+            cpoint_visible = bool(getattr(self, "cpoint", None) is not None and self.cpoint.get_visible())
+            self.vline.set_visible(False)
+            self.hline.set_visible(False)
+            if getattr(self, "cpoint", None) is not None:
+                self.cpoint.set_visible(False)
+            background = self.canvas.copy_from_bbox(self.overlay_ax.bbox)
+            self._background = background
+            self._background_initialized = True
+            if hasattr(self, 'state') and self.state is not None:
+                 self.state.update_background(background)
+            
+            self.vline.set_visible(vline_visible)
+            self.hline.set_visible(hline_visible)
+            cursor_x = getattr(self.state, "cursor_x", None) if hasattr(self, "state") else None
+            cursor_y = getattr(self.state, "cursor_y", None) if hasattr(self, "state") else None
             if self.plane == 'xy':
-                marker_manager.redraw_planes(['xz', 'zy'])
+                xval = cursor_x if cursor_x is not None else self._get_shared_xpix()
+                yval = cursor_y if cursor_y is not None else self._get_shared_ypix()
+                self.vline.set_xdata([xval])
+                self.hline.set_ydata([yval])
+            elif self.plane == 'xz':
+                xval = cursor_x if cursor_x is not None else self._get_shared_xpix()
+                yval = cursor_y if cursor_y is not None else self._get_shared_zpix()
+                self.vline.set_xdata([xval])
+                self.hline.set_ydata([yval])
+            elif self.plane == 'zy':
+                xval = cursor_x if cursor_x is not None else self._get_shared_zpix()
+                yval = cursor_y if cursor_y is not None else self._get_shared_ypix()
+                self.vline.set_xdata([xval])
+                self.hline.set_ydata([yval])
+            self._set_crosshair_point_for_plane(self.plane, x=xval, y=yval)
+            if getattr(self, "cpoint", None) is not None:
+                self.cpoint.set_visible(cpoint_visible)
+            self.overlay_ax.draw_artist(self.vline)
+            self.overlay_ax.draw_artist(self.hline)
+            if getattr(self, "cpoint", None) is not None and self.cpoint.get_visible():
+                self.overlay_ax.draw_artist(self.cpoint)
 
-        if restore_batches and getattr(self, 'plane', None) == 'xy':
-            self.redraw_main_overlay_and_blit()
+            pending_hidden = getattr(self, '_pending_region_restore', [])
+            restore_batches = []
+            if hidden_regions:
+                restore_batches.append(hidden_regions)
+            if pending_hidden:
+                restore_batches.append(pending_hidden)
+                self._pending_region_restore = []
 
-        QTimer.singleShot(0, lambda: setattr(self, '_updating_overlay', False))
+            if region_manager is not None:
+                for batch in restore_batches:
+                    region_manager.restore_after_background_capture(batch)
+            if marker_manager is not None:
+                if hidden_markers:
+                    marker_manager.restore_after_background_capture(hidden_markers)
+                marker_manager.draw_markers_for_blit()
+                if self.plane == 'xy':
+                    marker_manager.redraw_planes(['xz', 'zy'])
+
+            if restore_batches and getattr(self, 'plane', None) == 'xy':
+                self.redraw_main_overlay_and_blit()
+        finally:
+            QTimer.singleShot(0, lambda: setattr(self, '_updating_overlay', False))
 
 
     def initUI(self, plane):
@@ -1269,7 +1313,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self._pending_drag_coords = None
         self._last_drag_update_key = None
         self._colorbar_drag_state = None
-        self._colorbar_autolayout_pending = False
+        self._colorbar_layout_from_draw_event = False
+        self._colorbar_sync_redraw_in_progress = False
         self._colorbar_auto_anchor_sig = None
         # Initialize per-plane ViewerState
         self.state = ViewerState(plane)

@@ -21,8 +21,10 @@ from takefits.core.workspace_restore import (
     build_workspace_restore_diagnostics,
     build_workspace_restore_status_line,
     compute_range_restore_mode,
+    invalidate_workspace_restore_blit_cache,
     normalize_wcs_axis_type,
     normalize_wcs_unit,
+    resolve_workspace_main_colorbar_layouts,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -757,7 +759,7 @@ class MainWindow(FITSViewer):
             }
         return snapshot
 
-    def _refresh_cursor_overlay_after_workspace_restore(self, preferred_cursor=None):
+    def _refresh_cursor_overlay_after_workspace_restore(self, preferred_cursor=None, *, defer_retry: bool = True):
         restore_crosshair = getattr(self, "_restore_crosshair_state", None)
         if not callable(restore_crosshair):
             return
@@ -773,11 +775,110 @@ class MainWindow(FITSViewer):
                 pass
 
         _apply_cursor_overlay()
+        if not bool(defer_retry):
+            return
         try:
             # Some panels queue draw_idle() during workspace restore.
             # Re-apply once the event loop drains so animated cursor artists remain visible.
             for delay_ms in (0, 40):
                 QTimer.singleShot(delay_ms, _apply_cursor_overlay)
+        except Exception:
+            pass
+
+    def _set_workspace_colorbar_restore_in_progress(self, active: bool):
+        try:
+            self._workspace_colorbar_restore_in_progress = bool(active)
+        except Exception:
+            pass
+
+    def _begin_workspace_restore_canvas_redraw_batch(self):
+        self._workspace_restore_canvas_redraw_batch_active = True
+        self._workspace_restore_pending_canvas_redraws = {}
+
+    def _queue_workspace_restore_canvas_redraw(self, canvas) -> bool:
+        if canvas is None:
+            return False
+        if not bool(getattr(self, "_workspace_restore_canvas_redraw_batch_active", False)):
+            return False
+        pending = getattr(self, "_workspace_restore_pending_canvas_redraws", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._workspace_restore_pending_canvas_redraws = pending
+        pending[id(canvas)] = canvas
+        return True
+
+    def _flush_workspace_restore_canvas_redraw_batch(self):
+        pending = getattr(self, "_workspace_restore_pending_canvas_redraws", None)
+        canvases = list(pending.values()) if isinstance(pending, dict) else []
+        self._workspace_restore_pending_canvas_redraws = {}
+        self._workspace_restore_canvas_redraw_batch_active = False
+        for canvas in canvases:
+            draw = getattr(canvas, "draw", None)
+            if callable(draw):
+                try:
+                    draw()
+                    continue
+                except Exception:
+                    pass
+            draw_idle = getattr(canvas, "draw_idle", None)
+            if callable(draw_idle):
+                try:
+                    draw_idle()
+                except Exception:
+                    pass
+
+    def _request_canvas_redraw(self, canvas, *, immediate: bool = False) -> bool:
+        if canvas is None:
+            return False
+        if self._queue_workspace_restore_canvas_redraw(canvas):
+            return True
+        draw_name = "draw" if immediate else "draw_idle"
+        draw = getattr(canvas, draw_name, None)
+        if callable(draw):
+            try:
+                draw()
+                return True
+            except Exception:
+                pass
+        if not immediate:
+            draw = getattr(canvas, "draw", None)
+            if callable(draw):
+                try:
+                    draw()
+                    return True
+                except Exception:
+                    pass
+        return False
+
+    def _refresh_colorbar_layout_after_workspace_restore(self, colorbar_state=None):
+        if not isinstance(colorbar_state, dict) or not colorbar_state:
+            return
+        if bool(getattr(self, "_is_app_closing", False)):
+            return
+
+        target_snapshot = self._desired_workspace_colorbar_layout_snapshot(colorbar_state)
+
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+        try:
+            self._restore_workspace_colorbar_state(colorbar_state, apply_to_open_windows=True)
+        except Exception:
+            pass
+
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+        current_snapshot = self._current_workspace_colorbar_layout_snapshot()
+        if self._workspace_colorbar_layouts_match(current_snapshot, target_snapshot):
+            return
+
+        try:
+            self._restore_workspace_colorbar_state(colorbar_state, apply_to_open_windows=True)
         except Exception:
             pass
 
@@ -2015,6 +2116,25 @@ class MainWindow(FITSViewer):
         self._refresh_view_navigation_actions()
         return True
 
+    def _reset_shared_view_history_to_current(self, reason: str = "") -> bool:
+        snapshot = self._capture_shared_view_limits_snapshot()
+        if snapshot is None:
+            return False
+        snapshot = self._fill_missing_plane_limits(snapshot)
+        color_snapshot = self._capture_shared_color_history_snapshot()
+        signature = self._shared_view_entry_signature(snapshot, color_snapshot)
+        self._shared_view_history = [
+            {
+                "limits": snapshot,
+                "color": color_snapshot,
+                "signature": signature,
+                "reason": str(reason or ""),
+            }
+        ]
+        self._shared_view_history_index = 0
+        self._refresh_view_navigation_actions()
+        return True
+
     def _apply_shared_view_history_entry(self, entry) -> bool:
         if not isinstance(entry, dict):
             return False
@@ -2064,7 +2184,7 @@ class MainWindow(FITSViewer):
                         if callable(suspend_regions):
                             suspend_regions()
                         if hasattr(viewer, "canvas") and viewer.canvas is not None:
-                            viewer.canvas.draw_idle()
+                            self._request_canvas_redraw(viewer.canvas)
                         self.update_ranges(plane, (x0, x1), (y0, y1))
                         applied = True
                     except Exception:
@@ -2174,7 +2294,7 @@ class MainWindow(FITSViewer):
             pass
         try:
             if getattr(panel, "canvas", None) is not None:
-                panel.canvas.draw_idle()
+                self._request_canvas_redraw(panel.canvas)
         except Exception:
             pass
 
@@ -2436,7 +2556,7 @@ class MainWindow(FITSViewer):
             canvas = getattr(viewer, "canvas", None) if viewer is not None else None
             if canvas is not None:
                 try:
-                    canvas.draw_idle()
+                    self._request_canvas_redraw(canvas)
                 except Exception:
                     pass
 
@@ -2450,7 +2570,7 @@ class MainWindow(FITSViewer):
             canvas = getattr(window, "canvas", None)
             if canvas is not None:
                 try:
-                    canvas.draw_idle()
+                    self._request_canvas_redraw(canvas)
                 except Exception:
                     pass
 
@@ -2466,7 +2586,7 @@ class MainWindow(FITSViewer):
             canvas = getattr(window, "canvas", None)
             if canvas is not None:
                 try:
-                    canvas.draw_idle()
+                    self._request_canvas_redraw(canvas)
                 except Exception:
                     pass
 
@@ -2732,9 +2852,10 @@ class MainWindow(FITSViewer):
                         for axis in self._collect_window_axes(window):
                             axis.set_xlim(x0, x1)
                             axis.set_ylim(y0, y1)
+                        invalidate_workspace_restore_blit_cache(window)
                         canvas = getattr(window, "canvas", None)
                         if canvas is not None:
-                            canvas.draw_idle()
+                            self._request_canvas_redraw(canvas)
                         applied = True
                     except Exception:
                         pass
@@ -2794,7 +2915,7 @@ class MainWindow(FITSViewer):
                     canvas = getattr(window, "canvas", None)
                     if canvas is not None:
                         try:
-                            canvas.draw_idle()
+                            self._request_canvas_redraw(canvas)
                         except Exception:
                             pass
                 applied = True
@@ -3676,11 +3797,39 @@ class MainWindow(FITSViewer):
             normalized["auto_layout"] = self._coerce_workspace_bool(layout_state.get("colorbar_auto_layout"))
         return normalized
 
-    def _apply_workspace_colorbar_state_to_main_viewer(self, config: dict, layout_state=None) -> bool:
+    def _apply_workspace_colorbar_bounds_to_viewer_state(self, state, bounds) -> bool:
+        if state is None or getattr(state, "cax", None) is None:
+            return False
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+            return False
+        try:
+            pos_x, pos_y, width, height = [float(v) for v in bounds]
+            if hasattr(state.cax, "set_axes_locator"):
+                state.cax.set_axes_locator(None)
+                setattr(state, "_colorbar_axes_locator", None)
+            state.cax.set_position([pos_x, pos_y, width, height])
+            state.cax.set_gid("colorbar")
+            self._set_colorbar_zorder_for_state(state)
+            canvas = getattr(state, "canvas", None)
+            if canvas is not None:
+                self._request_canvas_redraw(canvas)
+            return True
+        except Exception:
+            return False
+
+    def _apply_workspace_colorbar_state_to_main_viewer(self, config: dict, layout_state=None, per_viewer_layouts=None) -> bool:
         if not isinstance(config, dict):
             return False
         applied = False
         layout = self._normalize_workspace_colorbar_layout(layout_state)
+        normalized_per_viewer = {}
+        if isinstance(per_viewer_layouts, dict):
+            for plane in ("xy", "xz", "zy"):
+                plane_layout = self._normalize_workspace_colorbar_layout(per_viewer_layouts.get(plane))
+                if plane_layout:
+                    normalized_per_viewer[plane] = plane_layout
+        if not layout and normalized_per_viewer:
+            layout = dict(normalized_per_viewer.get("xy") or next(iter(normalized_per_viewer.values())))
         orientation = str(layout.get("orientation", config.get("colorbar_orientation", "vertical")) or "vertical").strip().lower()
         if orientation not in {"vertical", "horizontal"}:
             orientation = "vertical"
@@ -3700,22 +3849,37 @@ class MainWindow(FITSViewer):
             except Exception:
                 pass
 
-        bounds = layout.get("bounds")
-        if isinstance(bounds, (list, tuple)) and len(bounds) == 4:
-            set_geometry = getattr(self, "_set_colorbar_geometry", None)
-            if callable(set_geometry):
-                try:
-                    pos_x, pos_y, width, height = [float(v) for v in bounds]
-                    set_geometry(pos_x, pos_y, width, height)
-                    applied = True
-                except Exception:
-                    pass
-        elif auto_layout:
+        if auto_layout:
             fit_now = getattr(self, "fit_colorbar_now", None)
             if callable(fit_now):
                 try:
                     fit_now()
                     applied = True
+                except Exception:
+                    pass
+        else:
+            fallback_bounds = layout.get("bounds")
+            primary_bounds = None
+            for plane in ("xy", "xz", "zy"):
+                state = self.get_viewer_state(plane)
+                if state is None:
+                    continue
+                plane_layout = normalized_per_viewer.get(plane, layout)
+                bounds = plane_layout.get("bounds", fallback_bounds)
+                if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+                    continue
+                if self._apply_workspace_colorbar_bounds_to_viewer_state(state, bounds):
+                    if primary_bounds is None and plane == "xy":
+                        primary_bounds = [float(v) for v in bounds]
+                    applied = True
+            if primary_bounds is None and isinstance(fallback_bounds, (list, tuple)) and len(fallback_bounds) == 4:
+                try:
+                    primary_bounds = [float(v) for v in fallback_bounds]
+                except Exception:
+                    primary_bounds = None
+            if primary_bounds is not None:
+                try:
+                    self._update_colorbar_geometry_config(*primary_bounds)
                 except Exception:
                     pass
 
@@ -3734,7 +3898,7 @@ class MainWindow(FITSViewer):
                 canvas = getattr(state, "canvas", None)
                 if canvas is not None:
                     try:
-                        canvas.draw_idle()
+                        self._request_canvas_redraw(canvas)
                     except Exception:
                         pass
                 applied = True
@@ -3793,6 +3957,9 @@ class MainWindow(FITSViewer):
             cax = getattr(window, "cax", None)
             if cax is not None:
                 try:
+                    if hasattr(cax, "set_axes_locator"):
+                        cax.set_axes_locator(None)
+                        setattr(window, "_colorbar_axes_locator", None)
                     cax.set_position([float(bounds[0]), float(bounds[1]), float(bounds[2]), float(bounds[3])])
                     cax.set_gid("colorbar")
                     applied = True
@@ -3825,10 +3992,165 @@ class MainWindow(FITSViewer):
         canvas = getattr(window, "canvas", None)
         if applied and canvas is not None:
             try:
-                canvas.draw_idle()
+                self._request_canvas_redraw(canvas)
             except Exception:
                 pass
         return applied
+
+    def _workspace_colorbar_layout_equivalent(self, current_layout, desired_layout) -> bool:
+        desired = self._normalize_workspace_colorbar_layout(desired_layout)
+        if not desired:
+            return True
+        current = self._normalize_workspace_colorbar_layout(current_layout)
+        if not current:
+            return False
+
+        desired_orientation = desired.get("orientation")
+        if desired_orientation and current.get("orientation") != desired_orientation:
+            return False
+
+        if "auto_layout" in desired:
+            if bool(current.get("auto_layout")) != bool(desired.get("auto_layout")):
+                return False
+
+        desired_bounds = desired.get("bounds")
+        if isinstance(desired_bounds, (list, tuple)) and len(desired_bounds) == 4:
+            current_bounds = current.get("bounds")
+            if not isinstance(current_bounds, (list, tuple)) or len(current_bounds) != 4:
+                return False
+            for current_value, desired_value in zip(current_bounds, desired_bounds):
+                try:
+                    if not math.isclose(
+                        float(current_value),
+                        float(desired_value),
+                        rel_tol=1e-6,
+                        abs_tol=1e-6,
+                    ):
+                        return False
+                except Exception:
+                    return False
+        return True
+
+    def _current_workspace_colorbar_layout_snapshot(self) -> dict:
+        snapshot = {
+            "main_viewers": {},
+            "integration_windows": {},
+            "channel_windows": {},
+        }
+
+        for plane in ("xy", "xz", "zy"):
+            state = self.get_viewer_state(plane)
+            viewer = self._viewer_for_plane(plane)
+            layout = self._capture_colorbar_state_for_target(
+                getattr(state, "cax", None) if state is not None else None,
+                getattr(state, "colorbar", None) if state is not None else None,
+                owner=viewer if viewer is not None else self,
+            )
+            normalized = self._normalize_workspace_colorbar_layout(layout)
+            if normalized:
+                snapshot["main_viewers"][plane] = normalized
+
+        for window in self._live_integration_windows():
+            key = self._integration_window_color_key(window)
+            layout = self._capture_colorbar_state_for_target(
+                getattr(window, "cax", None),
+                getattr(window, "colorbar", None),
+                owner=window,
+            )
+            normalized = self._normalize_workspace_colorbar_layout(layout)
+            if normalized:
+                snapshot["integration_windows"][key] = normalized
+
+        for window in list(getattr(self, "channel_map_windows", []) or []):
+            if window is None:
+                continue
+            key = self._channel_window_color_key(window)
+            layout = self._capture_colorbar_state_for_target(
+                getattr(window, "cax", None),
+                getattr(window, "colorbar", None),
+                owner=window,
+            )
+            normalized = self._normalize_workspace_colorbar_layout(layout)
+            if normalized:
+                snapshot["channel_windows"][key] = normalized
+
+        return snapshot
+
+    def _desired_workspace_colorbar_layout_snapshot(self, colorbar_state) -> dict:
+        state = colorbar_state if isinstance(colorbar_state, dict) else {}
+        snapshot = {
+            "main_viewers": {},
+            "integration_windows": {},
+            "channel_windows": {},
+        }
+
+        resolved_main_layouts = resolve_workspace_main_colorbar_layouts(state)
+        per_plane = resolved_main_layouts.get("per_plane") if isinstance(resolved_main_layouts, dict) else {}
+        if isinstance(per_plane, dict):
+            for plane in ("xy", "xz", "zy"):
+                normalized = self._normalize_workspace_colorbar_layout(per_plane.get(plane))
+                if normalized:
+                    snapshot["main_viewers"][plane] = normalized
+
+        global_state = self._workspace_colorbar_global_state(state)
+
+        integ_entries = self._workspace_colorbar_entries(state, "integration_windows")
+        integ_fallback = global_state if not integ_entries else None
+        remaining_integ_entries = list(integ_entries)
+        for window in self._live_integration_windows():
+            entry = self._pop_workspace_entry_by_key_or_next(
+                remaining_integ_entries,
+                self._integration_window_color_key(window),
+            )
+            layout = None
+            if isinstance(entry, dict):
+                layout = entry.get("state") if isinstance(entry.get("state"), dict) else entry
+            if not isinstance(layout, dict):
+                layout = integ_fallback
+            normalized = self._normalize_workspace_colorbar_layout(layout)
+            if normalized:
+                snapshot["integration_windows"][self._integration_window_color_key(window)] = normalized
+
+        channel_entries = self._workspace_colorbar_entries(state, "channel_windows")
+        channel_fallback = global_state if not channel_entries else None
+        remaining_channel_entries = list(channel_entries)
+        for window in list(getattr(self, "channel_map_windows", []) or []):
+            if window is None:
+                continue
+            entry = self._pop_workspace_entry_by_key_or_next(
+                remaining_channel_entries,
+                self._channel_window_color_key(window),
+            )
+            layout = None
+            if isinstance(entry, dict):
+                layout = entry.get("state") if isinstance(entry.get("state"), dict) else entry
+            if not isinstance(layout, dict):
+                layout = channel_fallback
+            normalized = self._normalize_workspace_colorbar_layout(layout)
+            if normalized:
+                snapshot["channel_windows"][self._channel_window_color_key(window)] = normalized
+
+        return snapshot
+
+    def _workspace_colorbar_layouts_match(self, current_snapshot, desired_snapshot) -> bool:
+        if not isinstance(desired_snapshot, dict):
+            return True
+        current = current_snapshot if isinstance(current_snapshot, dict) else {}
+
+        for bucket in ("main_viewers", "integration_windows", "channel_windows"):
+            desired_bucket = desired_snapshot.get(bucket)
+            if not isinstance(desired_bucket, dict):
+                continue
+            current_bucket = current.get(bucket)
+            if not isinstance(current_bucket, dict):
+                current_bucket = {}
+            for key, desired_layout in desired_bucket.items():
+                if not self._workspace_colorbar_layout_equivalent(
+                    current_bucket.get(key),
+                    desired_layout,
+                ):
+                    return False
+        return True
 
     def _apply_workspace_colorbar_state_to_open_windows(self, colorbar_state=None) -> bool:
         config = getattr(getattr(self, "config_manager", None), "config", None)
@@ -3852,7 +4174,17 @@ class MainWindow(FITSViewer):
         if not isinstance(main_layout, dict):
             main_layout = global_state
 
-        applied = self._apply_workspace_colorbar_state_to_main_viewer(config, layout_state=main_layout)
+        resolved_main_layouts = resolve_workspace_main_colorbar_layouts(state)
+        per_plane_layouts = resolved_main_layouts.get("per_plane")
+        resolved_primary = resolved_main_layouts.get("primary")
+        if isinstance(resolved_primary, dict) and resolved_primary:
+            main_layout = resolved_primary
+
+        applied = self._apply_workspace_colorbar_state_to_main_viewer(
+            config,
+            layout_state=main_layout,
+            per_viewer_layouts=per_plane_layouts,
+        )
 
         integ_entries = self._workspace_colorbar_entries(state, "integration_windows")
         integ_fallback = global_state if not integ_entries else None
@@ -4200,7 +4532,7 @@ class MainWindow(FITSViewer):
                 self._apply_image_color_state(image, image_state)
                 try:
                     if getattr(viewer, "canvas", None) is not None:
-                        viewer.canvas.draw_idle()
+                        self._request_canvas_redraw(viewer.canvas)
                 except Exception:
                     pass
                 applied = True
@@ -4265,7 +4597,7 @@ class MainWindow(FITSViewer):
                         pass
                 try:
                     if getattr(window, "canvas", None) is not None:
-                        window.canvas.draw_idle()
+                        self._request_canvas_redraw(window.canvas)
                 except Exception:
                     pass
                 applied = True
@@ -4308,7 +4640,7 @@ class MainWindow(FITSViewer):
                         pass
                 try:
                     if getattr(window, "canvas", None) is not None:
-                        window.canvas.draw_idle()
+                        self._request_canvas_redraw(window.canvas)
                 except Exception:
                     pass
                 applied = True
@@ -4460,7 +4792,7 @@ class MainWindow(FITSViewer):
 
             try:
                 if hasattr(window, "canvas") and window.canvas is not None:
-                    window.canvas.draw_idle()
+                    self._request_canvas_redraw(window.canvas)
             except Exception:
                 continue
 
@@ -5275,7 +5607,7 @@ class MainWindow(FITSViewer):
         canvas = getattr(window, "canvas", None)
         if canvas is not None:
             try:
-                canvas.draw_idle()
+                self._request_canvas_redraw(canvas)
                 return True
             except Exception:
                 pass
@@ -5294,7 +5626,7 @@ class MainWindow(FITSViewer):
             canvas = getattr(window, "canvas", None)
             if canvas is not None:
                 try:
-                    canvas.draw_idle()
+                    self._request_canvas_redraw(canvas)
                 except Exception:
                     pass
 
@@ -5328,7 +5660,7 @@ class MainWindow(FITSViewer):
             canvas = getattr(window, "canvas", None)
             if canvas is not None:
                 try:
-                    canvas.draw_idle()
+                    self._request_canvas_redraw(canvas)
                 except Exception:
                     pass
 
@@ -5360,8 +5692,9 @@ class MainWindow(FITSViewer):
                 viewer.ax.set_ylim(y0, y1)
                 if hasattr(viewer, "overlay_ax") and viewer.overlay_ax is not None:
                     viewer.overlay_ax.set_position(viewer.ax.get_position())
+                invalidate_workspace_restore_blit_cache(viewer)
                 if hasattr(viewer, "canvas") and viewer.canvas is not None:
-                    viewer.canvas.draw_idle()
+                    self._request_canvas_redraw(viewer.canvas)
                 self.update_ranges(plane, (x0, x1), (y0, y1))
                 applied = True
             except Exception:
@@ -5637,6 +5970,8 @@ class MainWindow(FITSViewer):
                 for key in ("xpix", "ypix", "zpix", "cursor_x", "cursor_y"):
                     preferred_cursor.pop(key, None)
 
+        self._set_workspace_colorbar_restore_in_progress(True)
+        self._begin_workspace_restore_canvas_redraw_batch()
         try:
             self.action_session.load_history(path, replay=True, replace=True)
             self._apply_action_session_state_to_viewers(preferred_cursor=preferred_cursor)
@@ -5668,7 +6003,6 @@ class MainWindow(FITSViewer):
                 allow_window_axis_limits=same_dataset,
             )
             restored_ui_widgets = self._restore_workspace_ui_state(workspace_state.get("ui_state"))
-            self._restore_workspace_colorbar_state(colorbar_state, apply_to_open_windows=True)
             restored_view = False
             restored_world = False
             restore_mode = compute_range_restore_mode(
@@ -5686,7 +6020,17 @@ class MainWindow(FITSViewer):
             self._resync_analysis_windows_after_restore()
             self._restore_workspace_window_z_order(workspace_state.get("window_z_order"))
             self._refresh_wcs_display_strings()
-            self._refresh_cursor_overlay_after_workspace_restore(preferred_cursor=preferred_cursor)
+            self._refresh_colorbar_layout_after_workspace_restore(colorbar_state)
+            self._flush_workspace_restore_canvas_redraw_batch()
+            self._refresh_cursor_overlay_after_workspace_restore(
+                preferred_cursor=preferred_cursor,
+                defer_retry=False,
+            )
+            self._reset_shared_view_history_to_current(reason="workspace_restore")
+            try:
+                QApplication.processEvents()
+            except Exception:
+                pass
 
             status_line = build_workspace_restore_status_line(
                 same_dataset=same_dataset,
@@ -5719,9 +6063,12 @@ class MainWindow(FITSViewer):
             self.set_workspace_save_path(path)
             return True
         except Exception as exc:
+            self._flush_workspace_restore_canvas_redraw_batch()
             QMessageBox.warning(self, "Workspace", f"Failed to load workspace: {exc}")
             return False
         finally:
+            self._flush_workspace_restore_canvas_redraw_batch()
+            self._set_workspace_colorbar_restore_in_progress(False)
             self._refresh_undo_redo_actions()
             self._refresh_view_navigation_actions()
 

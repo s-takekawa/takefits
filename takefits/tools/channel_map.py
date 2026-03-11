@@ -172,8 +172,9 @@ class ChannelMapWindow(QMainWindow):
         self._marker_planes: List[str] = []
         self._marker_plane_base: Dict[str, str] = {}
         self.marker_link_all = False
-        self._colorbar_autolayout_pending = False
         self._colorbar_auto_layout_override = None
+        self._colorbar_layout_from_draw_event = False
+        self._colorbar_sync_redraw_in_progress = False
         self._applying_colorbar_auto_layout = False
         self._colorbar_auto_anchor_sig = None
         
@@ -1423,6 +1424,15 @@ class ChannelMapWindow(QMainWindow):
         return (left, bottom, right - left, top - bottom)
 
     def _is_colorbar_auto_layout_enabled(self) -> bool:
+        root = getattr(self, "fits_viewer", None)
+        resolver = getattr(root, "_get_main_viewer", None)
+        if callable(resolver):
+            try:
+                root = resolver()
+            except Exception:
+                pass
+        if bool(getattr(root, "_workspace_colorbar_restore_in_progress", False)):
+            return False
         override = getattr(self, "_colorbar_auto_layout_override", None)
         if override is not None:
             return bool(override)
@@ -1430,6 +1440,44 @@ class ChannelMapWindow(QMainWindow):
         if not isinstance(config, dict):
             return False
         return bool(config.get("colorbar_auto_layout", False))
+
+    def _request_canvas_redraw(self, *, immediate: bool = False) -> bool:
+        canvas = getattr(self, "canvas", None)
+        if canvas is None:
+            return False
+
+        root = getattr(self, "fits_viewer", None)
+        resolver = getattr(root, "_get_main_viewer", None)
+        if callable(resolver):
+            try:
+                root = resolver()
+            except Exception:
+                pass
+
+        dispatcher = getattr(root, "_request_canvas_redraw", None)
+        if callable(dispatcher):
+            try:
+                return bool(dispatcher(canvas, immediate=immediate))
+            except Exception:
+                pass
+
+        draw_name = "draw" if immediate else "draw_idle"
+        draw = getattr(canvas, draw_name, None)
+        if callable(draw):
+            try:
+                draw()
+                return True
+            except Exception:
+                pass
+        if not immediate:
+            draw = getattr(canvas, "draw", None)
+            if callable(draw):
+                try:
+                    draw()
+                    return True
+                except Exception:
+                    pass
+        return False
 
     def _set_colorbar_orientation_config(self, orientation: str):
         orientation = str(orientation or "").strip().lower()
@@ -1498,7 +1546,7 @@ class ChannelMapWindow(QMainWindow):
         self._set_colorbar_zorder()
         return True
 
-    def _apply_colorbar_auto_layout(self, force: bool = False) -> bool:
+    def _apply_colorbar_auto_layout(self, force: bool = False, *, redraw: bool = True) -> bool:
         if not force and not self._is_colorbar_auto_layout_enabled():
             return False
         if bool(getattr(self, "_applying_colorbar_auto_layout", False)):
@@ -1533,7 +1581,6 @@ class ChannelMapWindow(QMainWindow):
         thickness_px = config.get("colorbar_thickness_px", 24.0)
         length_mode = str(config.get("colorbar_length_mode", "ratio") or "ratio")
         length_value = config.get("colorbar_length_value", 1.0)
-
         current_orientation = self._current_colorbar_orientation()
         target_orientation = orientation_for_placement(
             placement,
@@ -1563,7 +1610,6 @@ class ChannelMapWindow(QMainWindow):
             length_mode=length_mode,
             length_value=length_value,
         )[:4]
-
         eps = 1e-6
         changed = force or orientation_changed or any(abs(cur - tgt) > eps for cur, tgt in zip(cbar_bounds, target))
         if not changed:
@@ -1579,7 +1625,8 @@ class ChannelMapWindow(QMainWindow):
             config["cbar_width"] = float(target[2])
             config["cbar_height"] = float(target[3])
             if getattr(self, "canvas", None) is not None:
-                self.canvas.draw_idle()
+                if redraw:
+                    self._request_canvas_redraw()
         finally:
             self._applying_colorbar_auto_layout = False
         return True
@@ -1592,18 +1639,16 @@ class ChannelMapWindow(QMainWindow):
             return
         if not self._is_colorbar_auto_layout_enabled():
             return
-        if bool(getattr(self, "_colorbar_autolayout_pending", False)):
+        if bool(getattr(self, "_colorbar_sync_redraw_in_progress", False)):
             return
-        self._colorbar_autolayout_pending = True
-
-        def _run():
-            self._colorbar_autolayout_pending = False
-            if not force and bool(getattr(self, "_suspend_colorbar_auto_layout", False)):
-                return
-            if self._is_colorbar_auto_layout_enabled():
-                self._apply_colorbar_auto_layout(force=force)
-
-        QTimer.singleShot(0, _run)
+        from_draw_event = bool(getattr(self, "_colorbar_layout_from_draw_event", False))
+        changed = bool(self._apply_colorbar_auto_layout(force=force, redraw=not from_draw_event))
+        if changed and from_draw_event:
+            self._colorbar_sync_redraw_in_progress = True
+            try:
+                self._request_canvas_redraw(immediate=True)
+            finally:
+                self._colorbar_sync_redraw_in_progress = False
 
     def _colorbar_layout_anchor_signature(self):
         anchor = self._visible_axes_bounds()
@@ -1639,7 +1684,11 @@ class ChannelMapWindow(QMainWindow):
     def _on_canvas_draw_for_layout(self, event):
         if getattr(event, "canvas", None) is not self.canvas:
             return
-        self._schedule_colorbar_auto_layout_if_anchor_changed(force=False)
+        self._colorbar_layout_from_draw_event = True
+        try:
+            self._schedule_colorbar_auto_layout_if_anchor_changed(force=False)
+        finally:
+            self._colorbar_layout_from_draw_event = False
 
     def update_images(self):
         total_images = len(self.ch_imdata)
@@ -2781,7 +2830,7 @@ class ChannelMapWindow(QMainWindow):
                 pass
             if getattr(self, "canvas", None) is not None:
                 try:
-                    self.canvas.draw_idle()
+                    self._request_canvas_redraw()
                 except Exception:
                     pass
 
@@ -2907,9 +2956,6 @@ class ChannelMapWindow(QMainWindow):
         if new_state:
             # If turning ON, snap to the correct position immediately.
             self._schedule_colorbar_auto_layout(force=True)
-        else:
-            # If turning OFF, clear pending auto-layout requests.
-            self._colorbar_autolayout_pending = False
 
         return True
 
