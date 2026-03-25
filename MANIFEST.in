@@ -1,0 +1,14 @@
+prune .github
+prune cli
+prune config
+prune docs/dev
+prune scripts
+prune tests
+prune takefits/logic/scimes
+
+exclude .DS_Store
+exclude test_marker_utils.py
+
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store

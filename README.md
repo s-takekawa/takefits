@@ -6,7 +6,7 @@ Takefits is a GUI-based astronomical FITS viewer and analysis tool developed by 
 
 ## Requirements
 
-- Python 3.12 or later
+- Python 3.11 or later
 
 ## Setup
 

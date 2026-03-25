@@ -16,6 +16,7 @@ class ChannelMapResult:
     """Result from channel map generation."""
     images: List[np.ndarray]  # List of 2D images
     labels: List[Tuple[float, float, float]]  # (from, center, to) for each image
+    display_labels: List[Tuple[float, float, float]]  # Requested bin edges and midpoint
     pixel_ranges: List[Tuple[int, int]]  # (start, end) pixel for each image
 
 
@@ -104,6 +105,7 @@ def compute_channel_map(
 
     images = []
     labels = []
+    display_labels = []
     pixel_ranges = []
 
     current = start_channel
@@ -217,8 +219,11 @@ def compute_channel_map(
             idx = int(math.floor(current + 0.5))
             idx = max(0, min(n_channels - 1, idx))
             labels.append((float(idx), float(idx), float(idx)))
+            display_labels.append((float(idx), float(idx), float(idx)))
             pixel_ranges.append((idx, idx))
         else:
+            display_center = (current + ch_end) / 2.0
+            display_labels.append((float(current), float(display_center), float(ch_end)))
             is_integer_range = (
                 abs(current - round(current)) < 1e-6
                 and abs(ch_end - round(ch_end)) < 1e-6
@@ -251,6 +256,7 @@ def compute_channel_map(
     return ChannelMapResult(
         images=images,
         labels=labels,
+        display_labels=display_labels,
         pixel_ranges=pixel_ranges
     )
 

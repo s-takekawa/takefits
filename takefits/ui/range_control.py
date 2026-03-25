@@ -1,8 +1,16 @@
 from PySide6.QtWidgets import QWidget, QGridLayout, QLineEdit, QPushButton, QLabel, QMessageBox
 from PySide6.QtCore import Qt
-from takefits.core.coordinate import CoordinateConverter
+from takefits.core.range_files import (
+    build_range_payload,
+    build_coordinate_mismatch_message,
+    evaluate_range_payload_compatibility,
+    extract_native_ranges,
+    load_range_payload,
+    native_ranges_to_pixel_limits,
+    save_range_payload,
+)
+from takefits.core.wcs_frames import normalize_display_frame, parse_world_value
 import os
-from pathlib import Path
 
 class RangeControlPanel(QWidget):
     def __init__(self, fits_viewer, subwindows):
@@ -24,7 +32,6 @@ class RangeControlPanel(QWidget):
             
 
     def initUI(self):
-        self.converter = CoordinateConverter(self.wcs, self.fits_viewer.config_manager.config)
         layout = QGridLayout()
         
         layout.setHorizontalSpacing(4)
@@ -211,105 +218,298 @@ class RangeControlPanel(QWidget):
         self.save_range_button.setEnabled(has_path)
         self.load_range_button.setEnabled(has_path and os.path.isfile(range_path))
 
-    def read_range_file(self, range_file):
-        coords = {}
-        meta = {'filename': None, 'coordinate_system': None}
-        with open(range_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                if stripped.startswith('#'):
-                    lower = stripped.lower()
-                    if lower.startswith('#filename'):
-                        parts = stripped.split(':', 1)
-                        if len(parts) == 2:
-                            meta['filename'] = parts[1].strip()
-                    elif lower.startswith('#coordinate'):
-                        parts = stripped.split(':', 1)
-                        if len(parts) == 2:
-                            meta['coordinate_system'] = parts[1].strip()
-                    continue
-
-                parts = stripped.split()
-                if len(parts) != 4:
-                    raise ValueError(f'Invalid line format: "{line.strip()}"')
-                key = parts[0].upper()
-                ctype = parts[1]
-                try:
-                    coord1 = float(parts[2])
-                    coord2 = float(parts[3])
-                except ValueError as err:
-                    raise ValueError(f'Invalid numeric values in line: "{line.strip()}"') from err
-                coords[key] = (ctype, coord1, coord2)
-        if 'X' not in coords or 'Y' not in coords:
-            raise ValueError('Range file must contain X and Y entries.')
-        return meta, coords
-
-    def _write_range_file(self, range_file):
-        axis_order = [('X', 0), ('Y', 1)]
+    def _axis_keys(self):
+        keys = ['x', 'y']
         if self.fits_viewer.data.ndim > 2:
-            axis_order.append(('Z', 2))
+            keys.append('z')
+        return keys
 
-        entries = []
-        for axis_label, axis_index in axis_order:
-            input_widget = getattr(self, f"{axis_label.lower()}_min_input", None)
-            max_widget = getattr(self, f"{axis_label.lower()}_max_input", None)
-            if input_widget is None or max_widget is None:
-                continue
+    def _subwindow(self, index):
+        if 0 <= int(index) < len(self.subwindows):
+            return self.subwindows[int(index)]
+        return None
 
+    def _axis_index(self, axis_key):
+        return {'x': 0, 'y': 1, 'z': 2}.get(str(axis_key or '').lower(), -1)
+
+    def _axis_ctype(self, axis_key):
+        axis_index = self._axis_index(axis_key)
+        if axis_index < 0 or self.wcs is None or getattr(self.wcs, 'wcs', None) is None:
+            return ''
+        ctype = list(getattr(self.wcs.wcs, 'ctype', []) or [])
+        if axis_index >= len(ctype):
+            return ''
+        return str(ctype[axis_index] or '')
+
+    def _current_display_frame(self):
+        getter = getattr(self.fits_viewer, 'get_wcs_display_frame', None)
+        if callable(getter):
             try:
-                minimum = float(input_widget.text())
-                maximum = float(max_widget.text())
-            except ValueError:
-                raise ValueError(f'Invalid numeric value for {axis_label} range.')
+                return normalize_display_frame(getter())
+            except Exception:
+                pass
+        getter = getattr(self.fits_viewer, '_get_shared_display_frame', None)
+        if callable(getter):
+            try:
+                return normalize_display_frame(getter())
+            except Exception:
+                pass
+        return 'native'
 
-            ctype = self.wcs.wcs.ctype[axis_index] if self.wcs and self.wcs.wcs and len(self.wcs.wcs.ctype) > axis_index else ''
-            entries.append((axis_label, ctype, minimum, maximum))
+    def _build_dataset_descriptor(self):
+        descriptor_builder = getattr(self.fits_viewer, '_dataset_descriptor', None)
+        if callable(descriptor_builder):
+            try:
+                descriptor = descriptor_builder()
+            except Exception:
+                descriptor = None
+            if isinstance(descriptor, dict):
+                source = {}
+                for key in ('filepath', 'filename', 'wcs_signature'):
+                    value = descriptor.get(key)
+                    if value not in (None, '', {}):
+                        source[key] = value
+                return source
 
-        summary_parts = []
-        for _, ctype, _, _ in entries:
-            if ctype:
-                summary_parts.append(ctype.split('-')[0])
-        coordinate_summary = ', '.join(summary_parts)
+        filepath = str(getattr(self.fits_viewer, 'filename_path', '') or '')
+        descriptor = {
+            'filepath': os.path.abspath(filepath) if filepath else '',
+            'filename': os.path.basename(filepath) if filepath else str(getattr(self.fits_viewer, 'filename', '') or ''),
+        }
+        signature_builder = getattr(self.fits_viewer, '_build_wcs_signature', None)
+        if callable(signature_builder):
+            try:
+                signature = signature_builder(getattr(self.fits_viewer, 'wcs', None))
+            except Exception:
+                signature = None
+            if isinstance(signature, dict):
+                descriptor['wcs_signature'] = dict(signature)
+        return descriptor
 
-        output_lines = []
-        output_lines.append(f'#filename: {self.fits_viewer.filename}')
-        output_lines.append(f'#Coordinate: {coordinate_summary}')
-        for axis_label, ctype, minimum, maximum in entries:
-            output_lines.append(f'{axis_label} {ctype} {minimum} {maximum}')
+    def _current_wcs_signature(self):
+        descriptor = self._build_dataset_descriptor()
+        signature = descriptor.get('wcs_signature')
+        if isinstance(signature, dict):
+            return dict(signature)
+        return {}
 
-        range_path = Path(range_file)
-        if range_path.parent and not range_path.parent.exists():
-            range_path.parent.mkdir(parents=True, exist_ok=True)
+    def _fallback_native_world(self):
+        fallback_world = None
+        getter = getattr(self.fits_viewer, '_shared_world_vector', None)
+        if callable(getter):
+            try:
+                fallback_world = list(getter() or [])
+            except Exception:
+                fallback_world = None
+        return fallback_world
 
-        with open(range_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(output_lines) + '\n')
+    def _parse_axis_value(self, axis_key, value_text, *, axis_ctype=None, frame=None):
+        text = str(value_text or '').strip()
+        if not text:
+            raise ValueError(f'Missing {str(axis_key).upper()} range value.')
+        ctype = str(axis_ctype or self._axis_ctype(axis_key) or '')
+        frame_name = str(frame or self._current_display_frame() or 'native')
+        try:
+            return float(parse_world_value(text, ctype, frame_for_longitude=frame_name))
+        except Exception as exc:
+            raise ValueError(f'Invalid value for {str(axis_key).upper()} range: "{text}"') from exc
 
-    def _coordinate_system_matches(self, saved_axes):
-        if not self.wcs or not self.wcs.wcs:
-            return True
-
-        axis_mapping = [('X', 0), ('Y', 1)]
-        if self.fits_viewer.data.ndim > 2:
-            axis_mapping.append(('Z', 2))
-
-        # Allow different velocity/frequency types to be compatible for range loading
-        velocity_types = {'VELO', 'VRAD', 'VOPT', 'FREQ'}
-
-        for label, idx in axis_mapping:
-            if label not in saved_axes or len(self.wcs.wcs.ctype) <= idx:
+    def _collect_range_payload(self):
+        payload = {}
+        for axis_key in self._axis_keys():
+            min_widget = getattr(self, f'{axis_key}_min_input', None)
+            max_widget = getattr(self, f'{axis_key}_max_input', None)
+            if min_widget is None or max_widget is None:
                 continue
-            current = self.wcs.wcs.ctype[idx].split('-')[0]
-            saved = saved_axes[label][0].split('-')[0] if saved_axes[label][0] else ''
+            min_text = str(min_widget.text() or '').strip()
+            max_text = str(max_widget.text() or '').strip()
+            if not min_text or not max_text:
+                raise ValueError(f'Missing {axis_key.upper()} range.')
+            payload[axis_key] = {
+                'ctype': self._axis_ctype(axis_key),
+                'min_text': min_text,
+                'max_text': max_text,
+                'native_min': self._parse_axis_value(axis_key, min_text),
+                'native_max': self._parse_axis_value(axis_key, max_text),
+            }
+        return payload
 
-            # If both are velocity/frequency types, consider them a match
-            if current in velocity_types and saved in velocity_types:
+    def _pixel_limits_from_native_ranges(self, native_ranges):
+        return native_ranges_to_pixel_limits(
+            self.wcs,
+            native_ranges,
+            fallback_native_world=self._fallback_native_world(),
+        )
+
+    @staticmethod
+    def _set_view_limits(viewer, *, xlim=None, ylim=None):
+        if viewer is None or not hasattr(viewer, 'ax'):
+            return
+        if xlim is not None:
+            viewer.ax.set_xlim(*xlim)
+        if ylim is not None:
+            viewer.ax.set_ylim(*ylim)
+        overlay_ax = getattr(viewer, 'overlay_ax', None)
+        if overlay_ax is not None:
+            try:
+                overlay_ax.set_position(viewer.ax.get_position())
+            except Exception:
+                pass
+        canvas = getattr(viewer, 'canvas', None)
+        if canvas is not None:
+            canvas.draw_idle()
+
+    def _build_range_payload_from_inputs(self):
+        return build_range_payload(
+            source=self._build_dataset_descriptor(),
+            ranges=self._collect_range_payload(),
+        )
+
+    @staticmethod
+    def _set_axis_input_texts(viewer, axis_key, minimum, maximum):
+        if viewer is None:
+            return
+        min_input = getattr(viewer, f'{axis_key}_min_input', None)
+        max_input = getattr(viewer, f'{axis_key}_max_input', None)
+        if min_input is not None:
+            min_input.setText(str(minimum))
+        if max_input is not None:
+            max_input.setText(str(maximum))
+
+    def _axis_targets(self, axis_key):
+        if axis_key == 'x':
+            return (
+                (self.fits_viewer, 'xlim', 'x'),
+                (self._subwindow(0), 'xlim', 'x'),
+            )
+        if axis_key == 'y':
+            return (
+                (self.fits_viewer, 'ylim', 'y'),
+                (self._subwindow(1), 'ylim', 'y'),
+            )
+        if axis_key == 'z':
+            return (
+                (self._subwindow(0), 'ylim', 'z'),
+                (self._subwindow(1), 'xlim', 'z'),
+            )
+        return ()
+
+    def _apply_axis_limit(self, axis_key, pixel_range, minimum, maximum):
+        for viewer, limit_name, input_axis in self._axis_targets(axis_key):
+            if viewer is None:
+                continue
+            self._set_view_limits(viewer, **{limit_name: pixel_range})
+            self._set_axis_input_texts(viewer, input_axis, minimum, maximum)
+
+    def _native_ranges_from_payload(self, payload, *, include_full_z):
+        native_ranges = {
+            'x': (payload['x']['native_min'], payload['x']['native_max']),
+            'y': (payload['y']['native_min'], payload['y']['native_max']),
+        }
+        if self.fits_viewer.data.ndim <= 2:
+            return native_ranges
+
+        z_entry = payload.get('z')
+        if z_entry is None:
+            if include_full_z:
+                raise ValueError('Missing Z range.')
+            return native_ranges
+
+        if include_full_z:
+            native_ranges['z'] = (z_entry['native_min'], z_entry['native_max'])
+        else:
+            z_anchor = z_entry['native_min']
+            native_ranges['z'] = (z_anchor, z_anchor)
+        return native_ranges
+
+    def _set_z_anchor(self, z_text):
+        z_anchor = str(z_text or '').strip()
+        if not z_anchor:
+            return
+        self.original_zval = z_anchor
+        self.fits_viewer.original_zval = z_anchor
+        for sw in list(self.subwindows or []):
+            try:
+                sw.original_zval = z_anchor
+            except Exception:
                 continue
 
-            if current != saved:
-                return False
-        return True
+    def _apply_axis_range_from_payload(self, axis_key, payload):
+        if axis_key not in payload:
+            raise ValueError(f'Missing {axis_key.upper()} range.')
+
+        pixel_limits = self._pixel_limits_from_native_ranges(
+            self._native_ranges_from_payload(payload, include_full_z=(axis_key == 'z'))
+        )
+        if axis_key not in pixel_limits:
+            raise ValueError(f'Calculated {axis_key.upper()} pixel limits are unavailable.')
+
+        minimum = payload[axis_key]['min_text']
+        maximum = payload[axis_key]['max_text']
+        self._apply_axis_limit(axis_key, pixel_limits[axis_key], minimum, maximum)
+
+        if axis_key == 'z':
+            self._set_z_anchor(minimum)
+
+    def _sync_planes_for_axis(self, axis_key):
+        if axis_key == 'z':
+            return ('xz', 'zy')
+        return ('xy',)
+
+    def _record_axis_history(self, axis_key):
+        record_history = getattr(self.fits_viewer, "_record_shared_view_history", None)
+        if not callable(record_history):
+            return
+        reason = {
+            'x': 'range_panel:set_x',
+            'y': 'range_panel:set_y',
+            'z': 'range_panel:set_z',
+        }.get(axis_key)
+        if not reason:
+            return
+        try:
+            record_history(reason=reason)
+        except Exception:
+            pass
+
+    def _set_axis_range(self, axis_key):
+        try:
+            payload = self._collect_range_payload()
+            self._apply_axis_range_from_payload(axis_key, payload)
+        except (ValueError, TypeError):
+            if not getattr(self, "_suppress_range_warning", False):
+                QMessageBox.warning(self, 'Invalid Input', f'Please enter valid values for the {axis_key.upper()} range.')
+            return
+
+        for plane in self._sync_planes_for_axis(axis_key):
+            self._sync_inputs(plane)
+        self._record_axis_history(axis_key)
+
+    def _apply_loaded_native_ranges(self, native_ranges):
+        pixel_limits = self._pixel_limits_from_native_ranges(native_ranges)
+        xlim = pixel_limits.get('x')
+        ylim = pixel_limits.get('y')
+        zlim = pixel_limits.get('z')
+
+        if xlim is None or ylim is None:
+            raise ValueError('Saved range entry is missing X/Y limits.')
+
+        self._set_view_limits(self.fits_viewer, xlim=xlim, ylim=ylim)
+        if len(self.subwindows) > 0 and self.subwindows[0]:
+            self._set_view_limits(self.subwindows[0], xlim=xlim, ylim=zlim)
+        if len(self.subwindows) > 1 and self.subwindows[1]:
+            self._set_view_limits(self.subwindows[1], xlim=zlim, ylim=ylim)
+
+        viewer_update_ranges = getattr(self.fits_viewer, 'update_ranges', None)
+        if callable(viewer_update_ranges):
+            viewer_update_ranges('xy', xlim, ylim)
+            if self.fits_viewer.data.ndim > 2 and zlim is not None:
+                viewer_update_ranges('xz', xlim, zlim)
+                if len(self.subwindows) > 1 and self.subwindows[1]:
+                    viewer_update_ranges('zy', zlim, ylim)
+
+        if self.fits_viewer.data.ndim > 2 and zlim is not None and hasattr(self, 'z_min_input'):
+            self._set_z_anchor(self.z_min_input.text())
 
     def load_range_button_pressed(self):
         range_path = self._get_range_file_path()
@@ -322,37 +522,46 @@ class RangeControlPanel(QWidget):
             return
 
         try:
-            meta, coords = self.read_range_file(range_path)
+            payload = load_range_payload(range_path)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, 'Failed to Load Range', f'Could not load range file:\n{exc}')
             return
 
-        if not self._coordinate_system_matches(coords):
+        current_signature = self._current_wcs_signature()
+        compatible, _reason = evaluate_range_payload_compatibility(
+            payload,
+            current_signature=current_signature,
+            data_ndim=int(getattr(self.fits_viewer.data, 'ndim', 0) or 0),
+        )
+        native_ranges = extract_native_ranges(payload)
+        if not native_ranges:
             QMessageBox.warning(
                 self,
-                'Coordinate Mismatch',
-                'The coordinate system in the range file does not match the current FITS data.'
+                'Range Not Found',
+                'No saved range entry was found.'
             )
             return
 
-        x_min, x_max = coords['X'][1], coords['X'][2]
-        y_min, y_max = coords['Y'][1], coords['Y'][2]
+        if not compatible:
+            QMessageBox.warning(
+                self,
+                'Coordinate Mismatch',
+                build_coordinate_mismatch_message(payload, current_signature),
+            )
+            return
 
-        self.x_min_input.setText(str(x_min))
-        self.x_max_input.setText(str(x_max))
-        self.set_x_range()
+        try:
+            self._apply_loaded_native_ranges(native_ranges)
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, 'Failed to Load Range', str(exc))
+            return
 
-        self.y_min_input.setText(str(y_min))
-        self.y_max_input.setText(str(y_max))
-        self.set_y_range()
-
-        if self.fits_viewer.data.ndim > 2 and 'Z' in coords and hasattr(self, 'z_min_input'):
-            z_min, z_max = coords['Z'][1], coords['Z'][2]
-            self.z_min_input.setText(str(z_min))
-            self.z_max_input.setText(str(z_max))
-            self.set_z_range()
-
-        print(f'\n\nRange file "{self.range_file}" was loaded from {range_path}.')
+        source = payload.get('source') if isinstance(payload.get('source'), dict) else {}
+        saved_name = str(source.get('filename') or '').strip()
+        if saved_name:
+            print(f'\n\nRange file "{self.range_file}" loaded from {range_path} using entry "{saved_name}".')
+        else:
+            print(f'\n\nRange file "{self.range_file}" was loaded from {range_path}.')
 
     def save_range_button_pressed(self):
         range_path = self._get_range_file_path()
@@ -360,7 +569,8 @@ class RangeControlPanel(QWidget):
             QMessageBox.warning(self, 'Range File Missing', 'No range file configured.')
             return
         try:
-            self._write_range_file(range_path)
+            payload = self._build_range_payload_from_inputs()
+            save_range_payload(range_path, payload)
         except ValueError as exc:
             QMessageBox.warning(self, 'Failed to Save Range', str(exc))
             return
@@ -435,154 +645,15 @@ class RangeControlPanel(QWidget):
 
     def set_x_range(self):
         """Set the X range for both the MainWindow and SubWindow1."""
-        try:
-            x_min = self.x_min_input.text()
-            x_max = self.x_max_input.text()
-            y_min = self.y_min_input.text()
-            y_max = self.y_max_input.text()
-            if self.fits_viewer.data.ndim == 3:
-                xp_min = float(self.converter.world_to_pix(x_min,y_min,self.original_zval)[0])
-                xp_max = float(self.converter.world_to_pix(x_max,y_max,self.original_zval)[0])
-            elif self.fits_viewer.data.ndim == 4:
-                xp_min = float(self.converter.world_to_pix(x_min,y_min,self.original_zval, 0)[0])
-                xp_max = float(self.converter.world_to_pix(x_max,y_max,self.original_zval, 0)[0])
-            elif self.fits_viewer.data.ndim == 2:
-                xp_min = float(self.converter.world_to_pix(x_min,y_min)[0])
-                xp_max = float(self.converter.world_to_pix(x_max,y_max)[0])
-                
-            if xp_min > xp_max: xp_min, xp_max = xp_max, xp_min
-                
-            self.fits_viewer.ax.set_xlim(xp_min, xp_max)
-            self.fits_viewer.canvas.draw_idle()
+        self._set_axis_range('x')
 
-            if hasattr(self.fits_viewer, 'x_min_input'):
-                self.fits_viewer.x_min_input.setText(str(x_min))
-                self.fits_viewer.x_max_input.setText(str(x_max))
-
-            # Apply X range to SubWindow1 (if exists)
-            if len(self.subwindows) > 0 and self.subwindows[0]:  # SubWindow1 (XZ plane)
-                self.subwindows[0].ax.set_xlim(xp_min, xp_max)
-                self.subwindows[0].canvas.draw_idle()
-                if hasattr(self.subwindows[0], 'x_min_input'):
-                    self.subwindows[0].x_min_input.setText(str(x_min))
-                    self.subwindows[0].x_max_input.setText(str(x_max))
-
-        except (ValueError, TypeError):
-            if not getattr(self, "_suppress_range_warning", False):
-                QMessageBox.warning(self, 'Invalid Input', 'Please enter valid numeric values for the X range.')
-            return
-
-        self._sync_inputs('xy')
-        record_history = getattr(self.fits_viewer, "_record_shared_view_history", None)
-        if callable(record_history):
-            try:
-                record_history(reason="range_panel:set_x")
-            except Exception:
-                pass
     def set_y_range(self):
         """Set the Y range for both the MainWindow and SubWindow2."""
-        try:
-            y_min = self.y_min_input.text()
-            y_max = self.y_max_input.text()
-            x_min = self.x_min_input.text()
-            x_max = self.x_max_input.text()
-            if self.fits_viewer.data.ndim == 3:
-                yp_min = float(self.converter.world_to_pix(x_min,y_min,self.original_zval)[1])
-                yp_max = float(self.converter.world_to_pix(x_max,y_max,self.original_zval)[1])
-            elif self.fits_viewer.data.ndim == 4:
-                yp_min = float(self.converter.world_to_pix(x_min,y_min,self.original_zval, 0)[1])
-                yp_max = float(self.converter.world_to_pix(x_max,y_max,self.original_zval, 0)[1])
-            elif self.fits_viewer.data.ndim == 2:
-                yp_min = float(self.converter.world_to_pix(x_min,y_min)[1])
-                yp_max = float(self.converter.world_to_pix(x_max,y_max)[1])
+        self._set_axis_range('y')
 
-                
-            if yp_min > yp_max: yp_min, yp_max = yp_max, yp_min
-            
-            self.fits_viewer.ax.set_ylim(yp_min, yp_max)
-            self.fits_viewer.canvas.draw_idle()
-
-            if hasattr(self.fits_viewer, 'y_min_input'):
-                self.fits_viewer.y_min_input.setText(str(y_min))
-                self.fits_viewer.y_max_input.setText(str(y_max))
-
-            # Apply Y range to SubWindow1 (if exists)
-            if len(self.subwindows) > 1 and self.subwindows[1]:  # SubWindow2 (ZY plane)
-                self.subwindows[1].ax.set_ylim(yp_min, yp_max)
-                self.subwindows[1].canvas.draw_idle()
-                if hasattr(self.subwindows[1], 'y_min_input'):
-                    self.subwindows[1].y_min_input.setText(str(y_min))
-                    self.subwindows[1].y_max_input.setText(str(y_max))
-
-        except (ValueError, TypeError):
-            if not getattr(self, "_suppress_range_warning", False):
-                QMessageBox.warning(self, 'Invalid Input', 'Please enter valid numeric values for the Y range.')
-            return
-
-        self._sync_inputs('xy')
-        record_history = getattr(self.fits_viewer, "_record_shared_view_history", None)
-        if callable(record_history):
-            try:
-                record_history(reason="range_panel:set_y")
-            except Exception:
-                pass
     def set_z_range(self):
         """Set the Z range for both SubWindow1 (vertical in XZ plane) and SubWindow2 (horizontal in ZY plane)."""
-        try:
-            z_min = self.z_min_input.text()
-            z_max = self.z_max_input.text()
-            y_min = self.y_min_input.text()
-            y_max = self.y_max_input.text()
-            x_min = self.x_min_input.text()
-            x_max = self.x_max_input.text()
-            
-            if self.fits_viewer.data.ndim == 3:
-                zp_min = float(self.converter.world_to_pix(x_min, y_min, z_min)[2])
-                zp_max = float(self.converter.world_to_pix(x_max, y_max, z_max)[2])
-            elif self.fits_viewer.data.ndim == 4:
-                zp_min = float(self.converter.world_to_pix(x_min, y_min, z_min, 0)[2])
-                zp_max = float(self.converter.world_to_pix(x_min, y_max, z_max, 0)[2])
-                
-            if zp_min > zp_max: zp_min, zp_max = zp_max, zp_min
-
-            # Apply Z range to SubWindow1 (if exists)
-            if len(self.subwindows) > 0 and self.subwindows[0]:  # SubWindow1 (XZ plane vertical axis)
-                self.subwindows[0].ax.set_ylim(zp_min, zp_max)
-                self.subwindows[0].canvas.draw_idle()
-                if hasattr(self.subwindows[0], 'z_min_input'):
-                    self.subwindows[0].z_min_input.setText(str(z_min))
-                    self.subwindows[0].z_max_input.setText(str(z_max))
-
-            # Apply Z range to SubWindow2 (if exists)
-            if len(self.subwindows) > 1 and self.subwindows[1]:  # SubWindow2 (ZY plane horizontal axis)
-                self.subwindows[1].ax.set_xlim(zp_min, zp_max)
-                self.subwindows[1].canvas.draw_idle()
-                if hasattr(self.subwindows[1], 'z_min_input'):
-                    self.subwindows[1].z_min_input.setText(str(z_min))
-                    self.subwindows[1].z_max_input.setText(str(z_max))
-
-            # Keep the conversion anchor in sync with the latest Z-range edits.
-            self.original_zval = str(z_min)
-            self.fits_viewer.original_zval = str(z_min)
-            for sw in list(self.subwindows or []):
-                try:
-                    sw.original_zval = str(z_min)
-                except Exception:
-                    continue
-
-        except (ValueError, TypeError):
-            if not getattr(self, "_suppress_range_warning", False):
-                QMessageBox.warning(self, 'Invalid Input', 'Please enter valid numeric values for the Z range.')
-            return
-
-        self._sync_inputs('xz')
-        self._sync_inputs('zy')
-        record_history = getattr(self.fits_viewer, "_record_shared_view_history", None)
-        if callable(record_history):
-            try:
-                record_history(reason="range_panel:set_z")
-            except Exception:
-                pass
+        self._set_axis_range('z')
     def update_ranges(self, plane, xlim, ylim):
         # Always use the main viewer to compute full limits so we mirror its rounding.
         # Prefer values already shown on the main window so we mirror them exactly.

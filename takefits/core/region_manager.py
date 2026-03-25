@@ -6,6 +6,7 @@ from .region import Region
 from astropy.wcs.utils import proj_plane_pixel_scales, wcs_to_celestial_frame
 from astropy.coordinates import SkyCoord
 import astropy.units as u
+from .wcs_frames import celestial_axis_indices
 
 class RegionManager(QObject):
     """
@@ -102,16 +103,36 @@ class RegionManager(QObject):
             return True
         return False
 
+    def _screen_to_data_coords(self, axes, event):
+        if axes is None:
+            return None
+        ex = getattr(event, 'x', None)
+        ey = getattr(event, 'y', None)
+        if ex is None or ey is None:
+            return None
+        try:
+            xdata, ydata = axes.transData.inverted().transform((ex, ey))
+        except Exception:
+            return None
+        return float(xdata), float(ydata)
+
     def _extract_data_coords(self, event):
         xdata = getattr(event, 'xdata', None)
         ydata = getattr(event, 'ydata', None)
-        if self._is_colorbar_axes(getattr(event, 'inaxes', None)):
+        axes = getattr(event, 'inaxes', None)
+        if self._is_colorbar_axes(axes):
             xdata = None
             ydata = None
+
+        main_axes = getattr(self.viewer, 'ax', None)
+        if axes is not None and axes is not main_axes and main_axes is not None:
+            main_coords = self._screen_to_data_coords(main_axes, event)
+            if main_coords is not None:
+                return main_coords
+
         if xdata is not None and ydata is not None:
             return xdata, ydata
 
-        axes = getattr(event, 'inaxes', None)
         if self._is_colorbar_axes(axes):
             axes = None
         if axes is None and self.selected_region is not None:
@@ -121,12 +142,13 @@ class RegionManager(QObject):
         if self._is_colorbar_axes(axes):
             axes = getattr(self.viewer, 'ax', None)
 
-        if axes is not None and getattr(event, 'x', None) is not None and getattr(event, 'y', None) is not None:
-            try:
-                xdata, ydata = axes.transData.inverted().transform((event.x, event.y))
-            except Exception:
-                xdata = getattr(event, 'xdata', None)
-                ydata = getattr(event, 'ydata', None)
+        main_coords = self._screen_to_data_coords(main_axes, event)
+        if main_coords is not None:
+            return main_coords
+
+        axes_coords = self._screen_to_data_coords(axes, event)
+        if axes_coords is not None:
+            return axes_coords
         return xdata, ydata
 
 
@@ -975,11 +997,73 @@ class RegionManager(QObject):
             return None
         return axes
 
-    def _pixel_scales_deg(self, plane: str, wcs) -> tuple[float, float] | None:
+    def _shared_pixel_axis_value(self, axis_index: int):
+        viewer = self.viewer
+        if viewer is None:
+            return None
+        getter_names = (
+            "_get_shared_xpix",
+            "_get_shared_ypix",
+            "_get_shared_zpix",
+            "_get_shared_spix",
+        )
+        if axis_index < 0 or axis_index >= len(getter_names):
+            return None
+        getter = getattr(viewer, getter_names[axis_index], None)
+        if not callable(getter):
+            return None
+        try:
+            value = getter()
+        except Exception:
+            return None
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def _pixel_scales_deg(self, plane: str, wcs, center_pix=None) -> tuple[float, float] | None:
         indices = self._plane_axis_indices(plane, wcs)
         if indices is None:
             return None
         try:
+            if center_pix is not None:
+                naxis = max(int(getattr(wcs, "naxis", 0) or 0), max(indices) + 1)
+                pixel_vec = [0.0] * naxis
+                for axis_index in range(naxis):
+                    if axis_index == indices[0]:
+                        pixel_vec[axis_index] = float(center_pix[0])
+                    elif axis_index == indices[1]:
+                        pixel_vec[axis_index] = float(center_pix[1])
+                    else:
+                        value = self._shared_pixel_axis_value(axis_index)
+                        pixel_vec[axis_index] = 0.0 if value is None else float(value)
+                world_vec = wcs.wcs_pix2world([pixel_vec], 0)[0]
+                celestial = celestial_axis_indices(wcs)
+                frame = wcs_to_celestial_frame(wcs)
+                if celestial is not None and frame is not None:
+                    lon_index, lat_index = celestial
+                    sky_center = SkyCoord(
+                        float(world_vec[lon_index]) * u.deg,
+                        float(world_vec[lat_index]) * u.deg,
+                        frame=frame,
+                    )
+                    local_scales = {}
+                    for axis_index in indices:
+                        pixel_plus = list(pixel_vec)
+                        pixel_plus[axis_index] += 1.0
+                        world_plus = wcs.wcs_pix2world([pixel_plus], 0)[0]
+                        sky_plus = SkyCoord(
+                            float(world_plus[lon_index]) * u.deg,
+                            float(world_plus[lat_index]) * u.deg,
+                            frame=frame,
+                        )
+                        separation = float(sky_center.separation(sky_plus).deg)
+                        if math.isfinite(separation) and separation > 0:
+                            local_scales[axis_index] = separation
+                    if len(local_scales) == len(indices):
+                        return tuple(float(local_scales[idx]) for idx in indices)
             scales = proj_plane_pixel_scales(wcs)
             if scales is None or len(scales) <= max(indices):
                 return None
@@ -1210,7 +1294,7 @@ class RegionManager(QObject):
                         world_state["context_world"] = dict(shared_context)
                 except Exception:
                     world_state = {}
-            scales = self._pixel_scales_deg(plane_name, wcs)
+            scales = self._pixel_scales_deg(plane_name, wcs, center_pix=center)
             if scales is not None:
                 if isinstance(region, CircleRegion):
                     world_state["radius_deg"] = float(region.radius) * scales[0]
@@ -1299,7 +1383,6 @@ class RegionManager(QObject):
             world_state = entry.get("world") or {}
             world_context = world_state.get("context_world")
             axes = self._plane_axis_indices(plane, wcs)
-            scales = self._pixel_scales_deg(plane, wcs) if wcs is not None else None
             # Apply world geometry if available
             center_world = world_state.get("center")
             center_pix = None
@@ -1312,6 +1395,17 @@ class RegionManager(QObject):
                         state["center"] = (cx, cy)
                     if "width" in state and "height" in state:
                         state["xy"] = (cx - state["width"] / 2.0, cy - state["height"] / 2.0)
+            scale_center = center_pix
+            if scale_center is None:
+                scale_center = state.get("center")
+                if scale_center is None and "xy" in state and "width" in state and "height" in state:
+                    xy = state.get("xy")
+                    if xy is not None:
+                        scale_center = (
+                            float(xy[0]) + float(state["width"]) / 2.0,
+                            float(xy[1]) + float(state["height"]) / 2.0,
+                        )
+            scales = self._pixel_scales_deg(plane, wcs, center_pix=scale_center) if wcs is not None else None
             if scales is not None:
                 if "radius_deg" in world_state:
                     try:

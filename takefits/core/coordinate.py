@@ -517,6 +517,7 @@ class Format_pix_to_wcs:
                     yval,
                     frame=display_frame,
                     fallback_native_world=fallback_native_world,
+                    coord_wrap=self.coord_wrap,
                 )
                 display_x = transformed_x
                 display_y = transformed_y
@@ -685,6 +686,7 @@ class Format_pix_to_wcs:
                         zval,
                         frame=display_frame,
                         fallback_native_world=fallback_native_world,
+                        coord_wrap=self.coord_wrap,
                     )
                     ztype = display_axis or ztype
                 except Exception:

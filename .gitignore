@@ -26,5 +26,11 @@ env/
 # Ignore the config directory containing generated files (config.yaml, subplot_params.yaml, takefits.range, etc.)
 config/
 
-# --- Proprietary / Excluded Modules ---
-logic/scimes/
+# --- Local-only / Non-public in dist repo ---
+.github/workflows/baseline.yml
+cli/
+docs/dev/
+scripts/
+tests/
+test_marker_utils.py
+takefits/logic/scimes/

@@ -21,15 +21,20 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from takefits.core.region import CircleRegion, RectangleRegion, EllipseRegion, CubeRegion
+from takefits.core.region_viewer import (
+    resolve_plane_pixel_limits,
+    resolve_region_analysis_array,
+    viewer_display_slices,
+)
 from takefits.core.wcs_frames import (
     available_display_frames,
+    world_vector_for_plane_values,
     display_frame_label,
     frame_is_available,
     normalize_display_frame,
     plane_inputs_to_native,
     plane_values_for_display,
 )
-
 
 
 class RegionEditorDialog(QDialog):
@@ -355,16 +360,10 @@ class RegionEditorDialog(QDialog):
         return values
 
     def _configure_spin_ranges(self):
-        array = getattr(self.viewer.im, 'get_array', lambda: None)()
-        if array is None:
-            width_limit = 1_000.0
-            height_limit = 1_000.0
-        else:
-            height_limit, width_limit = array.shape[:2]
-
+        width_limit, height_limit = resolve_plane_pixel_limits(self.viewer)
         self._pixel_limit = max(width_limit, height_limit) * 2.0
-        for spin in (self.center_x_spin, self.center_y_spin):
-            spin.setRange(-self._pixel_limit, self._pixel_limit)
+        self.center_x_spin.setRange(-width_limit * 2.0, width_limit * 2.0)
+        self.center_y_spin.setRange(-height_limit * 2.0, height_limit * 2.0)
 
     def _set_combo_value(self, combo, value, formatter=None):
         combo.blockSignals(True)
@@ -591,22 +590,7 @@ class RegionEditorDialog(QDialog):
         return scale_map
 
     def _get_display_slices(self):
-        displaymap = getattr(self.viewer, 'displaymap', None)
-        if displaymap is not None:
-            slices = getattr(displaymap, 'slices', None)
-            if slices:
-                return slices
-
-        for attr in ('integ_slice', 'projection_slices', 'slice'):  # integration windows, channel maps, etc.
-            slices = getattr(self.viewer, attr, None)
-            if slices and not callable(slices):
-                return slices
-
-        format_pix = getattr(self.viewer, 'format_pix', None)
-        if format_pix is not None:
-            return getattr(format_pix, 'slices', None)
-
-        return None
+        return viewer_display_slices(self.viewer)
 
     def _build_pixel_vector(self, x_pix, y_pix, slices, wcs):
         axis_types = []
@@ -993,18 +977,10 @@ class RegionEditorDialog(QDialog):
 
     def _update_stats(self):
         """Calculates statistics for the currently selected region."""
-        array = None
-        if isinstance(self.region, CubeRegion):
-            # For CubeRegion, we need the full 3D data cube
-            data_cube = getattr(self.viewer, 'data', None)
-            if data_cube is not None:
-                if data_cube.ndim == 4:
-                    array = data_cube[0]
-                elif data_cube.ndim == 3:
-                    array = data_cube
-        else:
-            if hasattr(self.viewer, 'im'):
-                array = getattr(self.viewer.im, 'get_array', lambda: None)()
+        array = resolve_region_analysis_array(
+            self.viewer,
+            is_cube=isinstance(self.region, CubeRegion),
+        )
         
         if array is None:
             self.stats_label.setText("")
@@ -1062,6 +1038,11 @@ class RegionEditorDialog(QDialog):
             y_axis_idx_in_fits = slices.index('y')
             frame = self._current_world_frame()
             fallback_world = self._shared_world_vector()
+            coord_wrap = 180
+            try:
+                coord_wrap = getattr(converter, "config", {}).get("coord_wrap", 180)
+            except Exception:
+                coord_wrap = 180
             world_x_val, world_y_val, axis_x, axis_y = plane_values_for_display(
                 wcs,
                 getattr(self.viewer, "plane", "xy"),
@@ -1069,6 +1050,7 @@ class RegionEditorDialog(QDialog):
                 native_world[y_axis_idx_in_fits],
                 frame=frame,
                 fallback_native_world=fallback_world,
+                coord_wrap=coord_wrap,
             )
             world_x_str = converter.format_world_coordinate(world_x_val, axis_x)
             world_y_str = converter.format_world_coordinate(world_y_val, axis_y)
@@ -1116,15 +1098,6 @@ class RegionEditorDialog(QDialog):
         slices = self._get_display_slices()
         if not slices:
             return
-            
-        ref_pixel = wcs.wcs.crpix
-        try:
-            ref_world = wcs.wcs_pix2world([ref_pixel], 0)[0]
-        except Exception:
-            self._update_world_fields()
-            return
-            
-        target_world_values = list(ref_world)
 
         x_axis_idx_in_fits = slices.index('x')
         y_axis_idx_in_fits = slices.index('y')
@@ -1139,8 +1112,16 @@ class RegionEditorDialog(QDialog):
         if native_pair is None:
             self._update_world_fields()
             return
-        target_world_values[x_axis_idx_in_fits] = native_pair[0]
-        target_world_values[y_axis_idx_in_fits] = native_pair[1]
+        target_world_values = world_vector_for_plane_values(
+            wcs,
+            getattr(self.viewer, "plane", "xy"),
+            native_pair[0],
+            native_pair[1],
+            fallback_native_world=self._shared_world_vector(),
+        )
+        if target_world_values is None:
+            self._update_world_fields()
+            return
 
         try:
             pix_coords = converter.world_to_pix(*target_world_values)
@@ -1290,14 +1271,8 @@ class RegionEditorDialog(QDialog):
             """Append a single formatted line with aligned label."""
             lines.append(f"{label:<{LABEL_W}}: {value}")
 
-        array, is_3d = (None, isinstance(self.region, CubeRegion))
-        if is_3d:
-            data_cube = getattr(self.viewer, 'data', None)
-            if data_cube is not None and data_cube.ndim >= 3:
-                array = data_cube[0] if data_cube.ndim == 4 else data_cube
-        else:
-            if hasattr(self.viewer, 'im'):
-                array = getattr(self.viewer.im, 'get_array', lambda: None)()
+        is_3d = isinstance(self.region, CubeRegion)
+        array = resolve_region_analysis_array(self.viewer, is_cube=is_3d)
 
         if array is None:
             err_dialog = MomentResultsDialog("Error", "Analysis data not found.", self.viewer)

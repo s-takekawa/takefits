@@ -42,6 +42,7 @@ class ColorSettingsPanel(QWidget):
         self.fits_viewer = fits_viewer
         self.subwindows = subwindows
         self.mode = mode
+        self._histogram_artist = None
         self._shared_history_record_pending = False
         self._shared_history_record_reason = ""
         self._suppress_shared_history_recording = True
@@ -836,14 +837,130 @@ class ColorSettingsPanel(QWidget):
         for viewer in self._iter_changed_viewers_for_color_update():
             self._redraw_viewer_overlay_after_color_change(viewer)
 
-    def update_histogram(self):
+    def _histogram_cache_owner(self):
+        owner = getattr(self, "fits_viewer", None)
+        return owner if owner is not None else self
+
+    def _histogram_cache_key(self):
+        raw_data = getattr(self, "data", None)
+        array = np.asanyarray(raw_data)
+        shape = tuple(int(axis) for axis in getattr(array, "shape", ()) or ())
+        dtype = str(getattr(getattr(array, "dtype", None), "str", getattr(array, "dtype", "")) or "")
+        nbytes = self._data_nbytes
+        try:
+            nbytes = int(nbytes) if nbytes is not None else None
+        except Exception:
+            nbytes = None
+        return (
+            str(getattr(self.mode, "value", self.mode)),
+            id(raw_data),
+            shape,
+            dtype,
+            int(getattr(array, "size", 0) or 0),
+            nbytes,
+        )
+
+    def _get_cached_histogram(self):
+        owner = self._histogram_cache_owner()
+        cache = getattr(owner, "_color_panel_histogram_cache", None)
+        if not isinstance(cache, dict):
+            return None
+        if cache.get("key") != self._histogram_cache_key():
+            return None
+        histogram = cache.get("histogram")
+        return histogram if isinstance(histogram, dict) else None
+
+    def _set_cached_histogram(self, histogram):
+        owner = self._histogram_cache_owner()
+        try:
+            setattr(
+                owner,
+                "_color_panel_histogram_cache",
+                {
+                    "key": self._histogram_cache_key(),
+                    "histogram": dict(histogram or {}),
+                },
+            )
+        except Exception:
+            pass
+
+    def _compute_histogram_cache(self):
         data = np.asanyarray(self.data).ravel()
         if self._data_nbytes is not None and self._data_nbytes > MEMMAP_THRESHOLD_BYTES:
             stride = max(1, int(np.ceil(data.size / 1_000_000)))
             data = data[::stride]
         with np.errstate(invalid='ignore'):
             data = data[np.isfinite(data)]
-        self.ax.hist(data, bins=100, log=True, color=self.hist_color)
+        if data.size == 0:
+            counts = np.zeros(100, dtype=float)
+            bin_edges = np.linspace(0.0, 1.0, 101)
+        else:
+            counts, bin_edges = np.histogram(data, bins=100)
+            counts = counts.astype(float, copy=False)
+        return {
+            "counts": counts,
+            "bin_edges": bin_edges,
+        }
+
+    def _remove_histogram_artist(self):
+        artist = getattr(self, "_histogram_artist", None)
+        if artist is None:
+            return
+        try:
+            if hasattr(artist, "remove"):
+                artist.remove()
+            elif hasattr(artist, "patches"):
+                for patch in list(getattr(artist, "patches", []) or []):
+                    try:
+                        patch.remove()
+                    except Exception:
+                        pass
+            elif isinstance(artist, (list, tuple)):
+                for item in artist:
+                    try:
+                        item.remove()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._histogram_artist = None
+
+    def update_histogram(self):
+        histogram = self._get_cached_histogram()
+        if histogram is None:
+            histogram = self._compute_histogram_cache()
+            self._set_cached_histogram(histogram)
+
+        self._remove_histogram_artist()
+        counts = np.asarray(histogram.get("counts", []), dtype=float)
+        bin_edges = np.asarray(histogram.get("bin_edges", []), dtype=float)
+        positive_counts = counts[counts > 0]
+
+        if counts.size and bin_edges.size == counts.size + 1 and positive_counts.size:
+            mask = counts > 0
+            left_edges = bin_edges[:-1][mask]
+            widths = np.diff(bin_edges)[mask]
+            heights = counts[mask]
+            self._histogram_artist = self.ax.bar(
+                left_edges,
+                heights,
+                width=widths,
+                align='edge',
+                color=self.hist_color,
+                edgecolor=self.hist_color,
+                linewidth=0.0,
+                alpha=1.0,
+                zorder=1,
+            )
+            self.ax.set_xlim(float(bin_edges[0]), float(bin_edges[-1]))
+            self.ax.set_yscale('log')
+            self.ax.set_ylim(bottom=1.0)
+        else:
+            self.ax.set_yscale('linear')
+            if bin_edges.size >= 2:
+                self.ax.set_xlim(float(bin_edges[0]), float(bin_edges[-1]))
+            self.ax.set_ylim(0.0, 1.0)
+
         self.fig.tight_layout()
         self.fig.subplots_adjust(bottom=0.2) 
         self.canvas.draw_idle()

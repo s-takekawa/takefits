@@ -586,7 +586,7 @@ class ChannelMapWindow(QMainWindow):
                 ax.format_coord = (lambda x, y, _ax=ax, _plane_id=plane_id: self._formatter_for_axes(_ax, x, y, plane_id=_plane_id))
                 self.axes.append(ax)
         if self.dir_num == 1:
-            self.axes = np.array(self.axes).reshape(self.tiles_x, self.tiles_y).T.flatten()
+            self.axes = list(np.array(self.axes, dtype=object).reshape(self.tiles_x, self.tiles_y).T.flat)
         self.ax = self.axes[0] if len(self.axes) > 0 else None
 
         if self._marker_formats:
@@ -3773,7 +3773,7 @@ class ChannelMapSettingPanel(QDialog):
             return False
 
         images = list(result.images)
-        labels = list(result.labels)
+        labels = list(getattr(result, "display_labels", result.labels))
         reverse = bool(params.get("reverse", False))
         if reverse:
             images = images[::-1]
@@ -3919,7 +3919,7 @@ class ChannelMapSettingPanel(QDialog):
              return
 
         images = list(result.images)
-        labels = result.labels # list of (start, center, end) floats (0-based pixels)
+        labels = getattr(result, "display_labels", result.labels) # list of (start, center, end) floats (0-based pixels)
         labels = list(labels)
 
         if reverse:

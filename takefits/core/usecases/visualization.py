@@ -241,7 +241,7 @@ def export_channel_map_image(
     )
     
     images = result.images
-    raw_labels = result.labels
+    raw_labels = list(getattr(result, "display_labels", result.labels))
     
     # Convert labels to world coordinates if WCS exists
     # If using world coords, we want format like "-150.0"

@@ -1216,6 +1216,38 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         except Exception:
             return True
 
+    def _sync_overlay_axes_to_main(self):
+        ax = getattr(self, "ax", None)
+        overlay_ax = getattr(self, "overlay_ax", None)
+        if ax is None or overlay_ax is None:
+            return False
+
+        try:
+            overlay_ax.set_position(ax.get_position())
+        except Exception:
+            pass
+
+        synced = False
+        try:
+            ax_xlim = tuple(float(v) for v in ax.get_xlim())
+            overlay_xlim = tuple(float(v) for v in overlay_ax.get_xlim())
+            if overlay_xlim != ax_xlim:
+                overlay_ax.set_xlim(*ax_xlim)
+                synced = True
+        except Exception:
+            pass
+
+        try:
+            ax_ylim = tuple(float(v) for v in ax.get_ylim())
+            overlay_ylim = tuple(float(v) for v in overlay_ax.get_ylim())
+            if overlay_ylim != ax_ylim:
+                overlay_ax.set_ylim(*ax_ylim)
+                synced = True
+        except Exception:
+            pass
+
+        return synced
+
     def update_overlay_position(self, event):
         canvas = getattr(event, 'canvas', None)
         if canvas is not None and canvas is not self.canvas:
@@ -1226,7 +1258,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             return
         self._updating_overlay = True
         try:
-            self.overlay_ax.set_position(self.ax.get_position())
+            self._sync_overlay_axes_to_main()
             self._position_click_label()
             self._colorbar_layout_from_draw_event = True
             try:
@@ -3857,6 +3889,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         if xy_state is None or xy_state.canvas is None or xy_state.overlay_ax is None:
             self._perf_end(perf_token)
             return
+        self._sync_overlay_axes_to_main()
         updates_enabled = None
         if xy_state._background is None:
             if hasattr(xy_state.canvas, "updatesEnabled") and hasattr(xy_state.canvas, "setUpdatesEnabled"):

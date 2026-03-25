@@ -357,16 +357,18 @@ def plane_values_for_display(
     *,
     frame: Optional[str],
     fallback_native_world: Optional[Sequence[object]] = None,
+    coord_wrap: object = 180,
 ) -> Tuple[float, float, str, str]:
+    world_native = world_vector_for_plane_values(
+        wcs,
+        plane,
+        x_native,
+        y_native,
+        fallback_native_world=fallback_native_world,
+    )
     indices = plane_axis_indices(plane, wcs)
-    if indices is None:
+    if indices is None or world_native is None:
         return (float(x_native), float(y_native), "", "")
-
-    world_native = build_native_world_vector(wcs, fallback_native_world)
-    if len(world_native) <= max(indices):
-        return (float(x_native), float(y_native), "", "")
-    world_native[indices[0]] = float(x_native)
-    world_native[indices[1]] = float(y_native)
     world_display, transformed = transform_world_vector_between_frames_with_status(
         world_native,
         wcs,
@@ -389,12 +391,33 @@ def plane_values_for_display(
         axis_type_x_display = axis_type_x_native
         axis_type_y_display = axis_type_y_native
 
-    return (
-        float(world_display[indices[0]]),
-        float(world_display[indices[1]]),
-        axis_type_x_display,
-        axis_type_y_display,
-    )
+    x_value = float(world_display[indices[0]])
+    y_value = float(world_display[indices[1]])
+    if axis_is_longitude(axis_type_x_display):
+        x_value = _wrap_display_longitude_value(x_value, axis_type_x_display, coord_wrap)
+    if axis_is_longitude(axis_type_y_display):
+        y_value = _wrap_display_longitude_value(y_value, axis_type_y_display, coord_wrap)
+    return (x_value, y_value, axis_type_x_display, axis_type_y_display)
+
+
+def world_vector_for_plane_values(
+    wcs,
+    plane: str,
+    x_native: float,
+    y_native: float,
+    *,
+    fallback_native_world: Optional[Sequence[object]] = None,
+) -> Optional[List[float]]:
+    indices = plane_axis_indices(plane, wcs)
+    if indices is None:
+        return None
+
+    world_native = build_native_world_vector(wcs, fallback_native_world)
+    if len(world_native) <= max(indices):
+        return None
+    world_native[indices[0]] = float(x_native)
+    world_native[indices[1]] = float(y_native)
+    return world_native
 
 
 def plane_inputs_to_native(
@@ -456,6 +479,7 @@ def axis_value_for_display(
     *,
     frame: Optional[str],
     fallback_native_world: Optional[Sequence[object]] = None,
+    coord_wrap: object = 180,
 ) -> Tuple[float, str]:
     world_native = build_native_world_vector(wcs, fallback_native_world)
     if axis_index < 0 or axis_index >= len(world_native):
@@ -476,4 +500,29 @@ def axis_value_for_display(
         axis_type_display = display_axis_type(axis_type_native, frame)
     else:
         axis_type_display = axis_type_native
-    return (float(world_display[axis_index]), axis_type_display)
+    value = float(world_display[axis_index])
+    if axis_is_longitude(axis_type_display):
+        value = _wrap_display_longitude_value(value, axis_type_display, coord_wrap)
+    return (value, axis_type_display)
+
+
+def _wrap_display_longitude_value(value: float, axis_type: Optional[str], coord_wrap: object = 180) -> float:
+    axis_upper = str(axis_type or "").upper()
+    wrapped = float(value)
+    if axis_upper.startswith("RA"):
+        return wrapped % 360.0
+    if not axis_is_longitude(axis_type):
+        return wrapped
+    try:
+        wrap_mode = int(coord_wrap)
+    except Exception:
+        wrap_mode = 180
+    if wrap_mode == 360:
+        wrapped %= 360.0
+        if wrapped < 0.0:
+            wrapped += 360.0
+        return wrapped
+    wrapped = ((wrapped + 180.0) % 360.0) - 180.0
+    if wrapped == -180.0 and float(value) > 0.0:
+        return 180.0
+    return wrapped

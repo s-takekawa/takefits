@@ -7,7 +7,7 @@ name = "takefits"
 dynamic = ["version"]
 description = "GUI-based astronomical FITS viewer and analysis tool"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Shunya Takekawa" }]
@@ -22,15 +22,15 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Visualization",
 ]
 dependencies = [
-  "PySide6==6.10.2",
-  "numpy==2.1.3",
-  "scipy==1.14.1",
-  "matplotlib==3.8.4",
-  "astropy==6.1.0",
-  "reproject==0.17.0",
-  "PyYAML==6.0.2",
-  "astrodendro==0.3.1",
-  "scikit-image==0.26.0",
+  "PySide6>=6.9.3",
+  "numpy>=2.1.3",
+  "scipy>=1.14.1",
+  "matplotlib>=3.8.4",
+  "astropy>=6.1.0",
+  "reproject>=0.17.0",
+  "PyYAML>=6.0.2",
+  "astrodendro>=0.3.1",
+  "scikit-image>=0.26.0",
 ]
 
 [project.urls]
@@ -53,3 +53,4 @@ version = { attr = "takefits.core.version.APP_VERSION" }
 
 [tool.setuptools.packages.find]
 include = ["takefits*"]
+exclude = ["takefits.logic.scimes*"]
