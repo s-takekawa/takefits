@@ -99,6 +99,7 @@ class MainWindow(FITSViewer):
         self.data = data
         self.header = header
         self.wcs = wcs
+        self._browse_first_startup = bool(self.is_large_data_mode())
         
         self.plane = plane
         self.integ_result_windows = []
@@ -123,48 +124,60 @@ class MainWindow(FITSViewer):
         self.subwindows = []
         self.subwindow1 = None
         self.subwindow2 = None
-        startup_show_subwindow1 = bool(self.config_manager.config.get("startup_show_subwindow1", True))
-        startup_show_subwindow2 = bool(self.config_manager.config.get("startup_show_subwindow2", False))
+        startup_show_subwindow1 = bool(
+            self.config_manager.config.get("startup_show_subwindow1", True)
+        ) and not self._browse_first_startup
+        startup_show_subwindow2 = bool(
+            self.config_manager.config.get("startup_show_subwindow2", False)
+        ) and not self._browse_first_startup
         if self.data.ndim > 2:
-            self.subwindow1 = SubWindow('xz', "SubWindow1: %s" % filename, self) 
-            self.subwindows.append(self.subwindow1)
-            self.subwindow1.setVisible(startup_show_subwindow1)
             SubWindow_control.update_subwindow(self.subwindow1, self.subwindow2)
             self.menu_bar.enable_plane_menu(True)
-            self.menu_bar.sub1_action.setChecked(startup_show_subwindow1)
+            self.menu_bar.sub1_action.setChecked(False)
             self.menu_bar.sub2_action.setChecked(False)
             if startup_show_subwindow1:
+                self.ensure_subwindow1()
+                self.subwindow1.setVisible(True)
+                self.menu_bar.sub1_action.setChecked(True)
                 self.subwindow1.raise_()
         else:
             self.menu_bar.enable_plane_menu(False)
         
         self.menu_bar.main_action.setChecked(True)
-
-        self.control_panel = ControlPanel(self, self.subwindows)
-        self.range_panel = RangeControlPanel(self, self.subwindows)
-        
-        self.range_panel.show()
-
-        # RangeControlPanel initialisation already seeds all range inputs.
-        # Keep a light sync only, avoiding extra full-range redraw work at startup.
-        self.range_panel._sync_inputs('xy')
-        if self.data.ndim > 2:
-            self.range_panel._sync_inputs('xz')
+        self.control_panel = None
+        self.range_panel = None
+        if self._browse_first_startup:
+            self.menu_bar.control_panel_action.setChecked(False)
+            self.menu_bar.range_panel_action.setChecked(False)
+            # Populate initial range values even in browse-first mode so the
+            # viewer range inputs are not blank.  Pass None so that
+            # update_ranges uses world_extent() which computes world
+            # coordinates from the full pixel extent.
+            self.update_ranges('xy', None, None)
+        else:
+            self.ensure_control_panel()
+            self.ensure_range_panel()
+            self.show_range_panel()
+            # RangeControlPanel initialisation already seeds all range inputs.
+            # Keep a light sync only, avoiding extra full-range redraw work at startup.
+            self.range_panel._sync_inputs('xy')
+            if self.data.ndim > 2:
+                self.range_panel._sync_inputs('xz')
         
         #Color Scale connect
-        self.color_button.clicked.connect(self.control_panel.open_color_settings)
-        self.smooth_button.clicked.connect(self.control_panel.open_smooth_settings)
+        self.color_button.clicked.connect(lambda: self._open_control_panel_tool("open_color_settings"))
+        self.smooth_button.clicked.connect(lambda: self._open_control_panel_tool("open_smooth_settings"))
         if self.data.ndim > 2:
             #Integ connect
-            self.integ_button.clicked.connect(self.control_panel.open_integ_settings)
-            self.spec_button.clicked.connect(self.control_panel.open_spec_window)
+            self.integ_button.clicked.connect(lambda: self._open_control_panel_tool("open_integ_settings"))
+            self.spec_button.clicked.connect(lambda: self._open_control_panel_tool("open_spec_window"))
         
         FITSViewer.main_window = self
 
         # Create ViewerCoordinator and register all viewers
         self.coordinator = ViewerCoordinator(self)
         self.coordinator.register_viewer('xy', self)
-        if self.data.ndim > 2:
+        if self.data.ndim > 2 and self.subwindow1 is not None:
             self.coordinator.register_viewer('xz', self.subwindow1)
             # Provide coordinator reference to subwindows
             self.subwindow1.coordinator = self.coordinator
@@ -199,7 +212,11 @@ class MainWindow(FITSViewer):
         # ActionSession: record/replay friendly (foundation for Undo/Redo + CLI parity)
         registry = ActionRegistry()
         register_default_actions(registry)
-        self.action_session = ActionSession(registry=registry, state=self.app_state)
+        self.action_session = ActionSession(
+            registry=registry,
+            state=self.app_state,
+            defer_initial_state_seed=self.is_large_data_mode(),
+        )
         self._suspend_action_recording = False
         self._last_regions_fingerprint = None
         self._last_markers_fingerprint = None
@@ -245,6 +262,50 @@ class MainWindow(FITSViewer):
                 pass
         self._seed_workspace_window_order()
 
+    def ensure_subwindow1(self):
+        """Create the XZ subwindow on first demand."""
+        if self.data.ndim <= 2:
+            return None
+        if getattr(self, "subwindow1", None) is not None:
+            return self.subwindow1
+
+        filename = getattr(self, "filename_path", getattr(self, "filename", ""))
+        self.subwindow1 = SubWindow('xz', "SubWindow1: %s" % filename, self)
+        if self.subwindow1 not in self.subwindows:
+            self.subwindows.append(self.subwindow1)
+        SubWindow_control.update_subwindow(self.subwindow1, self.subwindow2)
+
+        if getattr(self, "coordinator", None) is not None:
+            self.coordinator.register_viewer('xz', self.subwindow1)
+            self.subwindow1.coordinator = self.coordinator
+
+        self._connect_subwindow_controls(self.subwindow1)
+
+        x_limits = tuple(self.ax.get_xlim())
+        z_limits = tuple(getattr(self, "original_zlim", (0.0, 0.0)))
+        self.subwindow1.ax.set_xlim(*x_limits)
+        self.subwindow1.ax.set_ylim(*z_limits)
+        self.subwindow1.overlay_ax.set_position(self.subwindow1.ax.get_position())
+        self._sync_color_to_subwindow(self.subwindow1)
+        self.subwindow1.canvas.draw_idle()
+        self.update_ranges('xz', x_limits, z_limits)
+
+        self.subwindow1.original_xval = getattr(self, "original_xval", None)
+        self.subwindow1.original_yval = getattr(self, "original_yval", None)
+        self.subwindow1.original_zval = getattr(self, "original_zval", None)
+
+        toolbar = getattr(self.subwindow1, "toolbar", None)
+        sync_mode = getattr(toolbar, "sync_navigation_mode_from_linked", None)
+        if callable(sync_mode):
+            sync_mode()
+
+        if getattr(self, "range_panel", None) is not None:
+            self.range_panel.subwindows = self.subwindows
+            self.range_panel._sync_inputs('xz')
+        self._refresh_view_navigation_actions()
+
+        return self.subwindow1
+
     def ensure_subwindow2(self):
         """Create the ZY subwindow on first demand to reduce startup cost."""
         if self.data.ndim <= 2:
@@ -283,6 +344,7 @@ class MainWindow(FITSViewer):
         self.subwindow2.ax.set_xlim(*z_limits)
         self.subwindow2.ax.set_ylim(*y_limits)
         self.subwindow2.overlay_ax.set_position(self.subwindow2.ax.get_position())
+        self._sync_color_to_subwindow(self.subwindow2)
         self.subwindow2.canvas.draw_idle()
         self.update_ranges('zy', z_limits, y_limits)
 
@@ -332,13 +394,65 @@ class MainWindow(FITSViewer):
 
         return self.subwindow2
 
-    def _connect_subwindow_controls(self, subwindow):
-        if subwindow is None or getattr(self, "control_panel", None) is None:
+    def _sync_color_to_subwindow(self, subwindow):
+        """Propagate the current main viewer's colormap and clim to a new subwindow."""
+        main_im = getattr(self, "im", None)
+        sub_im = getattr(subwindow, "im", None)
+        if main_im is None or sub_im is None:
             return
-        subwindow.color_button.clicked.connect(self.control_panel.open_color_settings)
-        subwindow.integ_button.clicked.connect(self.control_panel.open_integ_settings)
-        subwindow.smooth_button.clicked.connect(self.control_panel.open_smooth_settings)
-        subwindow.spec_button.clicked.connect(self.control_panel.open_spec_window)
+        try:
+            sub_im.set_cmap(main_im.get_cmap())
+            sub_im.set_norm(main_im.norm)
+            sub_im.set_clim(*main_im.get_clim())
+        except Exception:
+            pass
+        # Keep displaymap.colorscale in sync so future redraws use the right cmap.
+        main_cs = getattr(getattr(self, "displaymap", None), "colorscale", None)
+        if main_cs and getattr(subwindow, "displaymap", None) is not None:
+            subwindow.displaymap.colorscale = main_cs
+
+    def _connect_subwindow_controls(self, subwindow):
+        if subwindow is None:
+            return
+        if bool(getattr(subwindow, "_control_tool_buttons_connected", False)):
+            return
+        subwindow.color_button.clicked.connect(lambda: self._open_control_panel_tool("open_color_settings"))
+        subwindow.integ_button.clicked.connect(lambda: self._open_control_panel_tool("open_integ_settings"))
+        subwindow.smooth_button.clicked.connect(lambda: self._open_control_panel_tool("open_smooth_settings"))
+        subwindow.spec_button.clicked.connect(lambda: self._open_control_panel_tool("open_spec_window"))
+        subwindow._control_tool_buttons_connected = True
+
+    def _set_panel_toggle_checked(self, action_attr: str, visible: bool):
+        menu_bar = getattr(self, "menu_bar", None)
+        if menu_bar is None:
+            return
+        action = getattr(menu_bar, str(action_attr), None)
+        if action is None:
+            return
+        blocker = QSignalBlocker(action)
+        action.setChecked(bool(visible))
+
+    def ensure_control_panel(self, *, visible: bool = True):
+        """Create the tools panel on first demand."""
+        if getattr(self, "control_panel", None) is None:
+            self.control_panel = ControlPanel(self, self.subwindows, visible=visible)
+            for subwindow in self.subwindows:
+                self._connect_subwindow_controls(subwindow)
+        return self.control_panel
+
+    def ensure_range_panel(self):
+        """Create the range panel on first demand."""
+        if getattr(self, "range_panel", None) is None:
+            self.range_panel = RangeControlPanel(self, self.subwindows)
+            self.range_panel.hide()
+        return self.range_panel
+
+    def _open_control_panel_tool(self, method_name: str):
+        panel = self.ensure_control_panel(visible=False)
+        opener = getattr(panel, str(method_name), None)
+        if callable(opener):
+            return opener()
+        return None
 
     # ------------------------------------------------------------------
     # Regions/Markers -> AppState action bridge (record/replay friendly)
@@ -5464,9 +5578,12 @@ class MainWindow(FITSViewer):
 
         sub_state = panel_state.get("subwindows")
         if isinstance(sub_state, dict) and self.data.ndim > 2:
-            if "xz" in sub_state and getattr(self, "subwindow1", None) is not None:
+            if "xz" in sub_state:
                 xz_visible = bool(sub_state.get("xz"))
-                self.subwindow1.setVisible(xz_visible)
+                if xz_visible and getattr(self, "subwindow1", None) is None:
+                    self.ensure_subwindow1()
+                if getattr(self, "subwindow1", None) is not None:
+                    self.subwindow1.setVisible(xz_visible)
                 if hasattr(self, "menu_bar") and hasattr(self.menu_bar, "sub1_action"):
                     self.menu_bar.sub1_action.setChecked(xz_visible)
             if "zy" in sub_state:
@@ -6605,18 +6722,28 @@ class MainWindow(FITSViewer):
         self.hide()  # Hide the main window
 
     def show_control_panel(self):
-        if not self.control_panel.isVisible():
-            self.control_panel.show()
+        panel = self.ensure_control_panel()
+        if not panel.isVisible():
+            panel.show()
+        self._set_panel_toggle_checked("control_panel_action", True)
     
     def show_range_panel(self):
-        if not self.range_panel.isVisible():
-            self.range_panel.show()
+        panel = self.ensure_range_panel()
+        if not panel.isVisible():
+            panel.show()
+        self._set_panel_toggle_checked("range_panel_action", True)
 
     def hide_control_panel(self):
-        self.control_panel.hide()
+        panel = getattr(self, "control_panel", None)
+        if panel is not None:
+            panel.hide()
+        self._set_panel_toggle_checked("control_panel_action", False)
     
     def hide_range_panel(self):
-        self.range_panel.hide()
+        panel = getattr(self, "range_panel", None)
+        if panel is not None:
+            panel.hide()
+        self._set_panel_toggle_checked("range_panel_action", False)
 
     def on_control_panel_closed(self):
         # When control panel is closed, uncheck the menu action

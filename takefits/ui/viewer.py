@@ -50,6 +50,8 @@ from takefits.logic.data_tools import (
     DEFAULT_LARGE_DATA_DISPLAY_MAX_DIM,
     build_large_data_profile,
     downsample_2d_for_display,
+    is_lazy_scaled,
+    sanitize_slice,
 )
 
 class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
@@ -189,7 +191,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         
         
 
-        self.original_data = np.array(data, copy=False)
+        self.original_data = data if is_lazy_scaled(data) else np.array(data, copy=False)
         self.integ_result_windows = []
         self.channel_map_windows = []
         self._blank_planes = {}
@@ -1348,6 +1350,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self._colorbar_layout_from_draw_event = False
         self._colorbar_sync_redraw_in_progress = False
         self._colorbar_auto_anchor_sig = None
+        self._startup_colorbar_deferred = bool(self.is_large_data_mode())
         # Initialize per-plane ViewerState
         self.state = ViewerState(plane)
         self.state.set_viewer(self)
@@ -1359,6 +1362,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.config_manager.config,
             viewer_state=self.state,
             large_data_mode=self.is_large_data_mode(),
+            defer_colorbar=self._startup_colorbar_deferred,
         )
         self.im, self.ax = self.displaymap.display(self.fig, plane)
         self.ax.format_coord = self.formatter
@@ -1599,6 +1603,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         
         self._position_click_label()
 
+        if self._startup_colorbar_deferred:
+            QTimer.singleShot(0, self._realize_deferred_startup_colorbar)
+
         # Capture baseline pixel limits for later full-range resets.
         self.original_xlim = self.ax.get_xlim()
         self.original_ylim = self.ax.get_ylim()
@@ -1645,6 +1652,21 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self.state.update_lines(self.hline, self.vline, self.cpoint)
         self.state.update_background(self._background)
         self._background_initialized = False
+
+    def _realize_deferred_startup_colorbar(self):
+        if not bool(getattr(self, "_startup_colorbar_deferred", False)):
+            return
+        state = getattr(self, "state", None)
+        if state is None or getattr(state, "im", None) is None:
+            return
+        if getattr(state, "colorbar", None) is not None:
+            self._startup_colorbar_deferred = False
+            return
+        self._rebuild_colorbars()
+        if self._is_colorbar_auto_layout_enabled():
+            self._schedule_colorbar_auto_layout_if_anchor_changed(force=True)
+        self.canvas.draw_idle()
+        self._startup_colorbar_deferred = False
         
     def _large_data_profile(self) -> Dict[str, object]:
         metadata = self.spectral_metadata if isinstance(self.spectral_metadata, dict) else {}
@@ -1712,6 +1734,109 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             pass
         return True
 
+    # ------------------------------------------------------------------
+    # Strided display slice — avoids full-resolution I/O for xz/zy
+    # ------------------------------------------------------------------
+
+    def _set_plane_image_for_index(self, plane: str, index: int) -> bool:
+        """Set plane image using strided reads from cube in large data mode.
+
+        In large data mode the slice is read with strides matching the
+        display downsample factor so that non-contiguous planes (xz, zy)
+        skip most of the disk I/O that a full-resolution read would incur.
+        """
+        im = self._get_plane_im(plane)
+        if im is None:
+            return False
+
+        cube = getattr(self, 'cube', None)
+        if cube is None:
+            return False
+
+        if not self.is_large_data_mode():
+            raw = self._plane_slice_for_index(plane, index)
+            im.set_data(raw)
+            return True
+
+        display_data, full_h, full_w = self._fetch_strided_display_slice(plane, index)
+        im.set_data(display_data)
+        try:
+            im.set_extent((-0.5, full_w - 0.5, -0.5, full_h - 0.5))
+            im.set_interpolation("nearest")
+        except Exception:
+            pass
+        return True
+
+    def _fetch_strided_display_slice(self, plane: str, index: int):
+        """Fetch a display-ready slice with strided reads in large data mode.
+
+        Returns ``(display_data, full_height, full_width)`` where
+        *full_height/full_width* are the unstrided plane dimensions (used
+        for ``set_extent``).
+        """
+        cube = self.cube
+
+        # Full (unstrided) plane dimensions — needed for extent.
+        if plane == 'xy':
+            full_h, full_w = cube.shape[1], cube.shape[2]
+        elif plane == 'xz':
+            full_h, full_w = cube.shape[0], cube.shape[2]
+        elif plane == 'zy':
+            full_h, full_w = cube.shape[1], cube.shape[0]
+        else:
+            raise KeyError(plane)
+
+        # Check cache.
+        cache_key = self._large_data_cache_key(plane, index, (full_h, full_w))
+        if cache_key is not None and cache_key in self._large_data_slice_cache:
+            cached = self._large_data_slice_cache.pop(cache_key)
+            self._large_data_slice_cache[cache_key] = cached
+            return cached, full_h, full_w
+
+        # Compute strides so each display axis fits within max_dimension.
+        max_dim = self._large_data_display_max_dimension()
+        step_h = max(1, math.ceil(full_h / max_dim))
+        step_w = max(1, math.ceil(full_w / max_dim))
+
+        # For xz/zy planes, also limit total slice pixels to cap I/O.
+        # Non-contiguous slices cause scattered page faults across the
+        # entire memmapped file; bounding the pixel count keeps scrolling
+        # responsive even when individual axes are smaller than max_dim.
+        if plane in ('xz', 'zy'):
+            max_slice_px = max_dim * max_dim // 4
+            total_px = full_h * full_w
+            if total_px > max_slice_px:
+                io_step = max(1, math.ceil(math.sqrt(total_px / max_slice_px)))
+                step_h = max(step_h, io_step)
+                step_w = max(step_w, io_step)
+
+        if step_h > 1 or step_w > 1:
+            # Strided slice directly from the cube — dramatically reduces
+            # I/O for non-contiguous planes (xz, zy).
+            if plane == 'xy':
+                raw = cube[index, ::step_h, ::step_w]
+            elif plane == 'xz':
+                raw = cube[::step_h, index, ::step_w]
+            elif plane == 'zy':
+                raw = cube[::step_w, ::step_h, index].T
+            # Per-slice sanitisation.
+            metadata = self.spectral_metadata if isinstance(self.spectral_metadata, dict) else {}
+            if metadata.get("_needs_per_slice_sanitize"):
+                raw = sanitize_slice(raw)
+            display_data = raw if isinstance(raw, np.ndarray) else np.asarray(raw)
+        else:
+            # No downsampling needed — full slice.
+            raw = self._plane_slice_for_index(plane, index)
+            display_data = raw if isinstance(raw, np.ndarray) else np.asarray(raw)
+
+        # Cache.
+        if cache_key is not None:
+            self._large_data_slice_cache[cache_key] = display_data
+            while len(self._large_data_slice_cache) > self._large_data_slice_cache_limit:
+                self._large_data_slice_cache.popitem(last=False)
+
+        return display_data, full_h, full_w
+
     def _plane_length_for_index(self, plane: str) -> int:
         cube = getattr(self, "cube", None)
         if cube is None:
@@ -1730,13 +1855,22 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
     def _plane_slice_for_index(self, plane: str, index: int):
         if plane == "xy":
             if getattr(self.data, "ndim", 0) == 2:
-                return self.data
-            return self.cube[index]
-        if plane == "xz":
-            return self.cube[:, index, :]
-        if plane == "zy":
-            return self.cube[:, :, index].T
-        raise KeyError(plane)
+                raw = self.data
+                if is_lazy_scaled(raw):
+                    raw = raw[:]
+            else:
+                raw = self.cube[index]
+        elif plane == "xz":
+            raw = self.cube[:, index, :]
+        elif plane == "zy":
+            raw = self.cube[:, :, index].T
+        else:
+            raise KeyError(plane)
+        # Per-slice sanitisation for data that skipped the full-array scan.
+        metadata = self.spectral_metadata if isinstance(self.spectral_metadata, dict) else {}
+        if metadata.get("_needs_per_slice_sanitize"):
+            raw = sanitize_slice(raw)
+        return raw
 
     def _schedule_large_data_prefetch(self, plane: str, cache_index: Optional[int]) -> None:
         if not self.is_large_data_mode() or cache_index is None:
@@ -1761,13 +1895,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             if neighbor < 0 or neighbor >= plane_length:
                 continue
             try:
-                neighbor_slice = self._plane_slice_for_index(plane, neighbor)
+                self._fetch_strided_display_slice(plane, neighbor)
             except Exception:
                 continue
-            cache_key = self._large_data_cache_key(plane, neighbor, getattr(neighbor_slice, "shape", None))
-            if cache_key is not None and cache_key in self._large_data_slice_cache:
-                continue
-            self._get_large_data_display_slice(plane, neighbor_slice, cache_index=neighbor)
 
     def _large_data_notice_text(self, profile: Dict[str, object]) -> str:
         estimated_size = str(profile.get("estimated_size_text") or "unknown size")
@@ -1786,7 +1916,16 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         metadata["_large_data_notice_reported"] = True
         self.spectral_metadata = metadata
 
-        print(f"\033[1;33m\033[1mWarning: {self._large_data_notice_text(profile)}\033[0m")
+        max_dim = self._large_data_display_max_dimension()
+        notice = self._large_data_notice_text(profile)
+        lines = [
+            f"\033[1;33m\033[1mWarning: {notice}\033[0m",
+            f"\033[1;33m Display is downsampled to {max_dim}px per axis."
+            f" Zooming in will show coarse pixels.\033[0m",
+            "\033[1;33m Recommend: Tools > Cutout for full-resolution display"
+            " and faster analysis.\033[0m",
+        ]
+        print("\n".join(lines))
 
     
     def reload_viewer(self):
@@ -2765,7 +2904,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 x = y = None
             self._pending_drag_coords = None
             if x is not None and y is not None:
-                self.update_clicked_pix(x, y, update_slices=True)
+                self.update_clicked_pix(x, y, update_slices=True, force_slice_refresh=True)
                 # Restore the intensity line that update_clicked_pix overwrites.
                 try:
                     xstr, ystr = self.format_pix.convert(self.plane, x, y)
@@ -3061,7 +3200,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         if 0 <= j < self.cube.shape[1]:
                             if xz_requires_refresh:
                                 if xz_im:
-                                    self._set_plane_image_data('xz', self.cube[:, j, :], cache_index=j)
+                                    self._set_plane_image_for_index('xz', j)
                                 if self._get_clicked('xy') and xz_slider:
                                     self._sync_channel_controls(subwindow1, j)
                                 self._set_shared_ypix(j)
@@ -3112,7 +3251,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         if 0 <= i < self.cube.shape[2]:
                             if zy_requires_refresh:
                                 if zy_im:
-                                    self._set_plane_image_data('zy', self.cube[:, :, i].T, cache_index=i)
+                                    self._set_plane_image_for_index('zy', i)
                                 if self._get_clicked('xy') and zy_slider:
                                     self._sync_channel_controls(subwindow2, i)
                                 self._set_shared_xpix(i)
@@ -3210,22 +3349,24 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 # Update XY plane (main window) with new Z slice
                 xy_im = self._get_plane_im('xy')
                 xy_slider = self._get_plane_slider('xy')
+                xy_needs_refresh = z_changed or force_slice_refresh
 
                 if update_slices:
                     if 0 <= j < self.cube.shape[0]:
-                        if z_changed:
+                        if xy_needs_refresh:
                             if xy_im:
-                                self._set_plane_image_data('xy', self.cube[j], cache_index=j)
+                                self._set_plane_image_for_index('xy', j)
                             if self._get_clicked('xz') and xy_slider:
                                 self._sync_channel_controls(FITSViewer.main_window, j)
                             self._set_shared_zpix(j)
                     else:
-                        if z_changed and xy_im:
+                        if xy_needs_refresh and xy_im:
                             self._set_plane_image_data('xy', self._blank_plane('xy'))
 
                 # Update ZY plane (subwindow2) with new X slice
                 if sub2_visible:
                     zy_refreshed = False
+                    zy_needs_refresh = x_changed or force_slice_refresh
                     zy_im = self._get_plane_im('zy')
                     zy_slider = self._get_plane_slider('zy')
                     zy_canvas = self._get_plane_canvas('zy')
@@ -3233,23 +3374,23 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
                     if update_slices:
                         if 0 <= i < self.cube.shape[2]:
-                            if x_changed:
+                            if zy_needs_refresh:
                                 if zy_im:
-                                    self._set_plane_image_data('zy', self.cube[:, :, i].T, cache_index=i)
+                                    self._set_plane_image_for_index('zy', i)
                             if self._get_clicked('xz') and zy_slider:
                                 self._sync_channel_controls(subwindow2, i)
                             self._set_shared_xpix(i)
                         else:
-                            if x_changed and zy_im:
+                            if zy_needs_refresh and zy_im:
                                 self._set_plane_image_data('zy', self._blank_plane('zy'))
-                        if update_slices and subwindow2 and (x_changed or self._get_plane_background('zy') is None):
+                        if update_slices and subwindow2 and (zy_needs_refresh or self._get_plane_background('zy') is None):
                             zy_refreshed = self._update_slice_image(subwindow2, fast_blit=fast_blit)
                     
                     zy_bg = self._refresh_overlay_background('zy') if (update_slices and not fast_blit and not zy_refreshed) else self._get_plane_background('zy')
                     # Blit zy plane overlay (crosshairs, label)
                     if zy_canvas and zy_overlay:
                         # Only restore background if we didn't just fast-blit the image
-                        if not (fast_blit and (x_changed or self._get_plane_background('zy') is None)):
+                        if not (fast_blit and (zy_needs_refresh or self._get_plane_background('zy') is None)):
                             if zy_bg:
                                 zy_canvas.restore_region(zy_bg)
                         zy_cpoint = self._get_plane_cpoint('zy')
@@ -3269,7 +3410,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 # Redraw main window overlay
                 main = FITSViewer.main_window
                 if main:
-                    if update_slices and z_changed:
+                    if update_slices and xy_needs_refresh:
                         main_updated = self._update_slice_image(main, fast_blit=fast_blit)
                         if not main_updated and not fast_blit and not main._contours_active():
                             main.refresh_display_after_contour_update(main._contour_layer_id)
@@ -3279,7 +3420,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         main.redraw_main_overlay_and_blit()
                     else:
                         main.redraw_main_overlay_and_blit()
-                    if not fast_blit and update_slices and z_changed:
+                    if not fast_blit and update_slices and xy_needs_refresh:
                         if hasattr(main, 'control_panel') and main.control_panel and main.control_panel.pvd_panel:
                             main.control_panel.pvd_panel.update_cursor(int(self._get_shared_zpix()))
 
@@ -3350,22 +3491,24 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 # Update XY plane (main window) with new Z slice
                 xy_im = self._get_plane_im('xy')
                 xy_slider = self._get_plane_slider('xy')
+                xy_needs_refresh = z_changed or force_slice_refresh
 
                 if update_slices:
                     if 0 <= i < self.cube.shape[0]:
-                        if z_changed:
+                        if xy_needs_refresh:
                             if xy_im:
-                                self._set_plane_image_data('xy', self.cube[i], cache_index=i)
+                                self._set_plane_image_for_index('xy', i)
                             if self._get_clicked('zy') and xy_slider:
                                 self._sync_channel_controls(FITSViewer.main_window, i)
                             self._set_shared_zpix(i)
                     else:
-                        if z_changed and xy_im:
+                        if xy_needs_refresh and xy_im:
                             self._set_plane_image_data('xy', self._blank_plane('xy'))
 
                 # Update XZ plane (subwindow1) with new Y slice
                 if sub1_visible:
                     xz_refreshed = False
+                    xz_needs_refresh = y_changed or force_slice_refresh
                     xz_im = self._get_plane_im('xz')
                     xz_slider = self._get_plane_slider('xz')
                     xz_canvas = self._get_plane_canvas('xz')
@@ -3373,22 +3516,22 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
                     if update_slices:
                         if 0 <= j < self.cube.shape[1]:
-                            if y_changed:
+                            if xz_needs_refresh:
                                 if xz_im:
-                                    self._set_plane_image_data('xz', self.cube[:, j, :], cache_index=j)
+                                    self._set_plane_image_for_index('xz', j)
                                 if self._get_clicked('zy') and xz_slider:
                                     self._sync_channel_controls(subwindow1, j)
                                 self._set_shared_ypix(j)
                         else:
-                            if y_changed and xz_im:
+                            if xz_needs_refresh and xz_im:
                                 self._set_plane_image_data('xz', self._blank_plane('xz'))
-                        if update_slices and subwindow1 and (y_changed or self._get_plane_background('xz') is None):
+                        if update_slices and subwindow1 and (xz_needs_refresh or self._get_plane_background('xz') is None):
                             xz_refreshed = self._update_slice_image(subwindow1, fast_blit=fast_blit)
                     # Blit xz plane (correct order: restore -> draw image -> draw overlays -> blit)
                     xz_bg = self._refresh_overlay_background('xz') if (update_slices and not fast_blit and not xz_refreshed) else self._get_plane_background('xz')
                     xz_ax = self._get_plane_ax('xz')
                     if xz_canvas and xz_overlay:
-                        skip_restore = fast_blit and (y_changed or self._get_plane_background('xz') is None)
+                        skip_restore = fast_blit and (xz_needs_refresh or self._get_plane_background('xz') is None)
                         if not skip_restore and xz_bg:
                             xz_canvas.restore_region(xz_bg)
 
@@ -3431,7 +3574,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 # Redraw main window overlay
                 main = FITSViewer.main_window
                 if main:
-                    if update_slices and z_changed:
+                    if update_slices and xy_needs_refresh:
                         main_updated = self._update_slice_image(main, fast_blit=fast_blit)
                         if not main_updated and not fast_blit and not main._contours_active():
                             main.refresh_display_after_contour_update(main._contour_layer_id)
@@ -3441,7 +3584,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         main.redraw_main_overlay_and_blit()
                     else:
                         main.redraw_main_overlay_and_blit()
-                    if not fast_blit and update_slices and z_changed:
+                    if not fast_blit and update_slices and xy_needs_refresh:
                         if hasattr(main, 'control_panel') and main.control_panel and main.control_panel.pvd_panel:
                             main.control_panel.pvd_panel.update_cursor(int(self._get_shared_zpix()))
 
@@ -3479,6 +3622,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             plabel_zy.setText(self._compose_click_label_text(coord_text, intensity_text))
             if not plabel_zy.isVisible():
                 plabel_zy.setVisible(True)
+
         self._perf_end(perf_token)
 
 
@@ -3514,17 +3658,14 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self._update_shared_world_xyz(self._get_shared_world_x(), self._get_shared_world_y(), z)
             self._update_shared_world_xyz_str(self._get_shared_world_x_str(), self._get_shared_world_y_str(), z_str)
             
-            if self.data.ndim == 3:
-                self._set_plane_image_data('xy', self.data[k], cache_index=k)
-            elif self.data.ndim == 4:
-                self._set_plane_image_data('xy', self.data[0, k], cache_index=k)
+            self._set_plane_image_for_index('xy', k)
             # Image changed -> invalidate overlay background so blit won't restore stale pixels.
             self._invalidate_plane_background('xy')
 
             # Draw image and label (blit is handled by refresh_display_after_contour_update)
             # Redundant draw calls removed.
 
-            if hasattr(self, 'control_panel') and self.control_panel.pvd_panel:
+            if getattr(self, 'control_panel', None) is not None and self.control_panel.pvd_panel:
                 if k >= 0:
                     self.control_panel.pvd_panel.update_cursor(k)
 
@@ -3544,7 +3685,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
             if not self._get_clicked('xy'):
                 xy_plabel = self._get_plane_plabel('xy')
-                if self.SubWindow.subwindow1.isHidden() == False:
+                if getattr(getattr(self, 'SubWindow', None), 'subwindow1', None) is not None and not self.SubWindow.subwindow1.isHidden():
                     if xy_plabel and xy_plabel.isVisible():
                         xz_canvas = self._get_plane_canvas('xz')
                         xz_overlay = self._get_plane_overlay_ax('xz')
@@ -3615,10 +3756,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self._update_shared_world_xyz(self._get_shared_world_x(), z, self._get_shared_world_z())
             self._update_shared_world_xyz_str(self._get_shared_world_x_str(), z_str, self._get_shared_world_z_str())
             
-            if self.data.ndim == 3:
-                self._set_plane_image_data('xz', self.data[:, k, :], cache_index=k)
-            elif self.data.ndim == 4:
-                self._set_plane_image_data('xz', self.data[0, :, k, :], cache_index=k)
+            self._set_plane_image_for_index('xz', k)
             # Image changed -> invalidate overlay background so blit won't restore stale pixels.
             self._invalidate_plane_background('xz')
 
@@ -3692,10 +3830,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self._update_shared_world_xyz(z, self._get_shared_world_y(), self._get_shared_world_z())
             self._update_shared_world_xyz_str(z_str, self._get_shared_world_y_str(), self._get_shared_world_z_str())
             
-            if self.data.ndim == 3:
-                self._set_plane_image_data('zy', self.data[:, :, k].T, cache_index=k)
-            elif self.data.ndim == 4:
-                self._set_plane_image_data('zy', self.data[0, :, :, k].T, cache_index=k)
+            self._set_plane_image_for_index('zy', k)
             # Image changed -> invalidate overlay background so blit won't restore stale pixels.
             self._invalidate_plane_background('zy')
 
@@ -3725,7 +3860,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
 
 
-                    if self.SubWindow.subwindow1.isHidden() == False:
+                    if getattr(getattr(self, 'SubWindow', None), 'subwindow1', None) is not None and not self.SubWindow.subwindow1.isHidden():
                         xz_canvas = self._get_plane_canvas('xz')
                         xz_overlay = self._get_plane_overlay_ax('xz')
                         xz_bg = self._get_plane_background('xz')
@@ -3752,7 +3887,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         if xz_canvas and xz_overlay:
                             xz_canvas.blit(xz_overlay.bbox)
 
-        if hasattr(self, 'control_panel') and self.control_panel.pvd_panel:
+        if getattr(self, 'control_panel', None) is not None and self.control_panel.pvd_panel:
             if k >= 0:
                 self.control_panel.pvd_panel.update_cursor(k)
         
@@ -3931,7 +4066,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
             if xy_state.chlabel:
                 xy_state.overlay_ax.draw_artist(xy_state.chlabel)
-            if hasattr(self, 'control_panel'):
+            if getattr(self, 'control_panel', None) is not None:
                 if self.control_panel.pvd_panel is not None and self.control_panel.pvd_panel.arrow_artist is not None:
                     xy_state.overlay_ax.draw_artist(self.control_panel.pvd_panel.arrow_artist)
                     for indicator in self.control_panel.pvd_panel.width_indicators:
@@ -4308,10 +4443,14 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         state untouched. XY limits are always computed in native WCS frame.
         """
         plane_viewer = self._get_plane_viewer(plane)
+        # Fall back to the main viewer when the dedicated plane viewer has not
+        # been created yet (e.g. browse-first mode).
         if plane_viewer is None:
-            return None
+            plane_viewer = self
 
         fmt = getattr(plane_viewer, 'format_pix', None)
+        if fmt is None:
+            fmt = getattr(self, 'format_pix', None)
         if fmt is None:
             return None
 
@@ -4342,11 +4481,15 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 saved_frame = None
                 frame_switched = False
 
+        # In browse-first mode we may reuse the main viewer's formatter for XZ/ZY
+        # conversions before those subwindows exist. The requested plane still
+        # defines the axis mapping in that case.
+        convert_plane = str(plane or getattr(plane_viewer, 'plane', None) or 'xy').lower()
         try:
-            primary_min, _ = fmt.convert(plane_viewer.plane, xlim[0], y_ref)
-            primary_max, _ = fmt.convert(plane_viewer.plane, xlim[1], y_ref)
-            _, secondary_min = fmt.convert(plane_viewer.plane, x_ref, ylim[0])
-            _, secondary_max = fmt.convert(plane_viewer.plane, x_ref, ylim[1])
+            primary_min, _ = fmt.convert(convert_plane, xlim[0], y_ref)
+            primary_max, _ = fmt.convert(convert_plane, xlim[1], y_ref)
+            _, secondary_min = fmt.convert(convert_plane, x_ref, ylim[0])
+            _, secondary_max = fmt.convert(convert_plane, x_ref, ylim[1])
             return (
                 str(primary_min),
                 str(primary_max),
@@ -4379,10 +4522,17 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
         plane_viewer = self._get_plane_viewer(plane)
         if plane_viewer is None:
-            return {}
+            # In browse-first mode the XZ/ZY windows may not exist yet.  Fall
+            # back to the main viewer so full-range buttons still compute world
+            # limits instead of regressing to raw pixel extents.
+            plane_viewer = self._get_main_viewer()
+        if plane_viewer is None:
+            plane_viewer = self
 
         # Determine full pixel ranges for each axis.
         data = getattr(plane_viewer, 'data', None)
+        if data is None:
+            data = getattr(self, 'data', None)
         if data is None:
             return {}
 
@@ -4455,7 +4605,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
         plane_viewer = self._get_plane_viewer(plane)
         if plane_viewer is None:
-            return {}
+            plane_viewer = self._get_main_viewer()
+        if plane_viewer is None:
+            plane_viewer = self
 
         axis_labels = {
             'xy': ('x', 'y'),

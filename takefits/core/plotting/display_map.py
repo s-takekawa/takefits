@@ -11,6 +11,8 @@ from takefits.logic.data_tools import (
     downsample_2d_for_display,
     estimate_array_nbytes,
     fast_nanminmax,
+    is_lazy_scaled,
+    sanitize_slice,
 )
 
 if TYPE_CHECKING:
@@ -27,6 +29,35 @@ def _coord_wrap_quantity(value, default):
     except Exception:
         return float(default) * u.deg
 
+
+def _normalized_header_unit_text(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.replace(" ", "")
+
+
+def _build_third_axis_label(header):
+    ctype3 = str(header.get("CTYPE3", "") or "").strip().upper()
+    specsys = str(header.get("SPECSYS", "") or "").strip().upper()
+    cunit3 = _normalized_header_unit_text(header.get("CUNIT3", ""))
+
+    if "FREQ" in ctype3:
+        base = "Frequency"
+    elif any(token in ctype3 for token in ("VRAD", "VELO", "VOPT")):
+        base = "Velocity"
+    elif ctype3:
+        base = ctype3.split("-")[0].replace("_", " ").title()
+    else:
+        base = "Velocity"
+
+    if base == "Velocity" and ("LSR" in ctype3 or "LSR" in specsys):
+        base = "LSR Velocity"
+
+    if cunit3:
+        return f"{base}  [{cunit3}]"
+    return base
+
 class DisplayMap:
     def __init__(
         self,
@@ -37,24 +68,9 @@ class DisplayMap:
         viewer_state: 'ViewerState' = None,
         *,
         large_data_mode: bool = False,
+        defer_colorbar: bool = False,
     ):
-        if 'CUNIT3' in header:
-            if 'm/s' in header['CUNIT3'] and 'km/s' not in header['CUNIT3']:
-                if abs(header['CDELT3']) >= 100:
-                    self.third_axis_label = 'Velocity  [km/s]'
-                else:
-                    self.third_axis_label = 'Velocity  [m/s]'
-            elif 'km/s' in header['CUNIT3']:
-                self.third_axis_label = 'Velocity  [km/s]'
-        else: self.third_axis_label = 'Velocity  [km/s]'
-        if 'CTYPE3' in header and 'FREQ' in header['CTYPE3']:
-            self.third_axis_label = 'Frequency'
-            if 'CUNIT3' in header:
-                cunit3 = header['CUNIT3']
-                self.third_axis_label = self.third_axis_label + f'  [{cunit3}]'
-
-        elif ('CTYPE3' in header and 'LSR' in header['CTYPE3']) or ('SPECSYS' in header and 'LSR' in header['SPECSYS']):
-            self.third_axis_label = 'LSR ' + 'Velocity  [km/s]'
+        self.third_axis_label = _build_third_axis_label(header)
 
         self.coords_dict = {'glon': 'Galactic Longitude',
                'glat': 'Galactic Latitude',
@@ -131,6 +147,7 @@ class DisplayMap:
         self.header = header
         self.viewer_state = viewer_state
         self.large_data_mode = bool(large_data_mode)
+        self.defer_colorbar = bool(defer_colorbar)
         self.large_data_display_max_dim = int(
             config.get('large_data_display_max_dim', DEFAULT_LARGE_DATA_DISPLAY_MAX_DIM)
         )
@@ -306,6 +323,11 @@ class DisplayMap:
             image_kwargs["extent"] = (-0.5, source_width - 0.5, -0.5, source_height - 0.5)
             image_kwargs["interpolation"] = "nearest"
 
+        # Ensure display_imdata is a plain numpy array (LazyScaledArray cannot
+        # be passed directly to matplotlib).
+        if is_lazy_scaled(display_imdata):
+            display_imdata = np.asarray(display_imdata)
+
         self.im = self.ax.imshow(
             display_imdata,
             cmap=cmap,
@@ -340,22 +362,23 @@ class DisplayMap:
         self.overlay_ax.set_picker(False)
 
 
-        self.cax = self.fig.add_axes([self.cbar_pos_x, self.cbar_pos_y, self.cbar_width, self.cbar_height])
-        self.cax.set_gid('colorbar')
-        self.cax.set_zorder(300)
-        self.colorbar = self.fig.colorbar(self.im, cax = self.cax, orientation = self.colorbar_orientation )
-        self.colorbar.ax.set_zorder(300)
-        self.cax.tick_params(axis='y', which='both', left=self.colorbar_tick_left, right=self.colorbar_tick_right, labelleft=self.colorbar_tick_labelleft, labelright=(not self.colorbar_tick_labelleft),
-                            width=self.colorbar_tick_width, length=self.colorbar_tick_length, color=self.colorbar_tick_color, direction=self.colorbar_tick_direction, labelcolor=self.colorbar_tick_labelcolor)
-        self.cax.tick_params(axis='x', which='both', top=self.colorbar_tick_top, bottom=self.colorbar_tick_bottom, labeltop= self.colorbar_tick_labeltop, labelbottom = (not self.colorbar_tick_labeltop),
-                            width=self.colorbar_tick_width, length=self.colorbar_tick_length, color=self.colorbar_tick_color, direction=self.colorbar_tick_direction, labelcolor=self.colorbar_tick_labelcolor)
-        self.colorbar.outline.set_color(self.colorbar_tick_color)
-        self.colorbar.outline.set_linewidth(self.colorbar_tick_width)
-        self.colorbar.set_label(self.colorbar_label, fontsize=self.colorbar_label_fontsize, color=self.colorbar_label_color)
-        self.colorbar.ax.minorticks_on()
-        self.colorbar.ax.tick_params(which='minor', length=self.colorbar_mtick_length, color=self.colorbar_tick_color)
-        self.colorbar.ax.yaxis.set_minor_locator(mpl.ticker.AutoMinorLocator(self.colorbar_mtick_freq))
-        self.colorbar.ax.xaxis.set_minor_locator(mpl.ticker.AutoMinorLocator(self.colorbar_mtick_freq))
+        if not self.defer_colorbar:
+            self.cax = self.fig.add_axes([self.cbar_pos_x, self.cbar_pos_y, self.cbar_width, self.cbar_height])
+            self.cax.set_gid('colorbar')
+            self.cax.set_zorder(300)
+            self.colorbar = self.fig.colorbar(self.im, cax = self.cax, orientation = self.colorbar_orientation )
+            self.colorbar.ax.set_zorder(300)
+            self.cax.tick_params(axis='y', which='both', left=self.colorbar_tick_left, right=self.colorbar_tick_right, labelleft=self.colorbar_tick_labelleft, labelright=(not self.colorbar_tick_labelleft),
+                                width=self.colorbar_tick_width, length=self.colorbar_tick_length, color=self.colorbar_tick_color, direction=self.colorbar_tick_direction, labelcolor=self.colorbar_tick_labelcolor)
+            self.cax.tick_params(axis='x', which='both', top=self.colorbar_tick_top, bottom=self.colorbar_tick_bottom, labeltop= self.colorbar_tick_labeltop, labelbottom = (not self.colorbar_tick_labeltop),
+                                width=self.colorbar_tick_width, length=self.colorbar_tick_length, color=self.colorbar_tick_color, direction=self.colorbar_tick_direction, labelcolor=self.colorbar_tick_labelcolor)
+            self.colorbar.outline.set_color(self.colorbar_tick_color)
+            self.colorbar.outline.set_linewidth(self.colorbar_tick_width)
+            self.colorbar.set_label(self.colorbar_label, fontsize=self.colorbar_label_fontsize, color=self.colorbar_label_color)
+            self.colorbar.ax.minorticks_on()
+            self.colorbar.ax.tick_params(which='minor', length=self.colorbar_mtick_length, color=self.colorbar_tick_color)
+            self.colorbar.ax.yaxis.set_minor_locator(mpl.ticker.AutoMinorLocator(self.colorbar_mtick_freq))
+            self.colorbar.ax.xaxis.set_minor_locator(mpl.ticker.AutoMinorLocator(self.colorbar_mtick_freq))
 
         # Update ViewerState if provided
         if self.viewer_state is not None:
@@ -407,6 +430,21 @@ class DisplayMap:
         for coord_name, axis_label in self.coords_dict.items():
             if coord_name in self.ax.coords: 
                 self.ax.coords[coord_name].set_axislabel(axis_label, fontsize=self.axislabel_fontsize, fontfamily = self.axislabel_fontfamily, color = self.axislabel_color)
+
+        if self.plane == 'xz':
+            ax_xy[1].set_axislabel(
+                self.third_axis_label,
+                fontsize=self.axislabel_fontsize,
+                fontfamily=self.axislabel_fontfamily,
+                color=self.axislabel_color,
+            )
+        elif self.plane == 'zy':
+            ax_xy[0].set_axislabel(
+                self.third_axis_label,
+                fontsize=self.axislabel_fontsize,
+                fontfamily=self.axislabel_fontfamily,
+                color=self.axislabel_color,
+            )
         
         self.ax.tick_params(axis='both', which = 'major', direction=self.tick_direction,length=self.tick_length,color=self.tick_color, width = self.tick_width, labelsize = self.tick_labelsize, labelcolor = self.tick_labelcolor)
         

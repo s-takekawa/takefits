@@ -58,12 +58,14 @@ class ActionSession:
     state: Optional[AppState] = None
     history: List[ActionRecord] = field(default_factory=list)
     last_result: Any = None
+    defer_initial_state_seed: bool = False
     _initial_state_seed: Optional[AppState] = field(default=None, init=False, repr=False)
     _initial_seed_set: bool = field(default=False, init=False, repr=False)
     _cursor: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.set_initial_state_seed()
+        if not self.defer_initial_state_seed:
+            self.set_initial_state_seed()
         self._cursor = len(self.history)
 
     def execute(
@@ -74,6 +76,9 @@ class ActionSession:
         replace_tag: Optional[str] = None,
         **params: Any,
     ) -> Any:
+        if not self._initial_seed_set and self.state is not None:
+            self.set_initial_state_seed()
+
         result: Any = None
         if not record_only:
             result = self._execute_handler(name=name, params=params)
@@ -165,6 +170,8 @@ class ActionSession:
         if replace:
             self.history = []
             self._cursor = 0
+            if not self._initial_seed_set and self.state is not None:
+                self.set_initial_state_seed()
             self._restore_initial_state()
         elif self._cursor < len(self.history):
             del self.history[self._cursor :]
@@ -219,7 +226,10 @@ class ActionSession:
 
     def _restore_initial_state(self) -> None:
         if not self._initial_seed_set:
-            raise ValueError("Initial state seed is not set.")
+            if self.state is not None:
+                self.set_initial_state_seed()
+            else:
+                raise ValueError("Initial state seed is not set.")
         if self._initial_state_seed is None:
             self.state = None
             self.last_result = None
@@ -334,5 +344,56 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _clone_state_field(value: Any) -> Any:
+    """Clone a detached state field, falling back to the original on failure."""
+    if value is None:
+        return None
+
+    deepcopier = getattr(value, "deepcopy", None)
+    if callable(deepcopier):
+        try:
+            return deepcopier()
+        except Exception:
+            pass
+
+    copier = getattr(value, "copy", None)
+    if callable(copier):
+        try:
+            return copier()
+        except Exception:
+            pass
+
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
+
+
 def _clone_state(state: AppState) -> AppState:
-    return copy.deepcopy(state)
+    """Create a lightweight clone of *state*.
+
+    The heavy data array is shared by reference because usecase handlers treat
+    it as replace-on-write (for example ``state.data = smoothed_data``). FITS
+    metadata objects, however, are cloned so in-place header/WCS edits do not
+    mutate the initial seed used by undo/redo replay. Everything else is
+    deep-copied so that the clone can be mutated independently.
+    """
+    # Temporarily detach heavy fields so deepcopy skips them.
+    saved_data = state.data
+    saved_header = state.header
+    saved_wcs = state.wcs
+    try:
+        state.data = None
+        state.header = None
+        state.wcs = None
+        cloned = copy.deepcopy(state)
+    finally:
+        # Restore originals on the source state.
+        state.data = saved_data
+        state.header = saved_header
+        state.wcs = saved_wcs
+    # Re-attach with shared data but isolated metadata objects.
+    cloned.data = saved_data
+    cloned.header = _clone_state_field(saved_header)
+    cloned.wcs = _clone_state_field(saved_wcs)
+    return cloned

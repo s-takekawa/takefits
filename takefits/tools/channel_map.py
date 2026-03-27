@@ -35,6 +35,40 @@ from takefits.core.app_state import AppState, MarkerSpec, create_app_state
 from takefits.core.action_session import ActionSession
 from takefits.core.actions import ActionRegistry, register_default_actions
 from takefits.tools.base_panel import record_action_preview, clear_action_preview_record
+from takefits.tools.panel_helpers import _resolve_xz_subwindow, _resolve_z_view_limits
+
+
+def _axis_length_for_channel_map(fits_viewer, axis_number):
+    data = getattr(fits_viewer, "data", None)
+    ndim = getattr(data, "ndim", 0)
+
+    if ndim == 3:
+        shape_map = {1: data.shape[2], 2: data.shape[1], 3: data.shape[0]}
+        if axis_number in shape_map:
+            return int(shape_map[axis_number])
+    elif ndim >= 4:
+        cube = data[0]
+        shape_map = {1: cube.shape[2], 2: cube.shape[1], 3: cube.shape[0]}
+        if axis_number in shape_map:
+            return int(shape_map[axis_number])
+
+    header = getattr(fits_viewer, "header", None)
+    if header is not None:
+        value = header.get(f"NAXIS{axis_number}")
+        if value is not None:
+            return int(value)
+
+    return 0
+
+
+def _axis_upper_pixel_edge(fits_viewer, axis_number):
+    axis_len = _axis_length_for_channel_map(fits_viewer, axis_number)
+    return axis_len + 0.5 if axis_len > 0 else 0.5
+
+
+def _axis_last_pixel_center(fits_viewer, axis_number):
+    axis_len = _axis_length_for_channel_map(fits_viewer, axis_number)
+    return axis_len - 0.5 if axis_len > 0 else -0.5
 
 
 class _ChannelMarkerFormatWrapper:
@@ -180,7 +214,7 @@ class ChannelMapWindow(QMainWindow):
         
         self.original_xlim = self.fits_viewer.ax.get_xlim()
         self.original_ylim = self.fits_viewer.ax.get_ylim()
-        self.original_zlim = self.subwindows[0].ax.get_ylim()
+        self.original_zlim = _resolve_z_view_limits(self.fits_viewer, self.subwindows)
         self.converter = CoordinateConverter(self.wcs, self.fits_viewer.config_manager.config)
 
         if self.wcs.naxis == 3:
@@ -3054,12 +3088,12 @@ class ChannelMapSettingPanel(QDialog):
         
         self.original_xlim = self.fits_viewer.ax.get_xlim()
         self.original_ylim = self.fits_viewer.ax.get_ylim()
-        self.original_zlim = self.subwindows[0].ax.get_ylim()
+        self.original_zlim = _resolve_z_view_limits(self.fits_viewer, self.subwindows)
         
         self.from_val =  0.5
-        self.to_val =  self.fits_viewer.header['NAXIS3']+0.5
+        self.to_val = _axis_upper_pixel_edge(self.fits_viewer, 3)
         self.from_pix = 0.5
-        self.to_pix = self.fits_viewer.header['NAXIS3']+0.5
+        self.to_pix = _axis_upper_pixel_edge(self.fits_viewer, 3)
         self.interval_pix = 1
 
         self.initUI()
@@ -3235,35 +3269,35 @@ class ChannelMapSettingPanel(QDialog):
         if self.worldch_num == 0: #ch
             self.from_val =  0.5
             if self.plane_num == 0: #X-Y
-                self.to_val = self.fits_viewer.header['NAXIS3']+0.5
+                self.to_val = _axis_upper_pixel_edge(self.fits_viewer, 3)
             elif self.plane_num == 1:
-                self.to_val = self.fits_viewer.header['NAXIS2']+0.5
+                self.to_val = _axis_upper_pixel_edge(self.fits_viewer, 2)
             elif self.plane_num == 2:
-                self.to_val = self.fits_viewer.header['NAXIS1']+0.5
+                self.to_val = _axis_upper_pixel_edge(self.fits_viewer, 1)
             self.interval = 1
             
         elif self.worldch_num == 1: #world
             if self.plane_num == 0: #X-Y
                 if self.fits_viewer.data.ndim == 3:
                     self.from_val = self.converter.pix_to_world(0, 0, -0.5)[2]
-                    self.to_val = self.converter.pix_to_world(0, 0, int(self.fits_viewer.header['NAXIS3'])-0.5)[2]
+                    self.to_val = self.converter.pix_to_world(0, 0, _axis_last_pixel_center(self.fits_viewer, 3))[2]
                 elif self.fits_viewer.data.ndim == 4:
                     self.from_val = self.converter.pix_to_world(0, 0, -0.5, 0)[2]
-                    self.to_val = self.converter.pix_to_world(0, 0, int(self.fits_viewer.header['NAXIS3'])-0.5, 0)[2]
+                    self.to_val = self.converter.pix_to_world(0, 0, _axis_last_pixel_center(self.fits_viewer, 3), 0)[2]
             elif self.plane_num == 1: #X-Z
                 if self.fits_viewer.data.ndim == 3:
                     self.from_val = self.converter.pix_to_world(0, -0.5, 0)[1]
-                    self.to_val = self.converter.pix_to_world(0, int(self.fits_viewer.header['NAXIS2'])-0.5, 0)[1]
+                    self.to_val = self.converter.pix_to_world(0, _axis_last_pixel_center(self.fits_viewer, 2), 0)[1]
                 elif self.fits_viewer.data.ndim == 4:
                     self.from_val = self.converter.pix_to_world(0, -0.5, 0, 0)[1]
-                    self.to_val = self.converter.pix_to_world(0, int(self.fits_viewer.header['NAXIS2'])-0.5, 0, 0)[1]
+                    self.to_val = self.converter.pix_to_world(0, _axis_last_pixel_center(self.fits_viewer, 2), 0, 0)[1]
             elif self.plane_num == 2: #Z-Y
                 if self.fits_viewer.data.ndim == 3:
                     self.from_val = self.converter.pix_to_world(-0.5, 0, 0)[0]
-                    self.to_val = self.converter.pix_to_world(int(self.fits_viewer.header['NAXIS1'])-0.5, 0, 0)[0]
+                    self.to_val = self.converter.pix_to_world(_axis_last_pixel_center(self.fits_viewer, 1), 0, 0)[0]
                 elif self.fits_viewer.data.ndim == 4:
                     self.from_val = self.converter.pix_to_world(-0.5, 0, 0, 0)[0]
-                    self.to_val = self.converter.pix_to_world(int(self.fits_viewer.header['NAXIS1'])-0.5, 0, 0, 0)[0]
+                    self.to_val = self.converter.pix_to_world(_axis_last_pixel_center(self.fits_viewer, 1), 0, 0, 0)[0]
                     
             interval_val = abs(self.wcs.wcs.cdelt[2-self.plane_num])
             axis_type = self.converter.get_axis_types()[2-self.plane_num]
@@ -3634,7 +3668,10 @@ class ChannelMapSettingPanel(QDialog):
     def _axis_label_for_integration_axis(self, axis_index: int) -> str:
         try:
             if axis_index == 2:
-                return str(self.subwindows[0].ax.get_ylabel() or "")
+                xz_window = _resolve_xz_subwindow(self.subwindows)
+                if xz_window is not None:
+                    return str(xz_window.ax.get_ylabel() or "")
+                return ""
             if axis_index == 1:
                 return str(self.fits_viewer.ax.get_ylabel() or "")
             if axis_index == 0:

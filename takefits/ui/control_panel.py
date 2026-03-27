@@ -90,10 +90,11 @@ class ControlPanel(QWidget):
     A widget providing buttons to open various tool panels (Color, Scaling, AI, etc.)
     for the FITS viewer.
     """
-    def __init__(self, fits_viewer, subwindows):
+    def __init__(self, fits_viewer, subwindows, *, visible=True):
         super().__init__()
         self.fits_viewer = fits_viewer
         self.subwindows = subwindows
+        self._start_visible = bool(visible)
 
         # Initialize references to tool panels (initially None)
         self.color_settings_panel = None
@@ -228,7 +229,8 @@ class ControlPanel(QWidget):
 
         self.adjustSize() # Adjust window size to fit content
         self.move_to_default_position() # Position window relative to main viewer
-        self.show()
+        if self._start_visible:
+            self.show()
 
     def move_to_default_position(self):
         """Positions the control panel to the right of the main FITS viewer window."""
@@ -642,7 +644,10 @@ class ControlPanel(QWidget):
     def closeEvent(self, event):
         """Handles the close event for the ControlPanel."""
         # Update the state of the corresponding action in the main window's menu bar
-        if hasattr(self.fits_viewer, 'menu_bar') and self.fits_viewer.menu_bar:
+        sync_action = getattr(self.fits_viewer, "_set_panel_toggle_checked", None)
+        if callable(sync_action):
+            sync_action("control_panel_action", False)
+        elif hasattr(self.fits_viewer, 'menu_bar') and self.fits_viewer.menu_bar:
             self.fits_viewer.menu_bar.control_panel_action.setChecked(False)
         # Ensure all associated tool panels are closed when this panel closes
         panels_to_close = [

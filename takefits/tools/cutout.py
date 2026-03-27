@@ -350,7 +350,7 @@ class CutoutSettingsDialog(QDialog):
         button_row = QHBoxLayout()
         layout.addLayout(button_row)
 
-        self.save_button = QPushButton("Save FITS", self)
+        self.save_button = QPushButton("Export Cutout FITS", self)
         self.save_button.clicked.connect(self._handle_save)
         self.save_button.setDefault(True)
         button_row.addWidget(self.save_button)

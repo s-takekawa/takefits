@@ -394,9 +394,21 @@ class MenuBar:
 
     def toggle_sub1_window(self):
         if self.sub1_action.isChecked():
-            self.parent.SubWindow.subwindow1.show()
+            ensure = getattr(self.parent, "ensure_subwindow1", None)
+            if callable(ensure):
+                sub1 = ensure()
+            else:
+                sub1 = getattr(self.parent.SubWindow, "subwindow1", None)
+            if sub1 is not None:
+                sub1.show()
+                sub1.raise_()
+                sub1.activateWindow()
+            else:
+                self.sub1_action.setChecked(False)
         else:
-            self.parent.SubWindow.subwindow1.hide()
+            sub1 = getattr(self.parent.SubWindow, "subwindow1", None)
+            if sub1 is not None:
+                sub1.hide()
     
     def toggle_sub2_window(self):
         if self.sub2_action.isChecked():
@@ -417,95 +429,67 @@ class MenuBar:
                 sub2.hide()
         
         
+    def _ensure_control_panel(self, *, visible: bool = True):
+        ensure = getattr(self.parent, "ensure_control_panel", None)
+        if callable(ensure):
+            try:
+                return ensure(visible=visible)
+            except TypeError:
+                return ensure()
+        return getattr(self.parent, "control_panel", None)
+
+    def _open_control_panel_child(self, panel_attr: str, opener_name: str):
+        control_panel = self._ensure_control_panel(visible=False)
+        if control_panel is None:
+            return
+        panel = getattr(control_panel, panel_attr, None)
+        if panel is None:
+            opener = getattr(control_panel, opener_name, None)
+            if callable(opener):
+                opener()
+            return
+        panel.raise_()
+        panel.activateWindow()
+
     def open_colorscale_panel(self):
-        if self.parent.control_panel.color_settings_panel is None:
-            self.parent.control_panel.open_color_settings()
-        else:
-            self.parent.control_panel.color_settings_panel.raise_()
-            self.parent.control_panel.color_settings_panel.activateWindow()
+        self._open_control_panel_child("color_settings_panel", "open_color_settings")
             
     def open_scaling_panel(self):
-        if self.parent.control_panel.scaling_panel is None:
-            self.parent.control_panel.open_scaling_panel()
-        else:
-            self.parent.control_panel.scaling_panel.raise_()
-            self.parent.control_panel.scaling_panel.activateWindow()
+        self._open_control_panel_child("scaling_panel", "open_scaling_panel")
 
     def open_unit_conversion_panel(self):
-        if self.parent.control_panel.unit_conversion_panel is None:
-            self.parent.control_panel.open_unit_conversion_panel()
-        else:
-            self.parent.control_panel.unit_conversion_panel.raise_()
-            self.parent.control_panel.unit_conversion_panel.activateWindow()
+        self._open_control_panel_child("unit_conversion_panel", "open_unit_conversion_panel")
     
     def open_chmap_panel(self):
-        if self.parent.control_panel.chmap_settings_panel is None:
-            self.parent.control_panel.open_chmap_settings()
-        else:
-            self.parent.control_panel.chmap_settings_panel.raise_()
-            self.parent.control_panel.chmap_settings_panel.activateWindow()
+        self._open_control_panel_child("chmap_settings_panel", "open_chmap_settings")
 
     def open_clump_finding_panel(self):
-        if self.parent.control_panel.clump_finding_panel is None:
-            self.parent.control_panel.open_clump_finding_panel()
-        else:
-            self.parent.control_panel.clump_finding_panel.raise_()
-            self.parent.control_panel.clump_finding_panel.activateWindow()
+        self._open_control_panel_child("clump_finding_panel", "open_clump_finding_panel")
 
     def open_integ_panel(self):
-        if self.parent.control_panel.integ_settings_panel is None:
-            self.parent.control_panel.open_integ_settings()
-        else:
-            self.parent.control_panel.integ_settings_panel.raise_()
-            self.parent.control_panel.integ_settings_panel.activateWindow()
+        self._open_control_panel_child("integ_settings_panel", "open_integ_settings")
 
     def open_cutout_dialog(self):
         if hasattr(self.parent, 'open_cutout_dialog'):
             self.parent.open_cutout_dialog(use_view_bounds=True)
 
     def open_mask_panel(self):
-        if self.parent.control_panel.mask_settings_panel is None:
-            self.parent.control_panel.open_mask_settings()
-        else:
-            self.parent.control_panel.mask_settings_panel.raise_()
-            self.parent.control_panel.mask_settings_panel.activateWindow()            
+        self._open_control_panel_child("mask_settings_panel", "open_mask_settings")
 
     def open_pvd_panel(self):
-        if self.parent.control_panel.pvd_panel is None:
-            self.parent.control_panel.open_pvd_settings()
-        else:
-            self.parent.control_panel.pvd_panel.raise_()
-            self.parent.control_panel.pvd_panel.activateWindow()
+        self._open_control_panel_child("pvd_panel", "open_pvd_settings")
     
     def open_spec_window(self):
-        if self.parent.control_panel.spec_window is None:
-            self.parent.control_panel.open_spec_window()
-        else:
-            self.parent.control_panel.spec_window.raise_()
-            self.parent.control_panel.spec_window.activateWindow()
+        self._open_control_panel_child("spec_window", "open_spec_window")
 
     def open_baseline_panel(self):
-        if self.parent.control_panel.baseline_panel is None:
-            self.parent.control_panel.open_baseline_panel()
-        else:
-            self.parent.control_panel.baseline_panel.raise_()
-            self.parent.control_panel.baseline_panel.activateWindow()
+        self._open_control_panel_child("baseline_panel", "open_baseline_panel")
 
     def open_smooth_panel(self):
-        if self.parent.control_panel.smooth_settings_panel is None:
-            self.parent.control_panel.open_smooth_settings()
-        else:
-            self.parent.control_panel.smooth_settings_panel.raise_()
-            self.parent.control_panel.smooth_settings_panel.activateWindow()
+        self._open_control_panel_child("smooth_settings_panel", "open_smooth_settings")
 
     def open_contour_panel(self):
-        if self.parent.control_panel is None:
-            return
-        if self.parent.control_panel.contour_panel is None:
-            self.parent.control_panel.open_contour_panel()
-        else:
-            self.parent.control_panel.contour_panel.raise_()
-            self.parent.control_panel.contour_panel.activateWindow()
+        self._open_control_panel_child("contour_panel", "open_contour_panel")
 
 
     def open_config_panel(self):
@@ -532,11 +516,7 @@ class MenuBar:
         dlg.exec()
 
     def open_arithmetic_panel(self):
-        if self.parent.control_panel.arithmetic_panel is None:
-            self.parent.control_panel.open_arithmetic_panel()
-        else:
-            self.parent.control_panel.arithmetic_panel.raise_()
-            self.parent.control_panel.arithmetic_panel.activateWindow()
+        self._open_control_panel_child("arithmetic_panel", "open_arithmetic_panel")
 
 
 def _copy_menu_contents(source_menu: QMenu, target_menu: QMenu):

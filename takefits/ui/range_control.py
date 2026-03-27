@@ -25,7 +25,11 @@ class RangeControlPanel(QWidget):
         self.original_xlim = self.fits_viewer.ax.get_xlim()
         self.original_ylim = self.fits_viewer.ax.get_ylim()
         if self.fits_viewer.data.ndim > 2:
-            self.original_zlim = self.subwindows[0].ax.get_ylim()
+            subwindow_xz = self._subwindow(0)
+            if subwindow_xz is not None:
+                self.original_zlim = subwindow_xz.ax.get_ylim()
+            else:
+                self.original_zlim = tuple(getattr(self.fits_viewer, 'original_zlim', (0.0, 0.0)))
         self.range_file = self.fits_viewer.range_file
         
         self.initUI()
@@ -743,4 +747,8 @@ class RangeControlPanel(QWidget):
             self.update_ranges(plane, None, None)
                                 
     def closeEvent(self, event):
-        self.fits_viewer.menu_bar.range_panel_action.setChecked(False)
+        sync_action = getattr(self.fits_viewer, "_set_panel_toggle_checked", None)
+        if callable(sync_action):
+            sync_action("range_panel_action", False)
+        else:
+            self.fits_viewer.menu_bar.range_panel_action.setChecked(False)

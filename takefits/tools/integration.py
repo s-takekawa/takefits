@@ -4,6 +4,7 @@ import matplotlib as mpl
 import os
 import json
 import uuid
+import re
 from typing import List, Optional
 import astropy.units as u
 from PySide6.QtWidgets import QWidget, QMainWindow, QDialog, QGridLayout, QGroupBox, QVBoxLayout, QComboBox, QLineEdit, QPushButton, QRadioButton, QCheckBox, QLabel, QButtonGroup, QMessageBox, QFileDialog
@@ -46,6 +47,82 @@ from takefits.tools.base_panel import (
 from takefits.core.region import CircleRegion, RectangleRegion, EllipseRegion, CubeRegion
 
 
+from takefits.tools.panel_helpers import _resolve_xz_subwindow, _resolve_z_view_limits
+
+
+def _resolve_display_axis_label(fits_viewer, subwindows, axis_to_drop):
+    axis_index = int(axis_to_drop) if axis_to_drop is not None else -1
+
+    try:
+        if axis_index == 2:
+            xz_window = _resolve_xz_subwindow(subwindows)
+            if xz_window is not None:
+                label_text = str(xz_window.ax.get_ylabel() or "").strip()
+                if label_text:
+                    return label_text
+
+        elif axis_index == 1:
+            return str(fits_viewer.ax.get_ylabel() or "").strip()
+        elif axis_index == 0:
+            return str(fits_viewer.ax.get_xlabel() or "").strip()
+    except Exception:
+        pass
+
+    return ""
+
+
+def _normalize_plain_unit_text(unit_text):
+    text = str(unit_text or "").strip()
+    if not text:
+        return ""
+
+    text = text.replace("$", "").strip()
+    text = re.sub(r"\\mathrm\{\\frac\{([^{}]+)\}\{([^{}]+)\}\}", r"\1/\2", text)
+    text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"\1/\2", text)
+    text = re.sub(r"\\mathrm\{([^{}]+)\\,s\^\{-?1\}\}", r"\1/s", text)
+    text = re.sub(r"\\mathrm\{([^{}]+)\s*s\^\{-?1\}\}", r"\1/s", text)
+    text = text.replace("\\,", " ")
+    text = text.replace("{", "").replace("}", "")
+    text = re.sub(r"\s*/\s*", "/", text)
+    text = text.replace(" s^-1", "/s")
+    text = text.replace(" s-1", "/s")
+    text = text.replace(" s^{-1}", "/s")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _resolve_plain_axis_unit(fits_viewer, subwindows, wcs, axis_to_drop):
+    axis_index = int(axis_to_drop) if axis_to_drop is not None else -1
+    header_axis = axis_index + 1
+    header = getattr(fits_viewer, "header", None)
+
+    candidates = []
+    if axis_index == 2:
+        spectral_meta = getattr(fits_viewer, "spectral_metadata", None) or {}
+        candidates.append(spectral_meta.get("current_axis_unit"))
+
+    if header is not None and header_axis > 0:
+        candidates.append(header.get(f"CUNIT{header_axis}"))
+
+    label_text = _resolve_display_axis_label(fits_viewer, subwindows, axis_to_drop)
+    if label_text:
+        match = re.search(r"\[(.*?)\]", label_text)
+        if match:
+            candidates.append(match.group(1))
+
+    try:
+        candidates.append(wcs.wcs.cunit[axis_index].to_string("generic"))
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        normalized = _normalize_plain_unit_text(candidate)
+        if normalized:
+            return normalized
+
+    return ""
+
+
 class IntegSettingsPanel(QDialog):
     def __init__(self, fits_viewer, subwindows):
         super().__init__()
@@ -58,7 +135,7 @@ class IntegSettingsPanel(QDialog):
         
         self.original_xlim = self.fits_viewer.ax.get_xlim()
         self.original_ylim = self.fits_viewer.ax.get_ylim()
-        self.original_zlim = self.subwindows[0].ax.get_ylim()
+        self.original_zlim = _resolve_z_view_limits(self.fits_viewer, self.subwindows)
 
         self.integ_result_windows = []
         self._action_record_tag = "panel:integration"
@@ -996,7 +1073,7 @@ class IntegResultWindow(QMainWindow):
             
         self.original_xlim = self.fits_viewer.ax.get_xlim()
         self.original_ylim = self.fits_viewer.ax.get_ylim()
-        self.original_zlim = self.subwindows[0].ax.get_ylim()
+        self.original_zlim = _resolve_z_view_limits(self.fits_viewer, self.subwindows)
         self.initialize_ranges()
         self.znpix = self.data.shape[0]-1
         self.ynpix = self.data.shape[1]-1
@@ -1210,46 +1287,24 @@ class IntegResultWindow(QMainWindow):
 
     def _set_bunit(self):
             # Set the correct brightness unit based on the integration mode.
-            import re
             original_header = self.fits_viewer.header
             original_bunit = original_header.get('BUNIT', '')
             
             plane_to_axis = {'xy': 2, 'xz': 1, 'zy': 0}
             axis_to_drop = plane_to_axis.get(self.plane)
             
-            full_axis_label = ''
-            display_axis_unit = ''
-
-            # Get the full text label from the corresponding displayed axis
-            # and parse the unit from it. This is the most reliable method.
-            try:
-                if axis_to_drop == 2: # Z-axis (e.g., Velocity)
-                    # Get label from the vertical axis of the XZ-plane subwindow
-                    full_axis_label = self.subwindows[0].ax.get_ylabel()
-                elif axis_to_drop == 1: # Y-axis (e.g., Declination)
-                    # Get label from the vertical axis of the XY-plane main window
-                    full_axis_label = self.fits_viewer.ax.get_ylabel()
-                elif axis_to_drop == 0: # X-axis (e.g., Right Ascension)
-                    # Get label from the horizontal axis of the XY-plane main window
-                    full_axis_label = self.fits_viewer.ax.get_xlabel()
-
-                # Use regex to find text within square brackets, e.g., "LSR Velocity [km/s]" -> "km/s"
-                match = re.search(r'\[(.*?)\]', full_axis_label)
-                if match:
-                    display_axis_unit = match.group(1)
-                else:
-                    # Fallback for labels without brackets
-                    display_axis_unit = self.wcs.wcs.cunit[axis_to_drop].to_string()
-
-            except Exception:
-                # General fallback if getting the label fails
-                display_axis_unit = self.wcs.wcs.cunit[axis_to_drop].to_string()
-
-            # Clean up the unit string by removing spaces
-            display_axis_unit = display_axis_unit.replace(' ', '')
+            display_axis_unit = _resolve_plain_axis_unit(
+                self.fits_viewer,
+                self.subwindows,
+                self.wcs,
+                axis_to_drop,
+            )
 
             if self.integ_mode == 'int':
-                self.bunit = f"{original_bunit} {display_axis_unit}"
+                if original_bunit and display_axis_unit:
+                    self.bunit = f"{original_bunit} {display_axis_unit}"
+                else:
+                    self.bunit = original_bunit or display_axis_unit
             elif self.integ_mode in ['mom1', 'mom2', 'peak_corrd']:
                 self.bunit = display_axis_unit
             else: # average, peak_int, median, rms
