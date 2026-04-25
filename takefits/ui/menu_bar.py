@@ -3,7 +3,7 @@ from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtCore import Qt
 from takefits.ui.config_panel import ConfigPanel
 from takefits.logic.show_header import ShowHeader
-from takefits.core.version import APP_NAME, APP_VERSION
+from takefits.core.version import APP_DISPLAY_VERSION, APP_NAME
 from takefits.core.wcs_frames import (
     available_display_frames,
     display_frame_label,
@@ -115,46 +115,6 @@ class MenuBar:
         window_menu.addAction(self.sub1_action)
         window_menu.addAction(self.sub2_action)
 
-        wcs_menu = menubar.addMenu("WCS")
-        self.wcs_frame_group = QActionGroup(self.parent)
-        self.wcs_frame_group.setExclusive(True)
-        self.wcs_frame_actions = {}
-        for frame in available_display_frames(getattr(self.parent, "wcs", None)):
-            action = QAction(display_frame_label(frame), self.parent, checkable=True)
-            action.triggered.connect(lambda checked=False, frame_name=frame: self.set_wcs_frame(frame_name))
-            self.wcs_frame_group.addAction(action)
-            wcs_menu.addAction(action)
-            self.wcs_frame_actions[frame] = action
-        if self.wcs_frame_actions:
-            wcs_menu.addSeparator()
-        self.wcs_decimal_group = QActionGroup(self.parent)
-        self.wcs_decimal_group.setExclusive(True)
-        self.wcs_decimal_action = QAction("Decimal", self.parent, checkable=True)
-        self.wcs_sexagesimal_action = QAction("Sexagesimal", self.parent, checkable=True)
-        self.wcs_decimal_action.triggered.connect(lambda checked=False: self.set_wcs_decimal_mode(True))
-        self.wcs_sexagesimal_action.triggered.connect(lambda checked=False: self.set_wcs_decimal_mode(False))
-        self.wcs_decimal_group.addAction(self.wcs_decimal_action)
-        self.wcs_decimal_group.addAction(self.wcs_sexagesimal_action)
-        wcs_menu.addAction(self.wcs_decimal_action)
-        wcs_menu.addAction(self.wcs_sexagesimal_action)
-
-        current_frame = preferred_display_frame(getattr(self.parent, "wcs", None))
-        getter = getattr(self.parent, "get_wcs_display_frame", None)
-        if callable(getter):
-            try:
-                current_frame = normalize_display_frame(getter())
-            except Exception:
-                current_frame = preferred_display_frame(getattr(self.parent, "wcs", None))
-        self.set_wcs_frame_checked(current_frame)
-        decimal_mode = True
-        decimal_getter = getattr(self.parent, "get_wcs_decimal_mode", None)
-        if callable(decimal_getter):
-            try:
-                decimal_mode = bool(decimal_getter())
-            except Exception:
-                decimal_mode = True
-        self.set_wcs_decimal_checked(decimal_mode)
-        
         # Tools Menu
         tools_menu = menubar.addMenu("Tools")
         tools_menu.addSeparator() # Add a visual separator in the menu
@@ -270,6 +230,46 @@ class MenuBar:
         self.load_regions_action = QAction("Load Regions...", self.parent)
         self.load_regions_action.triggered.connect(self.parent.load_regions_dialog)
         region_menu.addAction(self.load_regions_action)
+
+        wcs_menu = menubar.addMenu("WCS")
+        self.wcs_frame_group = QActionGroup(self.parent)
+        self.wcs_frame_group.setExclusive(True)
+        self.wcs_frame_actions = {}
+        for frame in available_display_frames(getattr(self.parent, "wcs", None)):
+            action = QAction(display_frame_label(frame), self.parent, checkable=True)
+            action.triggered.connect(lambda checked=False, frame_name=frame: self.set_wcs_frame(frame_name))
+            self.wcs_frame_group.addAction(action)
+            wcs_menu.addAction(action)
+            self.wcs_frame_actions[frame] = action
+        if self.wcs_frame_actions:
+            wcs_menu.addSeparator()
+        self.wcs_decimal_group = QActionGroup(self.parent)
+        self.wcs_decimal_group.setExclusive(True)
+        self.wcs_decimal_action = QAction("Decimal", self.parent, checkable=True)
+        self.wcs_sexagesimal_action = QAction("Sexagesimal", self.parent, checkable=True)
+        self.wcs_decimal_action.triggered.connect(lambda checked=False: self.set_wcs_decimal_mode(True))
+        self.wcs_sexagesimal_action.triggered.connect(lambda checked=False: self.set_wcs_decimal_mode(False))
+        self.wcs_decimal_group.addAction(self.wcs_decimal_action)
+        self.wcs_decimal_group.addAction(self.wcs_sexagesimal_action)
+        wcs_menu.addAction(self.wcs_decimal_action)
+        wcs_menu.addAction(self.wcs_sexagesimal_action)
+
+        current_frame = preferred_display_frame(getattr(self.parent, "wcs", None))
+        getter = getattr(self.parent, "get_wcs_display_frame", None)
+        if callable(getter):
+            try:
+                current_frame = normalize_display_frame(getter())
+            except Exception:
+                current_frame = preferred_display_frame(getattr(self.parent, "wcs", None))
+        self.set_wcs_frame_checked(current_frame)
+        decimal_mode = True
+        decimal_getter = getattr(self.parent, "get_wcs_decimal_mode", None)
+        if callable(decimal_getter):
+            try:
+                decimal_mode = bool(decimal_getter())
+            except Exception:
+                decimal_mode = True
+        self.set_wcs_decimal_checked(decimal_mode)
 
         # About (placed in macOS application menu via AboutRole)
         about_action = QAction("About...", self.parent)
@@ -507,7 +507,7 @@ class MenuBar:
         dlg.setTextFormat(Qt.TextFormat.RichText)
         dlg.setText(
             f'<table cellpadding="4">'
-            f'<tr><td><b>{APP_NAME}</b>&nbsp; version {APP_VERSION}</td>'
+            f'<tr><td><b>{APP_NAME}</b>&nbsp; version {APP_DISPLAY_VERSION}</td>'
             f'<td><a href="https://github.com/s-takekawa/takefits">GitHub</a></td></tr>'
             # f'<tr><td>&copy; Shunya Takekawa</td>'
             # f'<td><a href="https://orcid.org/0000-0001-8147-6817">ORCID</a></td></tr>'

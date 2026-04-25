@@ -23,6 +23,7 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 
 from takefits.core.region import CircleRegion, RectangleRegion, EllipseRegion
 from takefits.core.app_state import RegionSpec
+from takefits.ui.widget_sizing import fit_button_to_text
 from takefits.core.usecases import (
     get_averaged_spectrum,
     export_spectrum,
@@ -274,7 +275,7 @@ class SpecWindow(QWidget):
 
         self.fit_button = QPushButton("Gaussian Fit")
         self.fit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.fit_button.setFixedWidth(108)
+        fit_button_to_text(self.fit_button, minimum_width=108)
         self.fit_button.clicked.connect(self.fit_gaussian_components)
         extract_layout.addWidget(self.fit_button)
 
@@ -299,7 +300,7 @@ class SpecWindow(QWidget):
 
         self.clear_fit_button = QPushButton("Clear Fit")
         self.clear_fit_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.clear_fit_button.setFixedWidth(74)
+        fit_button_to_text(self.clear_fit_button, minimum_width=74)
         self.clear_fit_button.clicked.connect(self.clear_fit)
         extract_layout.addWidget(self.clear_fit_button)
 
@@ -312,7 +313,7 @@ class SpecWindow(QWidget):
 
         self.extract_button = QPushButton("Extract")
         self.extract_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.extract_button.setFixedWidth(100)
+        fit_button_to_text(self.extract_button, minimum_width=100)
         self.extract_button.clicked.connect(self.extract_spectrum)
         extract_layout.addWidget(self.extract_button)
 

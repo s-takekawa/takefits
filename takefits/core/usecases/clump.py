@@ -179,13 +179,14 @@ def run_dendrogram(
     handler.run_dendrogram(min_value=min_value, min_delta=min_delta, min_npix=min_npix)
 
     if use_scimes and scimes_criteria:
-        # Pass rms and save_isol_leaves
-        handler.run_scimes(
+        ok, message = handler.run_scimes(
             criteria=scimes_criteria,
             user_k=scimes_user_k,
             rms=rms,
             save_isol_leaves=scimes_save_isol
         )
+        if not ok:
+            raise ValueError(f"SCIMES failed: {message}")
 
     mask = handler.get_mask(mode=output_mode)
     catalog = handler.get_catalog()

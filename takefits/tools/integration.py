@@ -1060,6 +1060,7 @@ class IntegResultWindow(QMainWindow):
         self._colorbar_auto_layout_override = None
         self._colorbar_layout_from_draw_event = False
         self._colorbar_sync_redraw_in_progress = False
+        self._colorbar_sync_redraw_pending = False
         self._colorbar_auto_anchor_sig = None
         self._setup_marker_action_bridge()
 
@@ -2374,13 +2375,12 @@ class IntegResultWindow(QMainWindow):
             return
 
         if getattr(self, "_background", None) is None:
+            try:
+                canvas.draw()
+            except Exception:
+                canvas.draw_idle()
+                return
             self._capture_overlay_background()
-            if getattr(self, "_background", None) is None:
-                try:
-                    canvas.draw()
-                except Exception:
-                    canvas.draw_idle()
-                self._capture_overlay_background()
             if getattr(self, "_background", None) is None:
                 canvas.draw_idle()
                 return
@@ -2746,11 +2746,21 @@ class IntegResultWindow(QMainWindow):
         from_draw_event = bool(getattr(self, "_colorbar_layout_from_draw_event", False))
         changed = bool(self._apply_colorbar_auto_layout(force=force, redraw=not from_draw_event))
         if changed and from_draw_event:
-            self._colorbar_sync_redraw_in_progress = True
-            try:
-                self._request_canvas_redraw(immediate=True)
-            finally:
-                self._colorbar_sync_redraw_in_progress = False
+            if bool(getattr(self, "_colorbar_sync_redraw_pending", False)):
+                return
+            self._colorbar_sync_redraw_pending = True
+
+            def _deferred_redraw():
+                self._colorbar_sync_redraw_pending = False
+                if bool(getattr(self, "_colorbar_sync_redraw_in_progress", False)):
+                    return
+                self._colorbar_sync_redraw_in_progress = True
+                try:
+                    self._request_canvas_redraw(immediate=False)
+                finally:
+                    self._colorbar_sync_redraw_in_progress = False
+
+            QTimer.singleShot(0, _deferred_redraw)
 
     def _colorbar_layout_anchor_signature(self):
         ax = getattr(self, "ax", None)
@@ -3614,6 +3624,7 @@ class IntegResultWindow(QMainWindow):
             self.z_max_int_input.setText(str(zmax_val))
             self.y_min_int_input.setText(str(ymin_val))
             self.y_max_int_input.setText(str(ymax_val))
+        self._background = None
         if not bool(getattr(self, "_suspend_view_history_recording", False)):
             self._record_local_view_history(reason=f"nav:{plane}")
 

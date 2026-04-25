@@ -8,6 +8,7 @@ import numpy as np
 import ast
 from datetime import datetime
 from takefits.ui.save_fits_dialog import SaveFITS
+from takefits.ui.widget_sizing import fit_button_to_text
 from takefits.core.history_provenance import build_processing_history_lines
 
 
@@ -162,7 +163,8 @@ class CubeArithmeticPanel(QWidget):
         
         
         refresh_btn = QPushButton("Refresh")
-        refresh_btn.setFixedSize(60, 24)
+        fit_button_to_text(refresh_btn, minimum_width=60)
+        refresh_btn.setFixedHeight(24)
         refresh_btn.setStyleSheet("font-size: 10px; padding: 2px;")
         refresh_btn.clicked.connect(self.refresh_sources)
         
@@ -199,7 +201,7 @@ class CubeArithmeticPanel(QWidget):
         
         self.reset_btn = QPushButton("Reset")
         self.reset_btn.clicked.connect(self.reset_preview)
-        self.reset_btn.setFixedWidth(60)
+        fit_button_to_text(self.reset_btn, minimum_width=60)
         
         preview_reset_layout.addWidget(self.preview_btn)
         preview_reset_layout.addWidget(self.reset_btn)

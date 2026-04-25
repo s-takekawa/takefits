@@ -29,6 +29,7 @@ from takefits.core.contour_manager import (
     serialize_state_to_json,
     deserialize_state_from_json,
 )
+from takefits.ui.widget_sizing import fit_button_to_text
 from takefits.core.usecases_contour import compute_contours, clear_contours
 
 # The DS9 helpers are implemented in core.contour_manager during Step 4.
@@ -66,6 +67,8 @@ class ContourPanel(QDialog):
         self._default_target_ids = list(default_targets or [])
         self._default_selection_applied = False
         self._step_auto = False
+        self._custom_levels = False
+        self._updating_level_display = False
         self._suspend_target_callbacks = False
 
         self._build_ui()
@@ -160,9 +163,9 @@ class ContourPanel(QDialog):
         targets_header_layout.setSpacing(4)
         targets_header_layout.addWidget(QLabel("Targets", self))
         self.btn_check_all = QPushButton("All", self)
-        self.btn_check_all.setFixedWidth(50)
+        fit_button_to_text(self.btn_check_all, minimum_width=50)
         self.btn_check_none = QPushButton("None", self)
-        self.btn_check_none.setFixedWidth(60)
+        fit_button_to_text(self.btn_check_none, minimum_width=60)
         targets_header_layout.addWidget(self.btn_check_all)
         targets_header_layout.addWidget(self.btn_check_none)
         targets_header_layout.addStretch()
@@ -181,7 +184,7 @@ class ContourPanel(QDialog):
         values_container.setSpacing(4)
         values_container.addWidget(QLabel("Values", self))
         self.level_display = QTextEdit(self)
-        self.level_display.setReadOnly(True)
+        self.level_display.setReadOnly(False)
         self.level_display.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self.level_display.setFixedHeight(120)
         self.level_display.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -195,8 +198,8 @@ class ContourPanel(QDialog):
         button_layout.setSpacing(8)
         self.btn_execute = QPushButton("Apply", self)
         self.btn_clear = QPushButton("Clear", self)
-        self.btn_execute.setFixedWidth(140)
-        self.btn_clear.setFixedWidth(80)
+        fit_button_to_text(self.btn_execute, minimum_width=140)
+        fit_button_to_text(self.btn_clear, minimum_width=80)
         self.btn_execute.setDefault(True)
         self.btn_execute.setAutoDefault(True)
         button_layout.addWidget(self.btn_execute)
@@ -217,11 +220,14 @@ class ContourPanel(QDialog):
         self.btn_check_none.clicked.connect(self._uncheck_all_targets)
         for line_edit in (self.entry_min, self.entry_max, self.entry_step):
             line_edit.returnPressed.connect(self.execute_contours)
-        self.entry_step.textEdited.connect(self._mark_step_manual)
+        self.entry_step.textEdited.connect(self._on_step_text_edited)
         self.entry_step.editingFinished.connect(self._update_level_display)
         self.spin_levels.valueChanged.connect(self._handle_levels_changed)
+        self.entry_min.textEdited.connect(self._on_bounds_text_edited)
+        self.entry_max.textEdited.connect(self._on_bounds_text_edited)
         self.entry_min.editingFinished.connect(self._on_bounds_editing_finished)
         self.entry_max.editingFinished.connect(self._on_bounds_editing_finished)
+        self.level_display.textChanged.connect(self._on_level_display_text_changed)
 
 
     def _apply_saved_parameters(self) -> None:
@@ -235,7 +241,11 @@ class ContourPanel(QDialog):
             self.combo_color.setCurrentText(params.color)
         self._ensure_default_bounds(force=True)
         self._ensure_step()
-        self._update_level_display()
+        if params.levels is not None:
+            self._custom_levels = True
+            self._set_level_display_text("\n".join(f"{float(value):g}" for value in params.levels))
+        else:
+            self._update_level_display()
 
     def _selected_entries(self) -> List[dict]:
         entries: List[dict] = []
@@ -273,6 +283,17 @@ class ContourPanel(QDialog):
         self._set_all_checks(False)
 
     def _collect_parameters(self) -> Optional[ContourParameters]:
+        custom_levels: Optional[List[float]] = None
+        if self._custom_levels:
+            try:
+                custom_levels = self._parse_level_values(self.level_display.toPlainText())
+            except ValueError as exc:
+                QMessageBox.warning(self, "Invalid Input", str(exc))
+                return None
+            if not custom_levels:
+                QMessageBox.warning(self, "Invalid Input", "Please enter at least one contour value.")
+                return None
+
         try:
             level_min = self._parse_optional_float(self.entry_min.text())
             level_max = self._parse_optional_float(self.entry_max.text())
@@ -284,7 +305,7 @@ class ContourPanel(QDialog):
         if level_step is not None:
             self._step_auto = False
 
-        if level_step is None:
+        if custom_levels is None and level_step is None:
             step_value = self._ensure_step(warn_on_failure=True)
             if step_value is None:
                 return None
@@ -294,6 +315,7 @@ class ContourPanel(QDialog):
             level_min=level_min,
             level_max=level_max,
             level_step=level_step,
+            levels=custom_levels,
             smoothing=float(self.spin_smooth.value()),
             linewidth=float(self.spin_linewidth.value()),
             color=self.combo_color.currentText(),
@@ -335,13 +357,30 @@ class ContourPanel(QDialog):
     def _mark_step_manual(self, *_args) -> None:
         self._step_auto = False
 
+    def _mark_generated_levels(self) -> None:
+        self._custom_levels = False
+
+    def _on_step_text_edited(self, *_args) -> None:
+        self._mark_generated_levels()
+        self._mark_step_manual()
+        self._update_level_display()
+
+    def _on_bounds_text_edited(self, *_args) -> None:
+        self._mark_generated_levels()
+        if self._step_auto or not self.entry_step.text().strip():
+            if self._ensure_step(fill_bounds=False) is None:
+                self._update_level_display()
+        else:
+            self._update_level_display()
+
     def _handle_levels_changed(self, _value: int) -> None:
+        self._mark_generated_levels()
         self._step_auto = True
-        self._ensure_step()
+        self._ensure_step(fill_bounds=False)
 
     def _on_bounds_editing_finished(self) -> None:
         if self._step_auto or not self.entry_step.text().strip():
-            self._ensure_step()
+            self._ensure_step(fill_bounds=False)
         else:
             self._update_level_display()
 
@@ -352,11 +391,13 @@ class ContourPanel(QDialog):
             return
         self._ensure_default_bounds()
         if self._step_auto or not self.entry_step.text().strip():
-            self._ensure_step()
+            self._ensure_step(fill_bounds=False)
         else:
             self._update_level_display()
 
     def _ensure_default_bounds(self, force: bool = False) -> None:
+        if not force:
+            return
         need_min = force or not self.entry_min.text().strip()
         need_max = force or not self.entry_max.text().strip()
         if not need_min and not need_max:
@@ -380,7 +421,11 @@ class ContourPanel(QDialog):
             else:
                 self._update_level_display()
 
-    def _ensure_step(self, warn_on_failure: bool = False) -> Optional[float]:
+    def _ensure_step(
+        self,
+        warn_on_failure: bool = False,
+        fill_bounds: bool = True,
+    ) -> Optional[float]:
         min_val, max_val = self._current_min_max()
         if min_val is None or max_val is None:
             bounds = self._determine_bounds()
@@ -389,9 +434,9 @@ class ContourPanel(QDialog):
                     QMessageBox.warning(self, "Levels", "Could not determine data range for step calculation.")
                 return None
             min_val, max_val = bounds
-            if not self.entry_min.text().strip():
+            if fill_bounds and not self.entry_min.text().strip():
                 self.entry_min.setText(f"{min_val:g}")
-            if not self.entry_max.text().strip():
+            if fill_bounds and not self.entry_max.text().strip():
                 self.entry_max.setText(f"{max_val:g}")
 
         if min_val is None or max_val is None:
@@ -476,16 +521,52 @@ class ContourPanel(QDialog):
         return ordered
 
     def _update_level_display(self) -> None:
+        if self._custom_levels:
+            return
         levels = self._preview_levels()
         if not levels:
-            self.level_display.setPlainText("-")
+            self._set_level_display_text("-")
             return
         max_items = 200
         display_levels = levels[:max_items]
         text = "\n".join(f"{value:g}" for value in display_levels)
         if len(levels) > max_items:
             text += "\n…"
-        self.level_display.setPlainText(text)
+        self._set_level_display_text(text)
+
+    def _set_level_display_text(self, text: str) -> None:
+        self._updating_level_display = True
+        try:
+            self.level_display.setPlainText(text)
+        finally:
+            self._updating_level_display = False
+
+    def _on_level_display_text_changed(self) -> None:
+        if self._updating_level_display:
+            return
+        self._custom_levels = True
+
+    @staticmethod
+    def _parse_level_values(text: str) -> List[float]:
+        raw = (text or "").replace(",", " ").split()
+        levels: List[float] = []
+        for token in raw:
+            if token == "-":
+                continue
+            try:
+                value = float(token)
+            except ValueError as exc:
+                raise ValueError("Please enter contour values as numbers separated by spaces, commas, or new lines.") from exc
+            if not math.isfinite(value):
+                raise ValueError("Contour values must be finite numbers.")
+            levels.append(value)
+        if len(levels) > 200:
+            raise ValueError("Please enter 200 or fewer contour values.")
+        ordered: List[float] = []
+        for value in sorted(levels):
+            if not ordered or not math.isclose(ordered[-1], value):
+                ordered.append(value)
+        return ordered
 
 
     # Target list management

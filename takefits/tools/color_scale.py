@@ -48,6 +48,7 @@ class ColorSettingsPanel(QWidget):
         self._suppress_shared_history_recording = True
         self._pending_overlay_refresh_cids = {}
         self.current_settings = ColorSettingsPanel.settings[self.mode]
+        self.background = None
         
         if config is None: self.config = self.fits_viewer.displaymap.config
         else: self.config = config
@@ -683,7 +684,10 @@ class ColorSettingsPanel(QWidget):
                         canvas.mpl_disconnect(cid)
                     except Exception:
                         pass
-                self._redraw_viewer_overlay_after_color_change(viewer)
+                QTimer.singleShot(
+                    0,
+                    lambda viewer=viewer: self._redraw_viewer_overlay_after_color_change(viewer),
+                )
 
             try:
                 cid = canvas.mpl_connect("draw_event", _on_draw)
@@ -1073,7 +1077,17 @@ class ColorSettingsPanel(QWidget):
     def on_drag(self, event):
         if event.inaxes != self.ax or event.button != 1:
             return
-            
+
+        if not (self.dragging_min or self.dragging_max):
+            return
+
+        if event.xdata is None:
+            return
+
+        if self.background is None:
+            self.canvas.draw()
+            self.background = self.canvas.copy_from_bbox(self.ax.bbox)
+
         self.canvas.restore_region(self.background)
         
         if self.dragging_min:
@@ -1099,6 +1113,7 @@ class ColorSettingsPanel(QWidget):
         self.max_line.set_linewidth(1)  # Reset line width
         self.min_line.set_animated(False)
         self.max_line.set_animated(False)
+        self.background = None
 
 
      

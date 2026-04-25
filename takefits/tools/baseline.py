@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 
 from takefits.core.coordinate import CoordinateConverter
 from takefits.core.region import CircleRegion, EllipseRegion, RectangleRegion
+from takefits.ui.widget_sizing import fit_button_to_text
 from takefits.core.wcs_frames import (
     normalize_display_frame,
     plane_values_for_display,
@@ -109,7 +110,7 @@ class BaselinePanel(BaseToolPanel):
         top_row.addWidget(self.baseline_order_spinbox)
 
         self.clear_ranges_button = QPushButton("Clear Ranges")
-        self.clear_ranges_button.setFixedWidth(104)
+        fit_button_to_text(self.clear_ranges_button, minimum_width=104)
         self.clear_ranges_button.clicked.connect(self._clear_ranges)
         top_row.addWidget(self.clear_ranges_button)
 

@@ -90,10 +90,31 @@ def shared_index(viewer, getter_name: str, upper_bound: int) -> int:
 
 def resolve_region_analysis_array(viewer, *, is_cube: bool):
     """Return the full-resolution array used for stats/moments."""
+    plane = str(getattr(viewer, "plane", "xy") or "xy").lower()
+
+    if not is_cube:
+        projected = getattr(viewer, "integrated_data", None)
+        if getattr(projected, "ndim", 0) == 2:
+            return projected.T if plane == "zy" else projected
+
+        app_state = None
+        get_app_state = getattr(viewer, "get_app_state", None)
+        if callable(get_app_state):
+            try:
+                app_state = get_app_state()
+            except Exception:
+                app_state = None
+        elif hasattr(viewer, "app_state"):
+            app_state = getattr(viewer, "app_state", None)
+
+        app_data = getattr(app_state, "data", None)
+        viewer_data = getattr(viewer, "data", None)
+        if getattr(app_data, "ndim", 0) == 2 and getattr(viewer_data, "ndim", 0) > 2:
+            return app_data.T if plane == "zy" else app_data
+
     data = getattr(viewer, "data", None)
     if data is not None:
         ndim = getattr(data, "ndim", 0)
-        plane = str(getattr(viewer, "plane", "xy") or "xy").lower()
         if is_cube:
             if ndim == 4:
                 return data[0]

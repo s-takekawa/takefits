@@ -1466,8 +1466,21 @@ class RegionManager(QObject):
             if axes is None:
                 continue
             region.plane = plane
-            region.region_id = RegionManager._global_region_counter
-            RegionManager._global_region_counter += 1
+            region_id = entry.get("id")
+            if region_id is None:
+                region.region_id = RegionManager._global_region_counter
+                RegionManager._global_region_counter += 1
+            else:
+                region.region_id = region_id
+                try:
+                    numeric_id = int(region_id)
+                except Exception:
+                    numeric_id = None
+                if numeric_id is not None:
+                    RegionManager._global_region_counter = max(
+                        RegionManager._global_region_counter,
+                        numeric_id + 1,
+                    )
             region.add_to_axes(axes)
             region.update_visual() if hasattr(region, "update_visual") else None
             self.regions.append(region)

@@ -51,6 +51,9 @@ takefits = "takefits.main:main"
 [tool.setuptools.dynamic]
 version = { attr = "takefits.core.version.APP_VERSION" }
 
+[tool.setuptools]
+include-package-data = false
+
 [tool.setuptools.packages.find]
 include = ["takefits*"]
-exclude = ["takefits.logic.scimes*"]
+exclude = ["takefits.logic.scimes", "takefits.logic.scimes.*"]

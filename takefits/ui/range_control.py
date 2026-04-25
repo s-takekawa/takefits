@@ -10,6 +10,7 @@ from takefits.core.range_files import (
     save_range_payload,
 )
 from takefits.core.wcs_frames import normalize_display_frame, parse_world_value
+from takefits.ui.widget_sizing import fit_button_to_text
 import os
 
 class RangeControlPanel(QWidget):
@@ -53,7 +54,7 @@ class RangeControlPanel(QWidget):
         self.x_max_input.setFixedWidth(100)
         self.x_max_input.returnPressed.connect(self.set_x_range)
         self.x_button = QPushButton('Set X', self)
-        self.x_button.setFixedWidth(50)
+        fit_button_to_text(self.x_button)
         self.x_button.clicked.connect(self.set_x_range)
 
         layout.addWidget(self.xr_label, 0, 0)
@@ -73,7 +74,7 @@ class RangeControlPanel(QWidget):
         self.y_max_input.setFixedWidth(100)
         self.y_max_input.returnPressed.connect(self.set_y_range)
         self.y_button = QPushButton('Set Y', self)
-        self.y_button.setFixedWidth(50)
+        fit_button_to_text(self.y_button)
         self.y_button.clicked.connect(self.set_y_range)
 
         layout.addWidget(self.yr_label, 1, 0)
@@ -94,7 +95,7 @@ class RangeControlPanel(QWidget):
             self.z_max_input.setFixedWidth(100)
             self.z_max_input.returnPressed.connect(self.set_z_range)
             self.z_button = QPushButton('Set Z', self)
-            self.z_button.setFixedWidth(50)
+            fit_button_to_text(self.z_button)
             self.z_button.clicked.connect(self.set_z_range)
 
             layout.addWidget(self.zr_label, 2, 0)
@@ -135,12 +136,12 @@ class RangeControlPanel(QWidget):
         layout.addWidget(self.reset_button, 3, 0, 1, 4)
 
         self.save_range_button = QPushButton('Save', self)
-        self.save_range_button.setFixedWidth(50)
+        fit_button_to_text(self.save_range_button)
         self.save_range_button.clicked.connect(self.save_range_button_pressed)
         layout.addWidget(self.save_range_button, 3, 4)
 
         self.load_range_button = QPushButton('Load', self)
-        self.load_range_button.setFixedWidth(50)
+        fit_button_to_text(self.load_range_button)
         self.load_range_button.clicked.connect(self.load_range_button_pressed)
         layout.addWidget(self.load_range_button, 3, 5)
         

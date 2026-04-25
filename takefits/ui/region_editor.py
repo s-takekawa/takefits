@@ -626,6 +626,36 @@ class RegionEditorDialog(QDialog):
 
         return vector
 
+    def _spectral_axis_index(self, wcs):
+        if wcs is None:
+            return None
+
+        spectral_meta = getattr(self.viewer, 'spectral_metadata', {}) or {}
+        axis_index = spectral_meta.get('axis_index')
+        try:
+            if axis_index is not None:
+                zero_based = int(axis_index) - 1
+                if 0 <= zero_based < getattr(wcs, 'naxis', 0):
+                    return zero_based
+        except Exception:
+            pass
+
+        try:
+            axis_types = list(getattr(wcs, 'axis_type_names', []) or [])
+        except Exception:
+            axis_types = []
+
+        for idx, axis_type in enumerate(axis_types):
+            axis_upper = str(axis_type or '').upper()
+            if any(token in axis_upper for token in ('VRAD', 'VELO', 'VOPT', 'FREQ', 'WAVE')):
+                return idx
+
+        slices = self._get_display_slices() or ()
+        for idx, entry in enumerate(slices):
+            if entry not in {'x', 'y'}:
+                return idx
+        return None
+
     def _set_field_display_value(self, field_name, pixel_value):
         field = self._fields.get(field_name)
         if field is None:
@@ -736,22 +766,34 @@ class RegionEditorDialog(QDialog):
     def _on_z_world_edit_finished(self):
         """Updates the Z-axis pixel spin boxes from the world coordinate QLineEdits."""
         converter = getattr(self.viewer, 'converter', None)
-        if converter is None or self._updating_fields: return
+        wcs = getattr(converter, 'wcs', None)
+        if converter is None or wcs is None or self._updating_fields:
+            return
 
         sender = self.sender()
         target_spin = self.z_min_spin if sender is self.z_min_world_edit else self.z_max_spin
-        
+        text = sender.text().strip() if sender is not None else ""
+        if not text:
+            self._update_z_world_fields()
+            return
+
         try:
-            ref_world_x = self.viewer._get_shared_world_x()
-            ref_world_y = self.viewer._get_shared_world_y()
-            z_world_val = float(sender.text())
-            
-            if self.viewer.data.ndim == 3:
-                pix_coords = converter.world_to_pix(ref_world_x, ref_world_y, z_world_val)
-            else:
-                pix_coords = converter.world_to_pix(ref_world_x, ref_world_y, z_world_val, 0)
-            
-            z_pix = pix_coords[2]
+            z_world_val = float(text)
+            ref_x_pix = self.center_x_spin.value()
+            ref_y_pix = self.center_y_spin.value()
+            slices = self._get_display_slices()
+            if not slices:
+                raise ValueError("Missing display slices for World Z conversion.")
+
+            pixel_vector = self._build_pixel_vector(ref_x_pix, ref_y_pix, slices, wcs)
+            native_world = list(wcs.wcs_pix2world([pixel_vector], 0)[0])
+            z_axis_idx = self._spectral_axis_index(wcs)
+            if z_axis_idx is None or z_axis_idx >= len(native_world):
+                raise IndexError("Unable to resolve spectral axis for World Z conversion.")
+
+            native_world[z_axis_idx] = z_world_val
+            pix_coords = converter.world_to_pix(*native_world)
+            z_pix = float(pix_coords[z_axis_idx])
 
             self._updating_fields = True
             target_spin.setValue(z_pix)
@@ -848,7 +890,6 @@ class RegionEditorDialog(QDialog):
             self.center_y_spin.setValue(cy)
             self.width_spin.setValue(self.region.width)
             self.height_spin.setValue(self.region.height)
-            self._update_z_world_fields()
             self.angle_spin.setValue(self._normalize_angle(self.region.angle))
 
             if self.viewer.data is not None and self.viewer.data.ndim >= 3:
@@ -885,6 +926,8 @@ class RegionEditorDialog(QDialog):
         self._update_label_field()
         self._refresh_unit_controls()
         self._update_world_fields()
+        if isinstance(self.region, CubeRegion):
+            self._update_z_world_fields()
         self._update_style_controls()
         self._updating_fields = False
 

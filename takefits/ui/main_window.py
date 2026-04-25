@@ -4982,6 +4982,17 @@ class MainWindow(FITSViewer):
                     payload[key] = float(value)
                 except Exception:
                     payload[key] = None
+        levels = getattr(params, "levels", None)
+        if levels is None:
+            payload["levels"] = None
+        else:
+            serialized_levels = []
+            for value in levels:
+                try:
+                    serialized_levels.append(float(value))
+                except Exception:
+                    continue
+            payload["levels"] = serialized_levels
         try:
             payload["smoothing"] = float(getattr(params, "smoothing", 0.0))
         except Exception:
@@ -5019,10 +5030,20 @@ class MainWindow(FITSViewer):
             except Exception:
                 linewidth = 1.0
             color = str(payload.get("color", "white") or "white")
+            levels_payload = payload.get("levels")
+            levels = None
+            if isinstance(levels_payload, (list, tuple)):
+                levels = []
+                for value in levels_payload:
+                    try:
+                        levels.append(float(value))
+                    except Exception:
+                        continue
             return ContourParameters(
                 level_min=_opt_float("level_min"),
                 level_max=_opt_float("level_max"),
                 level_step=_opt_float("level_step"),
+                levels=levels,
                 smoothing=smoothing,
                 linewidth=linewidth,
                 color=color,
@@ -6479,6 +6500,54 @@ class MainWindow(FITSViewer):
         region_specs = list(getattr(state, "regions", []) or []) if state is not None else []
         return build_region_payload_from_specs(region_specs, default_plane="xy")
 
+    def _region_specs_from_state(self, state=None):
+        source_state = state if state is not None else getattr(self.action_session, "state", None)
+        region_entries = list(getattr(source_state, "regions", []) or []) if source_state is not None else []
+        specs = []
+        for entry in region_entries:
+            try:
+                if isinstance(entry, RegionSpec):
+                    payload = entry.to_dict()
+                else:
+                    payload = RegionSpec.from_dict(entry).to_dict()
+            except Exception:
+                try:
+                    payload = dict(entry or {})
+                except Exception:
+                    continue
+            specs.append(payload)
+        specs.sort(key=lambda s: (str(s.get("plane") or ""), str(s.get("id") or ""), str(s.get("type") or "")))
+        return specs
+
+    def _normalize_region_specs_for_view_sync(self, specs):
+        normalized = []
+        for entry in list(specs or []):
+            params = dict(entry.get("params") or {})
+            style = dict(entry.get("style") or {})
+            normalized.append(
+                {
+                    "type": str(entry.get("type") or ""),
+                    "plane": str(entry.get("plane") or ""),
+                    "center_x": float(entry.get("center_x", 0.0)),
+                    "center_y": float(entry.get("center_y", 0.0)),
+                    "params": params,
+                    "label": str(entry.get("label") or ""),
+                    "style": style,
+                }
+            )
+        normalized.sort(
+            key=lambda s: (
+                s["plane"],
+                s["type"],
+                s["label"],
+                s["center_x"],
+                s["center_y"],
+                json.dumps(s["params"], sort_keys=True, separators=(",", ":")),
+                json.dumps(s["style"], sort_keys=True, separators=(",", ":")),
+            )
+        )
+        return normalized
+
     def _build_marker_payload_from_state(self):
         state = getattr(self.action_session, "state", None)
         marker_specs = list(getattr(state, "markers", []) or []) if state is not None else []
@@ -6641,13 +6710,26 @@ class MainWindow(FITSViewer):
                             sync_controls(viewer, effective_xpix)
 
             if hasattr(self, "region_manager") and self.region_manager is not None:
-                self.region_manager.delete_all_regions()
-                region_payload = self._build_region_payload_from_state()
-                if region_payload.get("regions"):
-                    try:
-                        self.region_manager.import_regions_from_dict(region_payload, clear_existing=True)
-                    except Exception:
-                        pass
+                current_region_specs = self._region_specs_snapshot()
+                state_region_specs = self._region_specs_from_state(state)
+                current_region_fingerprint = json.dumps(
+                    self._normalize_region_specs_for_view_sync(current_region_specs),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                state_region_fingerprint = json.dumps(
+                    self._normalize_region_specs_for_view_sync(state_region_specs),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if current_region_fingerprint != state_region_fingerprint:
+                    self.region_manager.delete_all_regions()
+                    region_payload = build_region_payload_from_specs(state_region_specs, default_plane="xy")
+                    if region_payload.get("regions"):
+                        try:
+                            self.region_manager.import_regions_from_dict(region_payload, clear_existing=True)
+                        except Exception:
+                            pass
 
             if hasattr(self, "marker_manager") and self.marker_manager is not None:
                 marker_planes_to_redraw = set()

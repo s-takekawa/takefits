@@ -5,8 +5,8 @@ import time
 import math
 from collections import OrderedDict
 from typing import Dict, List, Optional
-from PySide6.QtCore import Qt, QTimer, Signal as pyqtSignal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal as pyqtSignal
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPalette, QPen
 from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
@@ -16,6 +16,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
+    QStyle,
+    QStyleOptionSlider,
     QWidget,
 )
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -46,6 +48,7 @@ from takefits.core.wcs_frames import (
 )
 from takefits.ui.viewer_coord_mixin import ViewerCoordinatorMixin
 from takefits.ui.viewer_blit_mixin import ViewerBlitMixin
+from takefits.ui.widget_sizing import fit_button_to_text
 from takefits.logic.data_tools import (
     DEFAULT_LARGE_DATA_DISPLAY_MAX_DIM,
     build_large_data_profile,
@@ -53,6 +56,159 @@ from takefits.logic.data_tools import (
     is_lazy_scaled,
     sanitize_slice,
 )
+
+CHANNEL_SLIDER_STYLE = """
+QSlider::groove:horizontal {{
+    background: {track};
+    border: 0px;
+    border-radius: 3px;
+    height: 5px;
+}}
+QSlider::sub-page:horizontal {{
+    background: {track};
+    border: 0px;
+    border-radius: 3px;
+}}
+QSlider::add-page:horizontal {{
+    background: {track};
+    border: 0px;
+    border-radius: 3px;
+}}
+QSlider::handle:horizontal {{
+    background: {handle};
+    border: 1px solid {border};
+    border-radius: 3px;
+    margin: -7px 0px;
+    width: 6px;
+}}
+QSlider::handle:horizontal:hover {{
+    background: {handle_hover};
+    border: 1px solid {hover_border};
+}}
+"""
+
+
+def _allow_compact_line_edit(line_edit: QLineEdit, *, minimum_width: int = 55, maximum_width: int = 90) -> None:
+    line_edit.setMinimumWidth(minimum_width)
+    line_edit.setMaximumWidth(maximum_width)
+    line_edit.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+
+def _mix_qcolors(base: QColor, accent: QColor, ratio: float) -> QColor:
+    ratio = min(1.0, max(0.0, ratio))
+    inverse = 1.0 - ratio
+    return QColor(
+        round(base.red() * inverse + accent.red() * ratio),
+        round(base.green() * inverse + accent.green() * ratio),
+        round(base.blue() * inverse + accent.blue() * ratio),
+    )
+
+
+def _qss_color(color: QColor) -> str:
+    return color.name(QColor.NameFormat.HexRgb)
+
+
+class ChannelSlider(QSlider):
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self.setObjectName("slider")
+        self._tick_color = QColor("#b3b3b3")
+        self._applying_palette_style = False
+        self.setMinimumHeight(30)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.apply_palette_style()
+
+    def event(self, event):
+        if not self._applying_palette_style and event.type() in (
+            QEvent.Type.ApplicationPaletteChange,
+            QEvent.Type.PaletteChange,
+            QEvent.Type.StyleChange,
+        ):
+            self.apply_palette_style()
+        return super().event(event)
+
+    def apply_palette_style(self):
+        palette = self.palette()
+        window = palette.color(QPalette.ColorRole.Window)
+        text = palette.color(QPalette.ColorRole.WindowText)
+        light_mode = window.lightness() >= 128
+
+        if light_mode:
+            track = _mix_qcolors(window, text, 0.12)
+            handle = _mix_qcolors(window, QColor("#ffffff"), 0.78)
+            handle_hover = _mix_qcolors(handle, QColor("#ffffff"), 0.45)
+            border = _mix_qcolors(window, text, 0.10)
+            hover_border = _mix_qcolors(window, text, 0.18)
+            tick = _mix_qcolors(window, text, 0.28)
+        else:
+            track = _mix_qcolors(window, text, 0.22)
+            handle = _mix_qcolors(window, text, 0.30)
+            handle_hover = _mix_qcolors(handle, text, 0.10)
+            border = _mix_qcolors(window, text, 0.28)
+            hover_border = _mix_qcolors(window, text, 0.42)
+            tick = _mix_qcolors(window, text, 0.48)
+
+        self._tick_color = tick
+        style = CHANNEL_SLIDER_STYLE.format(
+            track=_qss_color(track),
+            handle=_qss_color(handle),
+            handle_hover=_qss_color(handle_hover),
+            border=_qss_color(border),
+            hover_border=_qss_color(hover_border),
+        )
+        if self.styleSheet() != style:
+            self._applying_palette_style = True
+            try:
+                self.setStyleSheet(style)
+            finally:
+                self._applying_palette_style = False
+        self.update()
+
+    def paintEvent(self, event):
+        self._draw_ticks()
+        super().paintEvent(event)
+
+    def _draw_ticks(self):
+        if self.orientation() != Qt.Orientation.Horizontal:
+            return
+
+        minimum = int(self.minimum())
+        maximum = int(self.maximum())
+        if maximum <= minimum:
+            return
+        interval = int(self.tickInterval() or self.singleStep() or 1)
+        if interval <= 0:
+            return
+
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider,
+            option,
+            QStyle.SubControl.SC_SliderGroove,
+            self,
+        )
+        if not groove.isValid() or groove.width() <= 0:
+            return
+
+        painter = QPainter(self)
+        painter.setPen(QPen(self._tick_color, 1))
+        y0 = min(self.height() - 8, groove.bottom() + 11)
+        y1 = min(self.height() - 3, y0 + 5)
+        span = max(1, groove.width())
+
+        tick = minimum
+        while tick <= maximum:
+            offset = QStyle.sliderPositionFromValue(minimum, maximum, tick, span, option.upsideDown)
+            x = groove.left() + offset
+            painter.drawLine(x, y0, x, y1)
+            tick += interval
+        if (maximum - minimum) % interval:
+            offset = QStyle.sliderPositionFromValue(minimum, maximum, maximum, span, option.upsideDown)
+            x = groove.left() + offset
+            painter.drawLine(x, y0, x, y1)
+
 
 class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
     position_updated = pyqtSignal(float, float, float)
@@ -1409,6 +1565,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
        
         self.toolbar = MyNavigationToolbar(self.canvas, self, self.plane, self.ax, default_image_name = self.filename)
+        self.toolbar.setMinimumWidth(0)
+        self.toolbar.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         #self.canvas.mpl_connect('motion_notify_event', self.update_toolbar_message)
 
         # Add matplotlib widget to a window
@@ -1425,8 +1583,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         has_depth = self.wcs.naxis > 2 and 'NAXIS3' in self.header
         if has_depth:
             self.canvas.mpl_connect('scroll_event', self.scroll_slider_mpl)
-            self.slider = QSlider(Qt.Orientation.Horizontal)
-            self.slider.setTickPosition(QSlider.TickPosition.TicksAbove)
+            self.slider = ChannelSlider(Qt.Orientation.Horizontal)
+            self.slider.setTickPosition(QSlider.TickPosition.NoTicks)
             #self.slider = QScrollBar(Qt.Orientation.Horizontal)
 
             self.current_value_label = QLabel("1") 
@@ -1447,7 +1605,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.slider.valueChanged.connect(self.scroll_slider)
         
             self.chval_box.setObjectName("chval_vox")
-            self.chval_box.setMaximumWidth(80)
+            _allow_compact_line_edit(self.chval_box, minimum_width=45, maximum_width=80)
             if self.plane in ("xz", "zy"):
                 self.chval_box.setToolTip("Slice value is interpreted in the cube axis frame.")
             init_z = self.format_pix.convert_chpix_to_world(self.plane, 0, 0, 0)
@@ -1489,16 +1647,15 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.xr_label.setFixedWidth(11)
             self.x_min_input = QLineEdit(self)
             self.x_min_input.setPlaceholderText("X min value")
-            
-            self.x_min_input.setFixedWidth(90)
+            _allow_compact_line_edit(self.x_min_input)
             self.x_min_input.returnPressed.connect(self.set_x_range)
             self.x_max_input = QLineEdit(self)
             self.x_max_input.setPlaceholderText("X max value")
-            self.x_max_input.setFixedWidth(90)
+            _allow_compact_line_edit(self.x_max_input)
             self.x_max_input.returnPressed.connect(self.set_x_range)
             self.x_button = QPushButton('Set X', self)
             self.x_button.clicked.connect(self.set_x_range)
-            self.x_button.setFixedWidth(45)
+            fit_button_to_text(self.x_button)
             
             self.state.update_xrange_input(self.x_min_input, self.x_max_input)
 
@@ -1513,16 +1670,15 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.yr_label.setFixedWidth(11)
             self.y_min_input = QLineEdit(self)
             self.y_min_input.setPlaceholderText("Y min value")
-            
-            self.y_min_input.setFixedWidth(90)
+            _allow_compact_line_edit(self.y_min_input)
             self.y_min_input.returnPressed.connect(self.set_y_range)
             self.y_max_input = QLineEdit(self)
             self.y_max_input.setPlaceholderText("Y max value")
-            self.y_max_input.setFixedWidth(90)
+            _allow_compact_line_edit(self.y_max_input)
             self.y_max_input.returnPressed.connect(self.set_y_range)
             self.y_button = QPushButton('Set Y', self)
             self.y_button.clicked.connect(self.set_y_range)
-            self.y_button.setFixedWidth(45)
+            fit_button_to_text(self.y_button)
     
             self.state.update_yrange_input(self.y_min_input, self.y_max_input)
 
@@ -1537,16 +1693,15 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.zr_label.setFixedWidth(11)
             self.z_min_input = QLineEdit(self)
             self.z_min_input.setPlaceholderText("Z min value")
-            
-            self.z_min_input.setFixedWidth(90)
+            _allow_compact_line_edit(self.z_min_input)
             self.z_min_input.returnPressed.connect(self.set_z_range)
             self.z_max_input = QLineEdit(self)
             self.z_max_input.setPlaceholderText("Z max value")
-            self.z_max_input.setFixedWidth(90)
+            _allow_compact_line_edit(self.z_max_input)
             self.z_max_input.returnPressed.connect(self.set_z_range)
             self.z_button = QPushButton('Set Z', self)
             self.z_button.clicked.connect(self.set_z_range)
-            self.z_button.setFixedWidth(45)
+            fit_button_to_text(self.z_button)
 
             self.state.update_zrange_input(self.z_min_input, self.z_max_input)
 

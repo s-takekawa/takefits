@@ -181,6 +181,7 @@ class ContourParameters:
     level_min: Optional[float] = None
     level_max: Optional[float] = None
     level_step: Optional[float] = None
+    levels: Optional[List[float]] = None
     smoothing: float = 0.0
     linewidth: float = 1.0
     color: str = "white"
@@ -190,6 +191,7 @@ class ContourParameters:
             level_min=self.level_min,
             level_max=self.level_max,
             level_step=self.level_step,
+            levels=list(self.levels) if self.levels is not None else None,
             smoothing=self.smoothing,
             linewidth=self.linewidth,
             color=self.color,
@@ -906,6 +908,22 @@ class ContourLayer:
         data_min: float,
         data_max: float,
     ) -> Optional[List[float]]:
+        if params.levels is not None:
+            ordered: List[float] = []
+            values: List[float] = []
+            for level in params.levels:
+                try:
+                    value = float(level)
+                except Exception:
+                    continue
+                if not np.isfinite(value):
+                    continue
+                values.append(value)
+            for value in sorted(values):
+                if not ordered or not math.isclose(ordered[-1], value):
+                    ordered.append(value)
+            return ordered or None
+
         vmin = params.level_min if params.level_min is not None else data_min
         vmax = params.level_max if params.level_max is not None else data_max
         if vmin > vmax:
@@ -1574,6 +1592,7 @@ def serialize_state_to_json(state: ContourState) -> str:
             "level_min": state.parameters.level_min,
             "level_max": state.parameters.level_max,
             "level_step": state.parameters.level_step,
+            "levels": list(state.parameters.levels) if state.parameters.levels is not None else None,
             "smoothing": state.parameters.smoothing,
             "linewidth": state.parameters.linewidth,
             "color": state.parameters.color,
@@ -1600,6 +1619,7 @@ def deserialize_state_from_json(data: str) -> ContourState:
         level_min=params_payload.get("level_min"),
         level_max=params_payload.get("level_max"),
         level_step=params_payload.get("level_step"),
+        levels=params_payload.get("levels"),
         smoothing=float(params_payload.get("smoothing", 0.0)),
         linewidth=float(params_payload.get("linewidth", 1.0)),
         color=params_payload.get("color", "white"),

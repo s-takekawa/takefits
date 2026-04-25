@@ -10,12 +10,29 @@ import sys
 import warnings
 from types import SimpleNamespace
 
-from takefits.core.version import APP_NAME, APP_VERSION
+if __package__ in {None, ""}:
+    # Support direct script execution from a source checkout via a symlinked launcher.
+    checkout_root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if checkout_root not in sys.path:
+        sys.path.insert(0, checkout_root)
+
+from takefits.core.version import APP_DISPLAY_VERSION, APP_NAME, APP_VERSION_TEXT
 
 
-def _build_argument_parser() -> argparse.ArgumentParser:
+def _resolve_prog(argv=None, prog: str | None = None) -> str:
+    if prog:
+        return prog
+    if argv is not None:
+        return "takefits"
+    candidate = os.path.basename(sys.argv[0] or "").strip()
+    if not candidate or candidate in {"__main__.py", "main.py"}:
+        return "takefits"
+    return candidate
+
+
+def _build_argument_parser(*, prog: str = "takefits") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="takefits",
+        prog=prog,
         description="GUI-based astronomical FITS viewer and analysis tool.",
     )
     parser.add_argument(
@@ -26,7 +43,7 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"{APP_NAME} version {APP_VERSION}",
+        version=APP_VERSION_TEXT,
     )
     return parser
 
@@ -182,12 +199,12 @@ def choose_fits_file(runtime):
 def launch_gui(filename: str | None, workspace_path: str | None) -> int:
     runtime = _load_gui_runtime()
 
-    print(f"{APP_NAME} version {APP_VERSION}")
+    print(APP_VERSION_TEXT)
 
     app = runtime.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
-    app.setApplicationVersion(APP_VERSION)
+    app.setApplicationVersion(APP_DISPLAY_VERSION)
     app.setOrganizationName("takefits")
 
     runtime.RegisterColor()
@@ -259,8 +276,8 @@ def launch_gui(filename: str | None, workspace_path: str | None) -> int:
     return app.exec()
 
 
-def main(argv=None, *, gui_launcher=None) -> int:
-    parser = _build_argument_parser()
+def main(argv=None, *, gui_launcher=None, prog: str | None = None) -> int:
+    parser = _build_argument_parser(prog=_resolve_prog(argv=argv, prog=prog))
     args = parser.parse_args(argv)
 
     filename = None
@@ -278,6 +295,10 @@ def main(argv=None, *, gui_launcher=None) -> int:
     if gui_launcher is None:
         gui_launcher = launch_gui
     return int(gui_launcher(filename, workspace_path) or 0)
+
+
+def main_dev(argv=None, *, gui_launcher=None) -> int:
+    return main(argv, gui_launcher=gui_launcher, prog="takefits-dev")
 
 
 if __name__ == "__main__":

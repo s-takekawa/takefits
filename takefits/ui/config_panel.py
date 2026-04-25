@@ -9,6 +9,8 @@ import yaml
 import os
 import math
 
+from takefits.ui.widget_sizing import fit_button_to_text
+
 
 
 class CircularSpinBox(QSpinBox):
@@ -213,26 +215,26 @@ class ConfigPanel(QWidget):
 
         self.apply_button = QPushButton('Apply', self)
         self.apply_button.clicked.connect(self.apply_changes)
-        self.apply_button.setFixedWidth(50) 
+        fit_button_to_text(self.apply_button, minimum_width=50)
         self.apply_button.setAutoDefault(True)
         self.apply_button.setDefault(True)
         button_layout.addWidget(self.apply_button)
 
         self.reset_button = QPushButton('Reset', self)
         self.reset_button.clicked.connect(self.reset_to_loaded_config)
-        self.reset_button.setFixedWidth(50) 
+        fit_button_to_text(self.reset_button, minimum_width=50)
         button_layout.addWidget(self.reset_button)
         
         
         button_layout.addSpacing(50)  
         self.default_button = QPushButton('Default', self)
         self.default_button.clicked.connect(self.reset_to_default)
-        self.default_button.setFixedWidth(80) 
+        fit_button_to_text(self.default_button, minimum_width=80)
         button_layout.addWidget(self.default_button)
 
         self.save_button = QPushButton('Save', self)
         self.save_button.clicked.connect(self.save_config)
-        self.save_button.setFixedWidth(80)
+        fit_button_to_text(self.save_button, minimum_width=80)
         button_layout.addWidget(self.save_button)
         
 
@@ -297,14 +299,14 @@ class ConfigPanel(QWidget):
         window_layout.addWidget(self.figure_pos_y_input, 1, 1)
 
         self.figure_width_input = QSpinBox()
-        self.figure_width_input.setRange(640, 9999)
+        self.figure_width_input.setRange(579, 9999)
         self.figure_width_input.setValue(self.config_manager.config.get('figure_width', 640))
         self.figure_width_input.setFixedWidth(100)
         window_layout.addWidget(QLabel('Figure Width:'), 2, 0)
         window_layout.addWidget(self.figure_width_input, 2, 1)
 
         self.figure_height_input = QSpinBox()
-        self.figure_height_input.setRange(115, 9999)
+        self.figure_height_input.setRange(100, 9999)
         self.figure_height_input.setValue(self.config_manager.config.get('figure_height', 640))
         self.figure_height_input.setFixedWidth(100)
         window_layout.addWidget(QLabel('Figure Height:'), 3, 0)
@@ -896,7 +898,7 @@ class ConfigPanel(QWidget):
         auto_layout.addWidget(self.cbar_auto_layout_checkbox, auto_row, 0)
 
         self.cbar_fit_now_button = QPushButton("Fit now")
-        self.cbar_fit_now_button.setFixedWidth(100)
+        fit_button_to_text(self.cbar_fit_now_button, minimum_width=100)
         auto_layout.addWidget(self.cbar_fit_now_button, auto_row, 1)
         auto_row += 1
 

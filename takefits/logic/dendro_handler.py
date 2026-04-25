@@ -1,5 +1,6 @@
 from astrodendro import Dendrogram, pp_catalog, ppv_catalog
 from astropy import units as u
+from astropy.table import Column, Table
 import numpy as np
 import warnings
 
@@ -65,6 +66,108 @@ class DendroHandler:
         self.clusters = []
         self.catalog_cache = None
 
+    @staticmethod
+    def _classify_axis_type(ctype: str) -> str:
+        """Return a simple classification for a FITS CTYPE value."""
+        if not ctype:
+            return 'unknown'
+        upper = str(ctype).upper()
+        if 'FREQ' in upper:
+            return 'frequency'
+        if any(tag in upper for tag in ('VRAD', 'VELO', 'VOPT')):
+            return 'velocity'
+        return 'unknown'
+
+    def _identify_spectral_axis(self) -> int | None:
+        """Identify the first spectral-like FITS axis (1-based)."""
+        if self.header is None:
+            return None
+        try:
+            naxis = int(self.header.get('NAXIS', 0))
+        except (TypeError, ValueError):
+            return None
+        for axis in range(1, naxis + 1):
+            ctype = self.header.get(f'CTYPE{axis}', '')
+            if self._classify_axis_type(ctype) != 'unknown':
+                return axis
+        return None
+
+    def _build_catalog_metadata(self):
+        """Build astrodendro metadata for catalog generation."""
+        metadata = {'data_unit': u.Jy / u.beam, 'wavelength': 1.0 * u.mm}
+
+        if self.wcs:
+            from astropy.wcs.utils import proj_plane_pixel_scales
+            scales = proj_plane_pixel_scales(self.wcs)
+            if len(scales) >= 2:
+                avg_scale = np.sqrt(scales[0] * scales[1])
+                try:
+                    is_quantity = isinstance(1 * avg_scale, u.Quantity)
+                except Exception:
+                    is_quantity = False
+                if is_quantity:
+                    metadata['spatial_scale'] = avg_scale
+                else:
+                    metadata['spatial_scale'] = float(avg_scale) * u.deg
+            elif self.header and 'CDELT2' in self.header:
+                metadata['spatial_scale'] = abs(float(self.header['CDELT2'])) * u.deg
+            else:
+                metadata['spatial_scale'] = None
+
+        if self.header:
+            bmaj = self.header.get('BMAJ')
+            bmin = self.header.get('BMIN')
+            if bmaj:
+                metadata['beam_major'] = float(bmaj) * u.deg
+            else:
+                metadata['beam_major'] = 0.01 * u.deg
+
+            if bmin:
+                metadata['beam_minor'] = float(bmin) * u.deg
+            else:
+                metadata['beam_minor'] = metadata['beam_major']
+        else:
+            metadata['beam_major'] = 0.01 * u.deg
+            metadata['beam_minor'] = 0.01 * u.deg
+
+        if self.data.ndim == 3:
+            metadata['velocity_scale'] = 1.0 * u.km / u.s
+            spec_axis = self._identify_spectral_axis()
+            if spec_axis is not None:
+                vaxis = self.data.ndim - int(spec_axis)
+                if 0 <= vaxis < self.data.ndim:
+                    metadata['vaxis'] = int(vaxis)
+
+        return metadata
+
+    def _build_native_catalog_table(self):
+        """Safely build an astrodendro catalog table."""
+        if self.d is None:
+            return None
+
+        try:
+            if len(self.d) == 0:
+                return Table()
+        except Exception:
+            pass
+
+        metadata = self._build_catalog_metadata()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=UserWarning)
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            try:
+                if self.data.ndim == 3:
+                    cat = ppv_catalog(self.d, metadata)
+                else:
+                    cat = pp_catalog(self.d, metadata)
+            except AttributeError as exc:
+                if "'NoneType' object has no attribute 'sort'" not in str(exc):
+                    raise
+                cat = None
+
+        return cat if cat is not None else Table()
+
     def run_dendrogram(self, min_value, min_delta, min_npix):
         """
         Run astrodendro.
@@ -100,94 +203,17 @@ class DendroHandler:
             # Import SCIMES from the bundled location
             from takefits.logic.scimes import SpectralCloudstering
 
-            # scimes needs a pp_catalog-like object and header
-            # Generate pp_catalog
-            # Standard SCIMES execution with physical units (if WCS available)
-            # This is the "correct" way to run SCIMES, even if it differs from Fscimes.py (pixel units).
-            
-            # Generate pp_catalog
-            metadata = {}
-            metadata['data_unit'] = u.Jy / u.beam
-            
-            # Compute spatial_scale from WCS to allow Jy/beam -> Jy conversion
-            if self.wcs:
-                from astropy.wcs.utils import proj_plane_pixel_scales
-                scales = proj_plane_pixel_scales(self.wcs)
-                # scales are usually in degrees if CTYPE is RA/DEC
-                # We assume square pixels or take the geometric mean
-                if len(scales) >= 2:
-                    avg_scale = np.sqrt(scales[0] * scales[1])
-                    try:
-                        is_quantity = isinstance(1 * avg_scale, u.Quantity)
-                    except Exception:
-                        is_quantity = False
-                    if is_quantity:
-                        metadata['spatial_scale'] = avg_scale
-                    else:
-                        metadata['spatial_scale'] = float(avg_scale) * u.deg
-                else:
-                    # Fallback if WCS is weird: try CDELT2; otherwise leave unset so astrodendro uses pixels.
-                    if self.header and 'CDELT2' in self.header:
-                         metadata['spatial_scale'] = abs(float(self.header['CDELT2'])) * u.deg
-                    else:
-                         metadata['spatial_scale'] = None
-            
-            metadata['wavelength'] = 1.0 * u.mm
+            structure_count = len(self.d)
+            leaf_count = len(self.leaves)
+            if structure_count == 0 or leaf_count == 0:
+                self.clusters = []
+                return True, "No dendrogram structures found; SCIMES was skipped."
 
-            # Check for Beam info in header (Common for 2D and 3D if flux density)
-            if self.header:
-                bmaj = self.header.get('BMAJ')
-                bmin = self.header.get('BMIN')
-                if bmaj:
-                    metadata['beam_major'] = float(bmaj) * u.deg
-                else:
-                    metadata['beam_major'] = 0.01 * u.deg # Dummy fallback
-
-                if bmin:
-                    metadata['beam_minor'] = float(bmin) * u.deg
-                else:
-                    metadata['beam_minor'] = metadata['beam_major']
-            else:
-                metadata['beam_major'] = 0.01 * u.deg
-                metadata['beam_minor'] = 0.01 * u.deg
-
-            if self.data.ndim == 3:
-                metadata['velocity_scale'] = 1.0 * u.km / u.s
-
-            def _classify_axis_type(ctype: str) -> str:
-                """Return a simple classification ('frequency', 'velocity', or 'unknown') for a CTYPE value."""
-                if not ctype:
-                    return 'unknown'
-                upper = str(ctype).upper()
-                if 'FREQ' in upper:
-                    return 'frequency'
-                if any(tag in upper for tag in ('VRAD', 'VELO', 'VOPT')):
-                    return 'velocity'
-                return 'unknown'
-
-            def _identify_spectral_axis(header) -> int | None:
-                """Identify the first spectral-like FITS axis (1-based)."""
-                if header is None:
-                    return None
-                try:
-                    naxis = int(header.get('NAXIS', 0))
-                except (TypeError, ValueError):
-                    return None
-                for axis in range(1, naxis + 1):
-                    ctype = header.get(f'CTYPE{axis}', '')
-                    if _classify_axis_type(ctype) != 'unknown':
-                        return axis
-                return None
-
-            # Using astrodendro pp_catalog/ppv_catalog to generate table.
-            # The PPV catalog needs `vaxis` metadata in numpy convention (0-based).
-            if self.data.ndim == 3:
-                spec_axis = _identify_spectral_axis(self.header)
-                if spec_axis is not None:
-                    # FITS axis N maps to numpy axis (ndim - N).
-                    vaxis = self.data.ndim - int(spec_axis)
-                    if 0 <= vaxis < self.data.ndim:
-                        metadata['vaxis'] = int(vaxis)
+            # SCIMES assumes a non-trivial affinity matrix. Mirror its intended
+            # small-N fallback locally instead of letting the vendored code fail.
+            if leaf_count <= 2:
+                self.clusters = list(self.leaves)
+                return True, f"Only {leaf_count} dendrogram leaves found; each leaf was kept as its own cluster."
 
             # Default criteria if not provided
             if criteria is None or len(criteria) == 0:
@@ -201,14 +227,12 @@ class DendroHandler:
             if self.catalog_cache is not None:
                 cat = self.catalog_cache
             else:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", category=UserWarning)
-                    warnings.simplefilter("ignore", category=RuntimeWarning)
-                    if self.data.ndim == 3:
-                        cat = ppv_catalog(self.d, metadata)
-                    else:
-                        cat = pp_catalog(self.d, metadata)
+                cat = self._build_native_catalog_table()
                 self.catalog_cache = cat
+
+            if cat is None or len(cat) == 0:
+                self.clusters = []
+                return True, "SCIMES was skipped because the dendrogram catalog is empty."
 
             # Strip units from catalog for SCIMES compatibility
             # SCIMES 0.3.2+ / astrodendro interaction issues can cause scaling parameters to be ~1.0
@@ -375,57 +399,12 @@ class DendroHandler:
         if self.catalog_cache is not None:
             return self.catalog_cache
 
-        # Generate catalog if missing
-        # We need to reconstruct metadata logic here or reuse it.
-        # Ideally, we should factor out metadata generation.
-        # For now, duplicate or minimal reconstruction.
-        
-        metadata = {}
-        metadata['data_unit'] = u.Jy / u.beam
-        metadata['spatial_scale'] =  1.0 * u.deg
-        metadata['wavelength'] = 1.0 * u.mm
-
-        # Header parsing
-        if self.header:
-            bmaj = self.header.get('BMAJ')
-            bmin = self.header.get('BMIN')
-            if bmaj:
-                metadata['beam_major'] = float(bmaj) * u.deg
-            else:
-                metadata['beam_major'] = 0.01 * u.deg
-            if bmin:
-                metadata['beam_minor'] = float(bmin) * u.deg
-            else:
-                metadata['beam_minor'] = metadata['beam_major']
-        else:
-            metadata['beam_major'] = 0.01 * u.deg
-            metadata['beam_minor'] = 0.01 * u.deg
-
-        if self.data.ndim == 3:
-            metadata['velocity_scale'] = 1.0 * u.km / u.s
-            # Minimal spectral axis detection
-            # (Simplified version of run_scimes logic)
-            if self.header:
-                 try:
-                     naxis = int(self.header.get('NAXIS', 0))
-                     for axis in range(1, naxis + 1):
-                         ctype = self.header.get(f'CTYPE{axis}', '').upper()
-                         if 'FREQ' in ctype or 'VELO' in ctype or 'VRAD' in ctype:
-                             # Map to numpy axis (ndim - axis)
-                             vaxis = self.data.ndim - int(axis)
-                             if 0 <= vaxis < self.data.ndim:
-                                 metadata['vaxis'] = int(vaxis)
-                             break
-                 except Exception:
-                     pass
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=UserWarning)
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            if self.data.ndim == 3:
-                cat = ppv_catalog(self.d, metadata)
-            else:
-                cat = pp_catalog(self.d, metadata)
+        cat = self._build_native_catalog_table()
+        if cat is None:
+            return None
+        if len(cat) == 0:
+            self.catalog_cache = cat
+            return cat
         
         # Add topological classification
         # We need to map back from catalog index to Structure object.
@@ -488,7 +467,6 @@ class DendroHandler:
                      col_data = [r.get(key, np.nan) for r in rows_data]
                      cat.add_column(Column(col_data, name=key))
              
-             from astropy.table import Column
              cat.add_column(Column(structure_types, name='structure_type'))
 
 
