@@ -157,19 +157,24 @@ class ConfigManager:
             with open(self.config_file, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
         except FileNotFoundError:
-            config = self.default_config
+            config = copy.deepcopy(self.default_config)
             os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
         except Exception as e:
             print(f"\033[91mFailed to load config file: {e}\033[0m")
-            config = self.default_config
+            config = copy.deepcopy(self.default_config)
         if isinstance(config, dict):
             if 'range_file' not in config and 'region_file' in config:
                 config['range_file'] = config.pop('region_file')
+            merged_config = copy.deepcopy(self.default_config)
+            merged_config.update(config)
+            config = merged_config
             # Backward compatibility: legacy "match" behaves as full-length ratio.
             mode = str(config.get('colorbar_length_mode', '') or '').strip().lower()
             if mode == 'match':
                 config['colorbar_length_mode'] = 'ratio'
                 config['colorbar_length_value'] = 1.0
+        else:
+            config = copy.deepcopy(self.default_config)
         return config

@@ -4,9 +4,128 @@ import math
 from PySide6.QtCore import Qt, Signal as pyqtSignal, QObject
 from .region import Region
 from astropy.wcs.utils import proj_plane_pixel_scales, wcs_to_celestial_frame
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import Angle, SkyCoord
 import astropy.units as u
-from .wcs_frames import celestial_axis_indices
+from .wcs_frames import celestial_axis_indices, normalize_display_frame, parse_world_value
+
+
+_DS9_IMAGE_COORD_SYSTEMS = {"image", "physical", "pixel"}
+_DS9_WORLD_COORD_SYSTEMS = {"fk5", "fk4", "icrs", "galactic"}
+
+
+def _split_ds9_commands(text: str) -> list[str]:
+    commands: list[str] = []
+    current: list[str] = []
+    brace_depth = 0
+    quote_char = None
+
+    for char in text:
+        if quote_char is not None:
+            current.append(char)
+            if char == quote_char:
+                quote_char = None
+            continue
+        if char in {'"', "'"}:
+            quote_char = char
+            current.append(char)
+            continue
+        if char == "{":
+            brace_depth += 1
+            current.append(char)
+            continue
+        if char == "}":
+            brace_depth = max(brace_depth - 1, 0)
+            current.append(char)
+            continue
+        if brace_depth == 0 and char in {";", "\n", "\r"}:
+            segment = "".join(current).strip()
+            if segment:
+                commands.append(segment)
+            current = []
+            continue
+        current.append(char)
+
+    tail = "".join(current).strip()
+    if tail:
+        commands.append(tail)
+    return commands
+
+
+def _parse_ds9_properties(text: str) -> dict[str, str]:
+    props: dict[str, str] = {}
+    idx = 0
+    length = len(text)
+
+    while idx < length:
+        while idx < length and text[idx].isspace():
+            idx += 1
+        key_start = idx
+        while idx < length and (text[idx].isalnum() or text[idx] in {"_", "-"}):
+            idx += 1
+        if idx == key_start:
+            idx += 1
+            continue
+        key = text[key_start:idx].lower()
+        while idx < length and text[idx].isspace():
+            idx += 1
+        if idx >= length or text[idx] != "=":
+            continue
+        idx += 1
+        while idx < length and text[idx].isspace():
+            idx += 1
+        if idx >= length:
+            props[key] = ""
+            break
+        if text[idx] in {'"', "'"}:
+            quote_char = text[idx]
+            idx += 1
+            value_start = idx
+            while idx < length and text[idx] != quote_char:
+                idx += 1
+            props[key] = text[value_start:idx]
+            if idx < length:
+                idx += 1
+            continue
+        if text[idx] == "{":
+            idx += 1
+            value_start = idx
+            brace_depth = 1
+            while idx < length and brace_depth > 0:
+                if text[idx] == "{":
+                    brace_depth += 1
+                elif text[idx] == "}":
+                    brace_depth -= 1
+                    if brace_depth == 0:
+                        break
+                idx += 1
+            props[key] = text[value_start:idx].strip()
+            if idx < length and text[idx] == "}":
+                idx += 1
+            continue
+        value_start = idx
+        while idx < length and not text[idx].isspace():
+            idx += 1
+        props[key] = text[value_start:idx]
+    return props
+
+
+def _split_ds9_shape_and_props(command: str) -> tuple[str, dict[str, str]]:
+    shape_text, sep, props_text = command.partition("#")
+    props = _parse_ds9_properties(props_text) if sep else {}
+    return shape_text.strip(), props
+
+
+def _split_ds9_arguments(text: str) -> list[str]:
+    if "," in text:
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return [part.strip() for part in text.split() if part.strip()]
+
+
+def _parse_takefits_metadata_comment(command: str) -> dict[str, str] | None:
+    prefix = "# takefits:"
+    if not command.lower().startswith(prefix):
+        return None
+    return _parse_ds9_properties(command[len(prefix):].strip())
 
 class RegionManager(QObject):
     """
@@ -1183,22 +1302,258 @@ class RegionManager(QObject):
         except Exception:
             return None
 
-    def _rotation_transform(self, angle_deg: float, source_frame: str | None, target_frame) -> float:
-        """
-        Approximate rotation transform between frames.
-        Assumes small-angle local projection; if frames differ, reuse the same angle.
-        """
-        if source_frame is None or target_frame is None:
-            return angle_deg
+    def _offset_world_point_in_source_frame(
+        self,
+        center_world,
+        source_frame: str | None,
+        dx_deg: float,
+        dy_deg: float,
+    ) -> tuple[float, float] | None:
+        if center_world is None:
+            return None
         try:
-            src_name = str(source_frame).lower()
-            tgt_name = str(getattr(target_frame, "name", None) or target_frame.__class__.__name__).lower()
-            if src_name == tgt_name:
-                return angle_deg
+            # DS9 defines WCS box/ellipse sizes in local angular units, not raw
+            # longitude-coordinate deltas, so longitude offsets need cos(lat).
+            lat0 = float(center_world[1])
+            cos_lat = max(abs(math.cos(math.radians(lat0))), 1e-8)
+            lon = float(center_world[0]) + (float(dx_deg) / cos_lat)
+            lat = lat0 + float(dy_deg)
+            if source_frame:
+                sky = SkyCoord(lon * u.deg, lat * u.deg, frame=source_frame.lower())
+                return (float(sky.spherical.lon.deg), float(sky.spherical.lat.deg))
+            return (lon, lat)
         except Exception:
-            return angle_deg
-        # Fallback: keep the angle; refining would require Jacobian at center.
-        return angle_deg
+            return None
+
+    def _project_source_frame_offset_to_pixel(
+        self,
+        center_world,
+        source_frame: str | None,
+        plane: str,
+        wcs,
+        *,
+        dx_deg: float,
+        dy_deg: float,
+        world_context=None,
+    ) -> tuple[float, float] | None:
+        offset_world = self._offset_world_point_in_source_frame(center_world, source_frame, dx_deg, dy_deg)
+        if offset_world is None:
+            return None
+        return self._world_center_to_pix(
+            offset_world,
+            source_frame,
+            plane,
+            wcs,
+            world_context=world_context,
+        )
+
+    def _source_frame_handedness(
+        self,
+        center_world,
+        source_frame: str | None,
+        plane: str,
+        wcs,
+        *,
+        world_context=None,
+        center_pix=None,
+    ) -> int:
+        if center_world is None or wcs is None:
+            return 1
+        if center_pix is None:
+            center_pix = self._world_center_to_pix(center_world, source_frame, plane, wcs, world_context=world_context)
+        if center_pix is None:
+            return 1
+        try:
+            x_pix = self._project_source_frame_offset_to_pixel(
+                center_world,
+                source_frame,
+                plane,
+                wcs,
+                dx_deg=1.0 / 3600.0,
+                dy_deg=0.0,
+                world_context=world_context,
+            )
+            y_pix = self._project_source_frame_offset_to_pixel(
+                center_world,
+                source_frame,
+                plane,
+                wcs,
+                dx_deg=0.0,
+                dy_deg=1.0 / 3600.0,
+                world_context=world_context,
+            )
+            if x_pix is None or y_pix is None:
+                return 1
+            vx = (float(x_pix[0] - center_pix[0]), float(x_pix[1] - center_pix[1]))
+            vy = (float(y_pix[0] - center_pix[0]), float(y_pix[1] - center_pix[1]))
+            cross = (vx[0] * vy[1]) - (vx[1] * vy[0])
+            return 1 if cross >= 0 else -1
+        except Exception:
+            return 1
+
+    def _source_frame_pixel_context(
+        self,
+        center_world,
+        source_frame: str | None,
+        plane: str,
+        wcs,
+        *,
+        world_context=None,
+    ) -> tuple[tuple[float, float], int] | None:
+        center_pix = self._world_center_to_pix(center_world, source_frame, plane, wcs, world_context=world_context)
+        if center_pix is None:
+            return None
+        handedness = self._source_frame_handedness(
+            center_world,
+            source_frame,
+            plane,
+            wcs,
+            world_context=world_context,
+            center_pix=center_pix,
+        )
+        return center_pix, handedness
+
+    def _source_frame_angle_offset(
+        self,
+        distance_deg: float,
+        angle_deg: float,
+        handedness: int,
+    ) -> tuple[float, float]:
+        angle_rad = math.radians(float(angle_deg))
+        distance = float(distance_deg)
+        return (
+            distance * math.cos(angle_rad),
+            distance * handedness * math.sin(angle_rad),
+        )
+
+    def _rotate_source_frame_offset(
+        self,
+        dx_deg: float,
+        dy_deg: float,
+        angle_deg: float,
+        handedness: int,
+    ) -> tuple[float, float]:
+        angle_rad = math.radians(float(angle_deg))
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        return (
+            (cos_a * float(dx_deg)) - (handedness * sin_a * float(dy_deg)),
+            (handedness * sin_a * float(dx_deg)) + (cos_a * float(dy_deg)),
+        )
+
+    def _project_world_axes_to_pixel(
+        self,
+        center_world,
+        source_frame: str | None,
+        plane: str,
+        wcs,
+        *,
+        width_half_deg: float | None = None,
+        height_half_deg: float | None = None,
+        angle_deg: float = 0.0,
+        world_context=None,
+    ) -> dict[str, tuple[float, float] | None] | None:
+        if center_world is None or wcs is None:
+            return None
+        context = self._source_frame_pixel_context(
+            center_world,
+            source_frame,
+            plane,
+            wcs,
+            world_context=world_context,
+        )
+        if context is None:
+            return None
+        center_pix, handedness = context
+
+        def _endpoint(distance_deg: float | None, region_angle_deg: float) -> tuple[float, float] | None:
+            if distance_deg is None or distance_deg <= 0:
+                return None
+            dx_deg, dy_deg = self._source_frame_angle_offset(distance_deg, region_angle_deg, handedness)
+            return self._project_source_frame_offset_to_pixel(
+                center_world,
+                source_frame,
+                plane,
+                wcs,
+                dx_deg=dx_deg,
+                dy_deg=dy_deg,
+                world_context=world_context,
+            )
+
+        return {
+            "center": center_pix,
+            "width": _endpoint(width_half_deg, angle_deg),
+            "height": _endpoint(height_half_deg, angle_deg + 90.0),
+        }
+
+    def _project_world_box_to_pixel(
+        self,
+        center_world,
+        source_frame: str | None,
+        plane: str,
+        wcs,
+        *,
+        width_deg: float,
+        height_deg: float,
+        angle_deg: float,
+        world_context=None,
+    ) -> dict[str, object] | None:
+        if center_world is None or wcs is None:
+            return None
+        context = self._source_frame_pixel_context(
+            center_world,
+            source_frame,
+            plane,
+            wcs,
+            world_context=world_context,
+        )
+        if context is None:
+            return None
+        center_pix, handedness = context
+
+        half_w = float(width_deg) / 2.0
+        half_h = float(height_deg) / 2.0
+        local_corners = [
+            (-half_w, -half_h),
+            (half_w, -half_h),
+            (half_w, half_h),
+            (-half_w, half_h),
+        ]
+        pixel_corners: list[tuple[float, float]] = []
+        for dx_local, dy_local in local_corners:
+            dx_world, dy_world = self._rotate_source_frame_offset(dx_local, dy_local, angle_deg, handedness)
+            pixel_corner = self._project_source_frame_offset_to_pixel(
+                center_world,
+                source_frame,
+                plane,
+                wcs,
+                dx_deg=dx_world,
+                dy_deg=dy_world,
+                world_context=world_context,
+            )
+            if pixel_corner is None:
+                return None
+            pixel_corners.append(pixel_corner)
+
+        p0, p1, p2, p3 = pixel_corners
+        width_vec = (
+            ((p1[0] - p0[0]) + (p2[0] - p3[0])) / 4.0,
+            ((p1[1] - p0[1]) + (p2[1] - p3[1])) / 4.0,
+        )
+        height_vec = (
+            ((p3[0] - p0[0]) + (p2[0] - p1[0])) / 4.0,
+            ((p3[1] - p0[1]) + (p2[1] - p1[1])) / 4.0,
+        )
+        width_pix = 2.0 * math.hypot(width_vec[0], width_vec[1])
+        height_pix = 2.0 * math.hypot(height_vec[0], height_vec[1])
+        angle_pix = math.degrees(math.atan2(width_vec[1], width_vec[0]))
+        return {
+            "center": center_pix,
+            "corners": pixel_corners,
+            "width": width_pix,
+            "height": height_pix,
+            "angle": angle_pix,
+        }
 
     def _transform_angle_via_center(
         self,
@@ -1212,53 +1567,486 @@ class RegionManager(QObject):
         """Transform an orientation angle using local projection around center."""
         if angle_deg is None or center_world is None or wcs is None:
             return angle_deg
-        axes = self._plane_axis_indices(plane, wcs)
-        if axes is None:
-            return angle_deg
         try:
-            # Build a small offset along the angle direction in the source frame.
-            lon, lat = center_world[:2]
-            src_frame = source_frame.lower() if source_frame else None
-            sky_center = SkyCoord(lon * u.deg, lat * u.deg, frame=src_frame) if src_frame else SkyCoord(lon * u.deg, lat * u.deg)
-            # 1 arcsec offset along angle
-            offset = sky_center.directional_offset_by(angle_deg * u.deg, 1.0 * u.arcsec)
-            tgt_frame = wcs_to_celestial_frame(wcs)
-            if tgt_frame is not None:
-                sky_center = sky_center.transform_to(tgt_frame)
-                offset = offset.transform_to(tgt_frame)
-            # Convert to pixel in target WCS
-            naxis = max(getattr(wcs, "naxis", 2), max(axes) + 1)
-            vec_center = [0.0] * naxis
-            vec_center[axes[0]] = float(sky_center.spherical.lon.deg)
-            vec_center[axes[1]] = float(sky_center.spherical.lat.deg)
-            for axis_index in range(naxis):
-                if axis_index in axes:
-                    continue
-                value = self._context_axis_value(world_context, axis_index)
-                if value is None:
-                    value = self._shared_world_axis_value(axis_index)
-                if value is not None:
-                    vec_center[axis_index] = float(value)
-            pix_c = wcs.wcs_world2pix([vec_center], 0)[0]
-            vec_off = [0.0] * naxis
-            vec_off[axes[0]] = float(offset.spherical.lon.deg)
-            vec_off[axes[1]] = float(offset.spherical.lat.deg)
-            for axis_index in range(naxis):
-                if axis_index in axes:
-                    continue
-                value = self._context_axis_value(world_context, axis_index)
-                if value is None:
-                    value = self._shared_world_axis_value(axis_index)
-                if value is not None:
-                    vec_off[axis_index] = float(value)
-            pix_o = wcs.wcs_world2pix([vec_off], 0)[0]
-            dx = float(pix_o[axes[0]] - pix_c[axes[0]])
-            dy = float(pix_o[axes[1]] - pix_c[axes[1]])
+            context = self._source_frame_pixel_context(
+                center_world,
+                source_frame,
+                plane,
+                wcs,
+                world_context=world_context,
+            )
+            if context is None:
+                return angle_deg
+            center_pix, handedness = context
+            dx_deg, dy_deg = self._source_frame_angle_offset(1.0 / 3600.0, angle_deg, handedness)
+            offset_pix = self._project_source_frame_offset_to_pixel(
+                center_world,
+                source_frame,
+                plane,
+                wcs,
+                dx_deg=dx_deg,
+                dy_deg=dy_deg,
+                world_context=world_context,
+            )
+            if offset_pix is None:
+                return angle_deg
+            dx = float(offset_pix[0] - center_pix[0])
+            dy = float(offset_pix[1] - center_pix[1])
             if math.isfinite(dx) and math.isfinite(dy) and abs(dx) + abs(dy) > 0:
                 return float(math.degrees(math.atan2(dy, dx)))
         except Exception:
             return angle_deg
         return angle_deg
+
+    def _normalize_ds9_coord_system(self, token: str | None) -> str | None:
+        if token is None:
+            return None
+        normalized = str(token).strip().lower()
+        aliases = {
+            "image": "image",
+            "pixel": "image",
+            "physical": "physical",
+            "fk5": "fk5",
+            "j2000": "fk5",
+            "icrs": "icrs",
+            "fk4": "fk4",
+            "b1950": "fk4",
+            "gal": "galactic",
+            "galactic": "galactic",
+        }
+        if normalized in aliases:
+            return aliases[normalized]
+        if normalized in {"world", "wcs"}:
+            wcs = getattr(self.viewer, "wcs", None) if self.viewer is not None else None
+            frame = normalize_display_frame(self._world_frame_from_wcs(wcs))
+            if frame in _DS9_WORLD_COORD_SYSTEMS:
+                return frame
+            return "image"
+        return None
+
+    def _ds9_axis_types(self, coord_system: str) -> tuple[str, str]:
+        if coord_system == "galactic":
+            return ("GLON", "GLAT")
+        return ("RA", "DEC")
+
+    def _ds9_truthy(self, value) -> bool:
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _style_from_ds9_properties(self, properties: dict[str, str]) -> dict[str, object]:
+        style: dict[str, object] = {"fill": False}
+        color = properties.get("color")
+        if color:
+            style["color"] = color
+        width = properties.get("width") or properties.get("linewidth")
+        if width:
+            try:
+                style["linewidth"] = max(float(width), 0.1)
+            except Exception:
+                pass
+        if self._ds9_truthy(properties.get("dash")):
+            style["linestyle"] = "dashed"
+        return style
+
+    def _parse_ds9_position_value(
+        self,
+        token: str,
+        coord_system: str,
+        axis_type: str,
+    ) -> tuple[str, float]:
+        text = str(token).strip()
+        lower = text.lower()
+        if lower.endswith(("i", "p")):
+            return ("pixel", float(text[:-1]))
+        if coord_system in _DS9_IMAGE_COORD_SYSTEMS:
+            return ("pixel", float(text))
+        value = parse_world_value(text, axis_type, frame_for_longitude=coord_system)
+        return ("world", float(value))
+
+    def _parse_ds9_size_value(self, token: str, coord_system: str) -> tuple[str, float]:
+        text = str(token).strip()
+        lower = text.lower()
+        if lower.endswith(("i", "p")):
+            return ("pixel", float(text[:-1]))
+        if coord_system in _DS9_IMAGE_COORD_SYSTEMS:
+            return ("pixel", float(text))
+        if any(char in text for char in {'"', "'", "d", "r"}):
+            return ("world", float(Angle(text).degree))
+        return ("world", float(text))
+
+    def _format_ds9_metadata_comment(self, metadata: dict[str, object]) -> str:
+        parts = []
+        for key, value in metadata.items():
+            if value is None:
+                continue
+            parts.append(f"{key}={value}")
+        return f"# takefits: {' '.join(parts)}" if parts else "# takefits:"
+
+    def _format_ds9_region_line(self, region: Region) -> str:
+        style = region.get_style_attributes() if hasattr(region, "get_style_attributes") else {}
+        color = str(style.get("color", "lime") or "lime")
+        linewidth = max(int(round(float(style.get("linewidth", 1.0) or 1.0))), 1)
+        dash = "1" if "dash" in str(style.get("linestyle", "")).lower() else "0"
+        label = getattr(region, "label_text", "") or ""
+
+        if isinstance(region, CircleRegion):
+            cx, cy = region.center
+            region_spec = f"circle({cx + 1.0:.10f},{cy + 1.0:.10f},{float(region.radius):.10f})"
+        elif isinstance(region, (RectangleRegion, CubeRegion)):
+            cx, cy = region.center
+            region_spec = (
+                f"box({cx + 1.0:.10f},{cy + 1.0:.10f},"
+                f"{float(region.width):.10f},{float(region.height):.10f},{float(getattr(region, 'angle', 0.0) or 0.0):.10f})"
+            )
+        elif isinstance(region, EllipseRegion):
+            cx, cy = region.center
+            region_spec = (
+                f"ellipse({cx + 1.0:.10f},{cy + 1.0:.10f},"
+                f"{float(region.width) / 2.0:.10f},{float(region.height) / 2.0:.10f},{float(region.angle):.10f})"
+            )
+        else:
+            raise ValueError(f"Unsupported region type for DS9 export: {region.__class__.__name__}")
+
+        props = [f"color={color}", f"width={linewidth}", f"dash={dash}"]
+        if label:
+            props.append(f"text={{{label}}}")
+        return f"{region_spec} # {' '.join(props)}"
+
+    def export_regions_to_ds9(self, plane: str | None = None) -> tuple[str, dict[str, object]]:
+        target_plane = plane.lower() if plane else None
+        exported = 0
+        flattened_cubes = 0
+        lines = [
+            "# Region file format: DS9 version 4.1",
+            'global color=lime dashlist=8 3 width=1 font="helvetica 10 normal roman" '
+            "select=1 highlite=1 dash=0 fixed=0 edit=1 move=1 delete=1 include=1 source=1",
+            "image",
+        ]
+
+        for region in self.regions:
+            plane_name = getattr(region, "plane", None) or self._plane_for_axes(region.axes)
+            if target_plane and plane_name != target_plane:
+                continue
+            metadata = {
+                "kind": self._region_kind(region),
+                "plane": plane_name,
+                "id": getattr(region, "region_id", None),
+            }
+            if isinstance(region, CubeRegion):
+                metadata["z_min"] = float(region.z_min)
+                metadata["z_max"] = float(region.z_max)
+                flattened_cubes += 1
+            lines.append(self._format_ds9_metadata_comment(metadata))
+            lines.append(self._format_ds9_region_line(region))
+            exported += 1
+
+        if exported == 0:
+            raise ValueError("No regions available to export.")
+
+        return "\n".join(lines) + "\n", {
+            "count": exported,
+            "flattened_cubes": flattened_cubes,
+            "coordinate_system": "image",
+        }
+
+    def _apply_ds9_region_id(self, region: Region, region_id) -> None:
+        if region_id is None:
+            region.region_id = RegionManager._global_region_counter
+            RegionManager._global_region_counter += 1
+            return
+        try:
+            numeric_id = int(region_id)
+        except Exception:
+            numeric_id = None
+        region.region_id = numeric_id if numeric_id is not None else region_id
+        if numeric_id is not None:
+            RegionManager._global_region_counter = max(RegionManager._global_region_counter, numeric_id + 1)
+
+    def _region_from_ds9_command(
+        self,
+        command: str,
+        coord_system: str,
+        global_properties: dict[str, str],
+        metadata: dict[str, str] | None,
+    ) -> Region | None:
+        shape_text, local_properties = _split_ds9_shape_and_props(command)
+        shape_text = shape_text.strip().lstrip("+-").replace("||", " ").strip()
+        if not shape_text:
+            return None
+
+        if "(" in shape_text and shape_text.endswith(")"):
+            name, _, arg_text = shape_text.partition("(")
+            shape_name = name.strip().lower()
+            args = _split_ds9_arguments(arg_text[:-1])
+        else:
+            parts = shape_text.split()
+            if not parts:
+                return None
+            shape_name = parts[0].strip().lower()
+            args = parts[1:]
+
+        if shape_name not in {"circle", "box", "ellipse"}:
+            return None
+
+        viewer = self.viewer
+        wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        metadata = dict(metadata or {})
+        plane = str(metadata.get("plane") or getattr(viewer, "plane", "xy") or "xy").lower()
+        axes = self._axes_for_plane(plane)
+        if axes is None:
+            return None
+
+        style_props = dict(global_properties)
+        style_props.update(local_properties)
+        style = self._style_from_ds9_properties(style_props)
+        label = local_properties.get("text") or global_properties.get("text") or ""
+        source_frame = coord_system if coord_system in _DS9_WORLD_COORD_SYSTEMS else None
+        axis_type_x, axis_type_y = self._ds9_axis_types(source_frame or "fk5")
+
+        def _angle_from_projected_axes(projected_axes, fallback_angle):
+            center_pt = projected_axes.get("center") if isinstance(projected_axes, dict) else None
+            width_pt = projected_axes.get("width") if isinstance(projected_axes, dict) else None
+            height_pt = projected_axes.get("height") if isinstance(projected_axes, dict) else None
+            if center_pt is None:
+                return fallback_angle
+            if width_pt is not None:
+                return float(math.degrees(math.atan2(width_pt[1] - center_pt[1], width_pt[0] - center_pt[0])))
+            if height_pt is not None:
+                return float(math.degrees(math.atan2(height_pt[1] - center_pt[1], height_pt[0] - center_pt[0])) - 90.0)
+            return fallback_angle
+
+        if shape_name == "circle":
+            if len(args) < 3:
+                return None
+            x_kind, x_value = self._parse_ds9_position_value(args[0], coord_system, axis_type_x)
+            y_kind, y_value = self._parse_ds9_position_value(args[1], coord_system, axis_type_y)
+            radius_kind, radius_value = self._parse_ds9_size_value(args[2], coord_system)
+            if x_kind == "pixel" and y_kind == "pixel":
+                center_pix = (x_value - 1.0, y_value - 1.0)
+                center_world = None
+            else:
+                center_world = (x_value, y_value)
+                center_pix = self._world_center_to_pix(center_world, source_frame, plane, wcs)
+            if center_pix is None:
+                return None
+            radius = float(radius_value)
+            if radius_kind == "world":
+                scales = self._pixel_scales_deg(plane, wcs, center_pix=center_pix)
+                if scales is None or scales[0] <= 0:
+                    return None
+                radius = float(radius_value) / scales[0]
+            region = CircleRegion(center=center_pix, radius=radius, style=style)
+        elif shape_name == "box":
+            if len(args) < 4:
+                return None
+            x_kind, x_value = self._parse_ds9_position_value(args[0], coord_system, axis_type_x)
+            y_kind, y_value = self._parse_ds9_position_value(args[1], coord_system, axis_type_y)
+            width_kind, width_value = self._parse_ds9_size_value(args[2], coord_system)
+            height_kind, height_value = self._parse_ds9_size_value(args[3], coord_system)
+            angle = float(args[4]) if len(args) > 4 else 0.0
+            if x_kind == "pixel" and y_kind == "pixel":
+                center_pix = (x_value - 1.0, y_value - 1.0)
+                center_world = None
+            else:
+                center_world = (x_value, y_value)
+                center_pix = self._world_center_to_pix(center_world, source_frame, plane, wcs)
+            if center_pix is None:
+                return None
+            width = float(width_value)
+            height = float(height_value)
+            projected_axes = None
+            if width_kind == "world" or height_kind == "world":
+                if center_world is None:
+                    return None
+                if width_kind == "world" and height_kind == "world":
+                    projected_box = self._project_world_box_to_pixel(
+                        center_world,
+                        source_frame,
+                        plane,
+                        wcs,
+                        width_deg=float(width_value),
+                        height_deg=float(height_value),
+                        angle_deg=angle,
+                    )
+                    if projected_box is None:
+                        return None
+                    center_pix = projected_box["center"]
+                    width = float(projected_box["width"])
+                    height = float(projected_box["height"])
+                    angle = float(projected_box["angle"])
+                    projected_axes = {
+                        "center": center_pix,
+                        "width": (
+                            center_pix[0] + (math.cos(math.radians(angle)) * width / 2.0),
+                            center_pix[1] + (math.sin(math.radians(angle)) * width / 2.0),
+                        ),
+                        "height": None,
+                    }
+                else:
+                    projected_axes = self._project_world_axes_to_pixel(
+                        center_world,
+                        source_frame,
+                        plane,
+                        wcs,
+                        width_half_deg=float(width_value) / 2.0 if width_kind == "world" else None,
+                        height_half_deg=float(height_value) / 2.0 if height_kind == "world" else None,
+                        angle_deg=angle,
+                    )
+                    if projected_axes is None:
+                        return None
+                    center_pix = projected_axes["center"]
+                    if width_kind == "world" and projected_axes.get("width") is not None:
+                        width = float(
+                            math.hypot(
+                                projected_axes["width"][0] - center_pix[0],
+                                projected_axes["width"][1] - center_pix[1],
+                            )
+                            * 2.0
+                        )
+                    if height_kind == "world" and projected_axes.get("height") is not None:
+                        height = float(
+                            math.hypot(
+                                projected_axes["height"][0] - center_pix[0],
+                                projected_axes["height"][1] - center_pix[1],
+                            )
+                            * 2.0
+                        )
+                if center_pix is None:
+                    return None
+            if center_world is not None:
+                angle = _angle_from_projected_axes(
+                    projected_axes,
+                    self._transform_angle_via_center(
+                        angle,
+                        center_world,
+                        source_frame,
+                        plane,
+                        wcs,
+                    ),
+                )
+            kind = str(metadata.get("kind") or "rectangle").lower()
+            xy = (center_pix[0] - width / 2.0, center_pix[1] - height / 2.0)
+            if kind == "cube":
+                z_min = float(metadata.get("z_min", 0.0))
+                z_max = float(metadata.get("z_max", 1.0))
+                region = CubeRegion(xy=xy, width=width, height=height, z_min=z_min, z_max=z_max, style=style)
+            else:
+                region = RectangleRegion(xy=xy, width=width, height=height, style=style)
+            region.set_angle(angle)
+        else:
+            if len(args) < 4:
+                return None
+            x_kind, x_value = self._parse_ds9_position_value(args[0], coord_system, axis_type_x)
+            y_kind, y_value = self._parse_ds9_position_value(args[1], coord_system, axis_type_y)
+            width_kind, width_value = self._parse_ds9_size_value(args[2], coord_system)
+            height_kind, height_value = self._parse_ds9_size_value(args[3], coord_system)
+            angle = float(args[4]) if len(args) > 4 else 0.0
+            if x_kind == "pixel" and y_kind == "pixel":
+                center_pix = (x_value - 1.0, y_value - 1.0)
+                center_world = None
+            else:
+                center_world = (x_value, y_value)
+                center_pix = self._world_center_to_pix(center_world, source_frame, plane, wcs)
+            if center_pix is None:
+                return None
+            width = float(width_value) * 2.0
+            height = float(height_value) * 2.0
+            projected_axes = None
+            if width_kind == "world" or height_kind == "world":
+                if center_world is None:
+                    return None
+                projected_axes = self._project_world_axes_to_pixel(
+                    center_world,
+                    source_frame,
+                    plane,
+                    wcs,
+                    width_half_deg=float(width_value) if width_kind == "world" else None,
+                    height_half_deg=float(height_value) if height_kind == "world" else None,
+                    angle_deg=angle,
+                )
+                if projected_axes is None:
+                    return None
+                center_pix = projected_axes["center"]
+                if width_kind == "world" and projected_axes.get("width") is not None:
+                    width = float(math.hypot(projected_axes["width"][0] - center_pix[0], projected_axes["width"][1] - center_pix[1])) * 2.0
+                if height_kind == "world" and projected_axes.get("height") is not None:
+                    height = float(math.hypot(projected_axes["height"][0] - center_pix[0], projected_axes["height"][1] - center_pix[1])) * 2.0
+            if center_world is not None:
+                angle = _angle_from_projected_axes(
+                    projected_axes,
+                    self._transform_angle_via_center(
+                        angle,
+                        center_world,
+                        source_frame,
+                        plane,
+                        wcs,
+                    ),
+                )
+            region = EllipseRegion(center=center_pix, width=width, height=height, style=style)
+            region.set_angle(angle)
+
+        region.plane = plane
+        if label:
+            region.set_label_text(label)
+        self._apply_ds9_region_id(region, metadata.get("id"))
+        return region
+
+    def import_regions_from_ds9_text(self, text: str, clear_existing: bool = True) -> dict[str, int]:
+        if clear_existing:
+            self.delete_all_regions()
+
+        coord_system = "image"
+        global_properties: dict[str, str] = {}
+        pending_metadata: dict[str, str] | None = None
+        loaded = 0
+        skipped = 0
+
+        for command in _split_ds9_commands(text):
+            stripped = command.strip()
+            if not stripped:
+                continue
+            metadata = _parse_takefits_metadata_comment(stripped)
+            if metadata is not None:
+                pending_metadata = metadata
+                continue
+            if stripped.startswith("#"):
+                continue
+
+            normalized_coord = self._normalize_ds9_coord_system(stripped)
+            if normalized_coord is not None:
+                coord_system = normalized_coord
+                continue
+
+            if stripped.lower().startswith("global"):
+                global_properties.update(_parse_ds9_properties(stripped[6:].strip()))
+                continue
+
+            region = self._region_from_ds9_command(
+                stripped,
+                coord_system,
+                global_properties,
+                pending_metadata,
+            )
+            pending_metadata = None
+            if region is None:
+                skipped += 1
+                continue
+            axes = self._axes_for_plane(getattr(region, "plane", "xy"))
+            if axes is None:
+                skipped += 1
+                continue
+            region.add_to_axes(axes)
+            if hasattr(region, "update_visual"):
+                region.update_visual()
+            self.regions.append(region)
+            loaded += 1
+
+        if loaded == 0:
+            raise ValueError("No supported DS9 regions could be loaded for this viewer.")
+
+        self._request_overlay_redraw()
+        return {"loaded": loaded, "skipped": skipped}
 
     def export_regions_to_dict(self, plane: str | None = None) -> dict:
         """Serialize regions (all or by plane) to a dict, embedding world info when possible."""

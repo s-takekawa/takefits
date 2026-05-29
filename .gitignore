@@ -33,4 +33,3 @@ docs/dev/
 scripts/
 tests/
 test_marker_utils.py
-takefits/logic/scimes/

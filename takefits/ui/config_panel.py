@@ -688,7 +688,7 @@ class ConfigPanel(QWidget):
 
         self.click_linewidth_label = QLabel('Click Line Width:')
         self.click_linewidth_input = QDoubleSpinBox()
-        self.click_linewidth_input.setValue(self.config_manager.config.get('click_linewidth', 0.25))
+        self.click_linewidth_input.setValue(self.config_manager.config.get('click_linewidth', 0.5))
         self.click_linewidth_input.setFixedWidth(100)
         self.click_linewidth_input.setSingleStep(0.25)
         crosshair_layout.addWidget(self.click_linewidth_label, 4, 0)
@@ -770,7 +770,7 @@ class ConfigPanel(QWidget):
         self.ch_label_size_input = QSpinBox()
         self.ch_label_size_input.setFixedWidth(100)
         self.ch_label_size_input.setRange(1, 100)
-        self.ch_label_size_input.setValue(self.config_manager.config.get('ch_label_size', 12))
+        self.ch_label_size_input.setValue(self.config_manager.config.get('ch_label_size', 10))
         channel_label_layout.addWidget(QLabel('Ch. Label Font Size:'), 1, 0)
         channel_label_layout.addWidget(self.ch_label_size_input, 1, 1)
 
@@ -869,8 +869,8 @@ class ConfigPanel(QWidget):
         color_combobox.addItems(colors)
         color_combobox.setEditable(True)
         color_combobox.setCompleter(QCompleter(colors))
-        if current_color in colors:
-            color_combobox.setCurrentText(current_color)
+        if current_color is not None:
+            color_combobox.setCurrentText(str(current_color))
         return color_combobox
 
     def create_font_combobox(self, current_font):
@@ -880,8 +880,8 @@ class ConfigPanel(QWidget):
         font_combobox.addItems(fonts)
         font_combobox.setEditable(True)
         font_combobox.setCompleter(QCompleter(fonts))
-        if current_font in fonts:
-            font_combobox.setCurrentText(current_font)
+        if current_font:
+            font_combobox.setCurrentText(str(current_font))
         return font_combobox
         
         

@@ -232,11 +232,10 @@ def check_scimes_availability() -> tuple[bool, str]:
     """
     try:
         from takefits.logic.dendro_handler import DendroHandler
-        try:
-            import takefits.logic.scimes
+        unavailable_reason = DendroHandler.scimes_unavailable_reason()
+        if not unavailable_reason:
             return True, ""
-        except ImportError as e:
-            return False, f"SCIMES module missing dependency: {e}"
+        return False, f"External SCIMES package missing dependency: {unavailable_reason}"
     except ImportError as e:
         return False, f"astrodendro or other dendro dependency missing: {e}"
 

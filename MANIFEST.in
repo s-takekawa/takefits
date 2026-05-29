@@ -4,7 +4,6 @@ prune config
 prune docs/dev
 prune scripts
 prune tests
-prune takefits/logic/scimes
 
 exclude .DS_Store
 exclude test_marker_utils.py

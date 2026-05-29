@@ -408,7 +408,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
 
         self.click_label_color = config.get('click_label_color', 'grey')
-        self.click_linewidth = config.get('click_linewidth', 0.25)
+        self.click_linewidth = config.get('click_linewidth', 0.5)
         self.click_linecolor = config.get('click_linecolor', 'cyan')
         self.click_linestyle = str(config.get('click_linestyle', '-'))
         self.click_alpha = float(config.get('click_alpha', 1.0))
@@ -440,7 +440,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         #self.pos_chlabel_h = config.get('pos_chlabel_h', 20)
         self.ch_label_color = config.get('ch_label_color', 'grey')
         self.ch_label_font = config.get('ch_label_font', 'Arial')
-        self.ch_label_size = config.get('ch_label_size', 12)
+        self.ch_label_size = config.get('ch_label_size', 10)
         
         self.range_file = config.get('range_file', 'takefits.range')
 
@@ -2101,7 +2101,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self.poslabel_w = config.get('poslabel_w', 250)
         self.poslabel_h = config.get('poslabel_h', 30)
         self.click_label_color = config.get('click_label_color')
-        self.click_linewidth = config.get('click_linewidth', 0.25)
+        self.click_linewidth = config.get('click_linewidth', 0.5)
         self.click_linecolor = config.get('click_linecolor', 'cyan')
         self.click_linestyle = str(config.get('click_linestyle', '-'))
         self.click_alpha = float(config.get('click_alpha', 1.0))
@@ -2131,7 +2131,12 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self.beam_pos_y = config.get('beam_pos_y', 0.1)
         
         
-        self.resize(config.get('figure_width'), config.get('figure_height'))
+        self.figure_pos_x = config.get('figure_pos_x', 100)
+        self.figure_pos_y = config.get('figure_pos_y', 100)
+        self.figure_width = config.get('figure_width', 640)
+        self.figure_height = config.get('figure_height', 640)
+        self.move(self.figure_pos_x, self.figure_pos_y)
+        self.resize(self.figure_width, self.figure_height)
         self.fig.subplots_adjust( left = config.get('ax_pos_l'), 
                                 right = config.get('ax_pos_r'),
                                 bottom = config.get('ax_pos_b'), 
@@ -2173,6 +2178,21 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         subwindow.displaymap.bad_color = bad_color
                 
         self._apply_config_to_plane()
+        for window_ref in list(getattr(self, "integ_result_windows", []) or []):
+            window = window_ref() if callable(window_ref) else window_ref
+            if window is None:
+                continue
+            apply_preferences = getattr(window, "apply_preferences", None)
+            if callable(apply_preferences):
+                apply_preferences()
+        for window in list(getattr(self, "channel_map_windows", []) or []):
+            apply_preferences = getattr(window, "apply_preferences", None)
+            if callable(apply_preferences):
+                apply_preferences()
+                continue
+            apply_labels = getattr(window, "apply_channel_label_settings", None)
+            if callable(apply_labels):
+                apply_labels()
         self._restore_crosshair_state(crosshair_snapshot)
 
     def _rebuild_colorbars(self):
@@ -2379,10 +2399,22 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             state.ax_coord[0].set_axislabel_position(xtick_label_position)
             state.ax_coord[1].set_axislabel_position(ytick_label_position)
 
-            state.ax_coord[0].set_ticklabel(rotation=config.get('tick_xlabelrotation'), pad=config.get('tick_pad_x'))
+            state.ax_coord[0].set_ticklabel(
+                rotation=config.get('tick_xlabelrotation'),
+                pad=config.get('tick_pad_x'),
+                size=config.get('tick_labelsize'),
+                color=config.get('tick_labelcolor'),
+                fontfamily=config.get('tick_font'),
+            )
             state.ax_coord[0].set_ticklabel_position(xtick_label_position)
             state.ax_coord[0].set_ticks_position(config.get('default_ticks_position'))
-            state.ax_coord[1].set_ticklabel(rotation=config.get('tick_ylabelrotation'), pad=config.get('tick_pad_y'))
+            state.ax_coord[1].set_ticklabel(
+                rotation=config.get('tick_ylabelrotation'),
+                pad=config.get('tick_pad_y'),
+                size=config.get('tick_labelsize'),
+                color=config.get('tick_labelcolor'),
+                fontfamily=config.get('tick_font'),
+            )
             state.ax_coord[1].set_ticklabel_position(ytick_label_position)
             state.ax_coord[1].set_ticks_position(config.get('default_ticks_position'))
 
@@ -3185,9 +3217,125 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         coord_text = self._format_cursor_pair_text(self.plane, xstr, ystr)
         self.label.setText(self._compose_click_label_text(coord_text, intensity_text))
 
+    def _event_data_position(self, event):
+        if event is None or event.inaxes is not self.ax:
+            return None
+        xdata = getattr(event, 'xdata', None)
+        ydata = getattr(event, 'ydata', None)
+        if xdata is not None and ydata is not None:
+            try:
+                return float(xdata), float(ydata)
+            except Exception:
+                return None
+
+        ex = getattr(event, 'x', None)
+        ey = getattr(event, 'y', None)
+        if ex is None or ey is None:
+            return None
+        try:
+            x, y = self.ax.transData.inverted().transform((ex, ey))
+        except Exception:
+            return None
+        return float(x), float(y)
+
+    def _magnifier_panel_if_visible(self):
+        main = self._get_main_viewer()
+        panel = getattr(main, "magnifier_panel", None) if main is not None else None
+        if panel is None:
+            return None
+        try:
+            if not panel.isVisible():
+                return None
+        except Exception:
+            return None
+        return panel
+
+    def _update_magnifier_from_position(self, x: float, y: float, *, force: bool = False) -> bool:
+        panel = self._magnifier_panel_if_visible()
+        if panel is None:
+            return False
+        updater = getattr(panel, "update_from_cursor", None)
+        if not callable(updater):
+            return False
+        try:
+            return bool(updater(self, getattr(self, "plane", "xy"), x, y, force=force))
+        except Exception:
+            return False
+
+    def _refresh_magnifier_from_current_cursor(self, plane: Optional[str] = None, *, force: bool = True) -> bool:
+        panel = self._magnifier_panel_if_visible()
+        if panel is None:
+            return False
+        main = self._get_main_viewer()
+        target_plane = str(plane or getattr(self, "plane", "xy")).lower()
+        viewer = None
+        getter = getattr(main, "_viewer_for_plane", None) if main is not None else None
+        if callable(getter):
+            try:
+                viewer = getter(target_plane)
+            except Exception:
+                viewer = None
+        if viewer is None:
+            viewer = self if str(getattr(self, "plane", "")).lower() == target_plane else main
+        if viewer is None:
+            return False
+
+        state = None
+        try:
+            state = viewer.get_viewer_state(target_plane)
+        except Exception:
+            state = None
+        x = getattr(state, "cursor_x", None) if state is not None else None
+        y = getattr(state, "cursor_y", None) if state is not None else None
+        if x is None or y is None:
+            cursor_getter = getattr(main or self, "_plane_cursor_pixel_tuple", None)
+            if callable(cursor_getter):
+                try:
+                    x, y = cursor_getter(target_plane)
+                except Exception:
+                    return False
+        updater = getattr(panel, "update_from_cursor", None)
+        if not callable(updater):
+            return False
+        try:
+            return bool(updater(viewer, target_plane, x, y, force=force))
+        except Exception:
+            return False
+
+    def _refresh_magnifier_from_last_pointer(self, *, force: bool = True) -> bool:
+        panel = self._magnifier_panel_if_visible()
+        if panel is None:
+            return False
+        if getattr(panel, "_last_source_viewer", None) is not self:
+            return False
+        refresher = getattr(panel, "refresh_last_cursor", None)
+        if not callable(refresher):
+            return False
+        try:
+            return bool(refresher(force=force))
+        except Exception:
+            return False
+
+    def _toggle_magnifier_lock(self) -> bool:
+        panel = self._magnifier_panel_if_visible()
+        if panel is None:
+            return False
+        toggler = getattr(panel, "toggle_lock", None)
+        if not callable(toggler):
+            return False
+        try:
+            toggler()
+            return True
+        except Exception:
+            return False
+
     def cursor_position(self, event):
         if self._drag_colorbar(event):
             return
+        event_position = self._event_data_position(event)
+        if event_position is not None:
+            self._update_magnifier_from_position(*event_position)
+
         marker_mgr = getattr(self, 'marker_manager', None)
         if getattr(self, 'marker_mode_enabled', False):
             if marker_mgr is not None:
@@ -3218,22 +3366,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
         if self.toolbar.mode == 'zoom rect' or self.toolbar.mode =='pan/zoom':
             return
-        if event.inaxes is not self.ax:
+        if event_position is None:
             return
-
-        xdata = getattr(event, 'xdata', None)
-        ydata = getattr(event, 'ydata', None)
-        if xdata is not None and ydata is not None:
-            x, y = float(xdata), float(ydata)
-        else:
-            ex = getattr(event, 'x', None)
-            ey = getattr(event, 'y', None)
-            if ex is None or ey is None:
-                return
-            try:
-                x, y = self.ax.transData.inverted().transform((ex, ey))
-            except Exception:
-                return
+        x, y = event_position
 
         if self._is_left_drag_motion(event):
             if self.plane == 'xy' and self._pv_arrow_active():
@@ -4045,6 +4180,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         if getattr(self, 'control_panel', None) is not None and self.control_panel.pvd_panel:
             if k >= 0:
                 self.control_panel.pvd_panel.update_cursor(k)
+        self._refresh_magnifier_from_last_pointer(force=True)
         
 
 
@@ -4522,6 +4658,10 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         """
         Handles key press events coming directly from the Matplotlib canvas.
         """
+        key = str(getattr(event, 'key', '') or '').lower()
+        if key == 'f' and self._toggle_magnifier_lock():
+            return
+
         region_manager = getattr(self, 'region_manager', None)
         if region_manager is not None:
             region_manager.handle_key_press(event)

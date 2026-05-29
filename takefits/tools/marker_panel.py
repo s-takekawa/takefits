@@ -2278,6 +2278,7 @@ class MarkerPanel(QDialog):
         base_plane_resolver = getattr(self.marker_manager, "_base_plane_for", None)
         base_plane = base_plane_resolver(plane) if callable(base_plane_resolver) else plane
         if format_pix is not None and wcs is not None:
+            world_pair_resolver = getattr(self.marker_manager, "_pixel_to_world_pair", None)
             for marker in markers:
                 if not isinstance(marker, LineMarker):
                     continue
@@ -2287,8 +2288,17 @@ class MarkerPanel(QDialog):
                 try:
                     start, end = marker._endpoints()
                     meta = dict(state.metadata)
-                    wx0, wy0 = format_pix.pix_to_wcs(wcs, start[0], start[1], base_plane)
-                    wx1, wy1 = format_pix.pix_to_wcs(wcs, end[0], end[1], base_plane)
+                    if callable(world_pair_resolver):
+                        start_world = world_pair_resolver(plane, start)
+                        end_world = world_pair_resolver(plane, end)
+                    else:
+                        start_world = end_world = None
+                    if start_world is None:
+                        start_world = format_pix.pix_to_wcs(wcs, start[0], start[1], base_plane)
+                    if end_world is None:
+                        end_world = format_pix.pix_to_wcs(wcs, end[0], end[1], base_plane)
+                    wx0, wy0 = start_world
+                    wx1, wy1 = end_world
                     meta["pixel_endpoints"] = [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))]
                     meta["world_endpoints"] = [(float(wx0), float(wy0)), (float(wx1), float(wy1))]
                     state.metadata = meta

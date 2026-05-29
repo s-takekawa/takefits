@@ -271,6 +271,8 @@ class ActionSession:
         accepts_result = _handler_accepts_result(handler)
         call_params = _filter_handler_kwargs(handler, params)
 
+        previous_result = self.last_result
+
         if accepts_state and accepts_result:
             if self.state is None:
                 raise ValueError(f"Action '{name}' requires state, but no state is loaded.")
@@ -294,7 +296,10 @@ class ActionSession:
             # In-place mutation pattern
             result = self.state
 
-        self.last_result = result
+        if _should_preserve_last_result(name, result, previous_result):
+            self.last_result = previous_result
+        else:
+            self.last_result = result
         return result
 
 
@@ -338,6 +343,15 @@ def _filter_handler_kwargs(handler: Any, params: Dict[str, Any]) -> Dict[str, An
         if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
             allowed.add(param.name)
     return {key: value for key, value in params.items() if key in allowed}
+
+
+def _should_preserve_last_result(name: str, result: Any, previous_result: Any) -> bool:
+    """Keep analysis results available after export actions return output paths."""
+    return (
+        previous_result is not None
+        and name.startswith("export_")
+        and isinstance(result, str)
+    )
 
 
 def _utc_timestamp() -> str:

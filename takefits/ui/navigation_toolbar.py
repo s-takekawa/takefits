@@ -3,6 +3,7 @@ import logging
 import os
 import yaml
 
+import matplotlib as mpl
 from takefits.app_paths import app_config_path
 from PySide6 import QtWidgets
 from PySide6.QtCore import Qt
@@ -440,23 +441,62 @@ class MyNavigationToolbar(NavigationToolbar2QT):
 
     def onclick(self, event):
         if self.mode == 'zoom rect': pass
+
+    def _save_figure_file(self, path):
+        ext = os.path.splitext(str(path))[1].lower()
+        is_vector = ext in {".pdf", ".eps", ".svg"}
+        if is_vector:
+            with mpl.rc_context({
+                "path.simplify": False,
+                "path.simplify_threshold": 0.0,
+                "agg.path.chunksize": 0,
+            }):
+                self.canvas.figure.savefig(path, transparent=True, dpi=300)
+            return
+        self.canvas.figure.savefig(path, transparent=True, dpi=300)
+
+    def _patches_for_save(self):
+        if self.ax is not None and hasattr(self.ax, "patches"):
+            return list(getattr(self.ax, "patches", []) or [])
+
+        figure = getattr(self.canvas, "figure", None)
+        patches = []
+        for axis in getattr(figure, "axes", []) or []:
+            if getattr(axis, "get_gid", lambda: None)() == "colorbar":
+                continue
+            patches.extend(list(getattr(axis, "patches", []) or []))
+        return patches
+
+    def _normalized_default_image_name(self):
+        name = self.default_image_name
+        if not name:
+            if hasattr(self.parent, "filename") and self.parent.filename:
+                name = self.parent.filename
+            else:
+                name = "figure"
+        name = str(name)
+        if name.endswith(".fits"):
+            name = name[:-5]
+        mode = str(getattr(self.parent, "integ_mode", "") or "").strip()
+        if mode and name.endswith(f".{mode}"):
+            name = name[: -(len(mode) + 1)]
+        return name
+
+    def _normalized_default_image_ext(self):
+        ext = str(self.default_image_ext or "pdf").lstrip(".")
+        mode = str(getattr(self.parent, "integ_mode", "") or "").strip()
+        if mode:
+            prefix = f"{mode}."
+            if ext.startswith(prefix):
+                ext = ext[len(prefix):]
+            ext = f"{mode}.{ext}"
+        return ext
         
     def save_figure(self):
         current_dir = os.getcwd()
         desktop_dir = os.path.join(os.path.expanduser("~"), "Desktop")
         initial_dir = desktop_dir if os.access(desktop_dir, os.W_OK) else current_dir
-        if not self.default_image_name:
-            if hasattr(self.parent, "filename") and self.parent.filename:
-                self.default_image_name = self.parent.filename
-            else:
-                self.default_image_name = "figure"
-        if self.default_image_name.endswith(".fits"):
-            self.default_image_name = self.default_image_name[:-5]
-
-        try:
-            self.default_image_ext = f"{self.parent.integ_mode}.{self.default_image_ext}"
-        except: pass
-        default_filename = f"{self.default_image_name}.{self.default_image_ext}"
+        default_filename = f"{self._normalized_default_image_name()}.{self._normalized_default_image_ext()}"
 
         path, _ = QFileDialog.getSaveFileName(
             self.canvas.parent(),
@@ -467,18 +507,19 @@ class MyNavigationToolbar(NavigationToolbar2QT):
         if path:
             visibility = []
             animated = []
+            patches = self._patches_for_save()
             try:
-                for patch in self.ax.patches:
+                for patch in patches:
                     visibility.append(patch.get_visible())
                     animated.append(getattr(patch, 'get_animated', lambda: False)())
                     patch.set_visible(True)
                     if hasattr(patch, 'set_animated'):
                         patch.set_animated(False)
-                self.canvas.figure.savefig(path, transparent=True, dpi=300)
+                self._save_figure_file(path)
                 filename = os.path.basename(path)
                 self.show_save_success_message(path, filename)
             finally:
-                for patch, vis, anim in zip(self.ax.patches, visibility, animated):
+                for patch, vis, anim in zip(patches, visibility, animated):
                     patch.set_visible(vis)
                     if hasattr(patch, 'set_animated'):
                         patch.set_animated(anim)

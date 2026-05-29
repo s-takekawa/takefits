@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from typing import Optional, Tuple, Union, List
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from takefits.core.app_state import AppState
@@ -11,18 +10,22 @@ from takefits.core.usecases.moment import compute_moment
 from takefits.core.usecases.channel_map import compute_channel_map, channel_labels_to_world
 from takefits.core.usecases.export import export_figure
 from takefits.core.usecases.utils import create_2d_header_from_3d
-from takefits.core.plotting.display_map import DisplayMap
 from takefits.core.config import ConfigManager
 from astropy.wcs import WCS
-import matplotlib as mpl
-from matplotlib import colormaps as mpl_colormaps
-from astropy.visualization.wcsaxes import WCSAxes
 import astropy.units as u
 
-from takefits.core.custom_colormap import CustomColormap, ColorDefinitions
+
+def _get_pyplot():
+    import matplotlib.pyplot as plt
+
+    return plt
+
 
 def register_custom_colormaps():
     """Register custom colormaps (Rainbow, Cool) if not present."""
+    from matplotlib import colormaps as mpl_colormaps
+    from takefits.core.custom_colormap import CustomColormap, ColorDefinitions
+
     # Check if 'Rainbow' is already registered
     if 'Rainbow' not in mpl_colormaps:
         rainbow_cdict = ColorDefinitions.rainbow()
@@ -109,10 +112,13 @@ def export_moment_image(
     # Export usually needs standard size or specific DPI.
     # We stick to fixed figsize for now, but respect Config for fonts/colors/ticks.
     
+    plt = _get_pyplot()
     fig = plt.figure(figsize=(8, 6))
     
     # Create DisplayMap instance
     # DisplayMap handles WCSAxes, colorbars, ticks, etc.
+    from takefits.core.plotting.display_map import DisplayMap
+
     dm = DisplayMap(moment_data, header_2d, wcs_2d, config)
     
     # We display on 'xy' plane because we have reduced it to 2D
@@ -269,6 +275,7 @@ def export_channel_map_image(
     effective_cmap = cmap if cmap else config.get('colorscale', 'viridis')
     nrows = int(np.ceil(n_images / ncols))
 
+    plt = _get_pyplot()
     fig = plt.figure(figsize=(ncols * 3, nrows * 3))
     gs = fig.add_gridspec(nrows, ncols)
 
@@ -304,6 +311,7 @@ def export_channel_map_image(
     tick_width = config.get('tick_width', 1)
     tick_labelsize = config.get('tick_labelsize', 10)
     tick_labelcolor = config.get('tick_labelcolor', 'black')
+    tick_font = config.get('tick_font', 'Arial')
     tick_direction = config.get('tick_direction', 'out')
     tick_length = config.get('tick_length', 4)
     tick_pad_x = config.get('tick_pad_x', 5)
@@ -351,11 +359,12 @@ def export_channel_map_image(
                 # Use config font/color for label
                 ch_label_font = config.get('ch_label_font', 'Arial')
                 ch_label_color = config.get('ch_label_color', 'grey')
+                ch_label_size = config.get('ch_label_size', 10)
                 pos_x = config.get('pos_chlabel_x', 0.98)
                 pos_y = config.get('pos_chlabel_y', 0.02)
                 
                 ax.text(pos_x, pos_y, label_text, transform=ax.transAxes, 
-                        color=ch_label_color, fontfamily=ch_label_font, 
+                        color=ch_label_color, fontsize=ch_label_size, fontfamily=ch_label_font,
                         va='bottom', ha='right', fontweight='bold')
                 
                 # Styling
@@ -400,7 +409,7 @@ def export_channel_map_image(
                     def configure_coord_format(coord, ctype_index):
                         ctype_str = (state.header.get(f'CTYPE{ctype_index+1}', '')).upper() if state.header else ''
                         # Basic formatting logic
-                        is_decimal = config.get('decimal', False)
+                        is_decimal = config.get('decimal', True)
                         
                         if ctype_str.startswith('RA'):
                             wrap_val = config.get('coord_wrap', 360.0)
@@ -418,6 +427,7 @@ def export_channel_map_image(
                              coord.set_coord_type('latitude')
                              if is_decimal:
                                  coord.set_format_unit(u.deg, decimal=True)
+                             else:
                                  coord.set_format_unit(u.deg, decimal=False)
                         
                         elif any(keyword in ctype_str for keyword in ['GLON', 'GLAT', 'OFFSET']):
@@ -449,6 +459,14 @@ def export_channel_map_image(
                         
                         # Handle X Axis (Horizontal)
                         if k == x_wcs_axis:
+                            coord.set_ticklabel(
+                                rotation=config.get('tick_xlabelrotation', 0),
+                                pad=tick_pad_x,
+                                size=tick_labelsize,
+                                color=tick_labelcolor,
+                                fontfamily=tick_font,
+                                exclude_overlapping=True,
+                            )
                             if is_bottom_tile:
                                 coord.set_ticklabel_visible(True)
                                 coord.set_ticks_position(config.get('xticklabel_position', 'b'))
@@ -459,6 +477,14 @@ def export_channel_map_image(
                         
                         # Handle Y Axis (Vertical)
                         elif k == y_wcs_axis:
+                            coord.set_ticklabel(
+                                rotation=config.get('tick_ylabelrotation', 0),
+                                pad=tick_pad_y,
+                                size=tick_labelsize,
+                                color=tick_labelcolor,
+                                fontfamily=tick_font,
+                                exclude_overlapping=True,
+                            )
                             if is_left_tile:
                                 coord.set_ticklabel_visible(True)
                                 coord.set_ticks_position(config.get('yticklabel_position', 'l'))

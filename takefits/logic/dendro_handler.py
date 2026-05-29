@@ -49,13 +49,19 @@ def _patch_astrodendro_quantity_truthiness():
 
 class DendroHandler:
     @staticmethod
+    def scimes_unavailable_reason():
+        """Return why SCIMES cannot run, or an empty string when available."""
+        try:
+            from takefits.logic.scimes.scimes import _require_sklearn
+            _require_sklearn()
+            return ""
+        except ImportError as exc:
+            return str(exc)
+
+    @staticmethod
     def is_scimes_available():
         """Check if SCIMES module is available."""
-        try:
-            import takefits.logic.scimes
-            return True
-        except ImportError:
-            return False
+        return DendroHandler.scimes_unavailable_reason() == ""
 
     def __init__(self, data, wcs=None, header=None):
         self.data = data
@@ -195,14 +201,7 @@ class DendroHandler:
         if self.d is None:
             return False, "Run Dendrogram first."
 
-        if not self.is_scimes_available():
-            return False, "SCIMES module is not installed."
-
         try:
-            _patch_astrodendro_quantity_truthiness()
-            # Import SCIMES from the bundled location
-            from takefits.logic.scimes import SpectralCloudstering
-
             structure_count = len(self.d)
             leaf_count = len(self.leaves)
             if structure_count == 0 or leaf_count == 0:
@@ -214,6 +213,14 @@ class DendroHandler:
             if leaf_count <= 2:
                 self.clusters = list(self.leaves)
                 return True, f"Only {leaf_count} dendrogram leaves found; each leaf was kept as its own cluster."
+
+            unavailable_reason = self.scimes_unavailable_reason()
+            if unavailable_reason:
+                return False, unavailable_reason
+
+            _patch_astrodendro_quantity_truthiness()
+            # Import SCIMES from the bundled location
+            from takefits.logic.scimes import SpectralCloudstering
 
             # Default criteria if not provided
             if criteria is None or len(criteria) == 0:

@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-import matplotlib as mpl
 import numpy as np
 
 from takefits.core.app_state import AppState
@@ -70,6 +69,8 @@ def export_figure(
     is_vector = ext in {".pdf", ".eps", ".svg"}
     try:
         if is_vector:
+            import matplotlib as mpl
+
             # Preserve vector editability while avoiding backend path simplification.
             with mpl.rc_context({
                 "path.simplify": False,

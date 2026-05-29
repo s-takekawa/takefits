@@ -1,6 +1,5 @@
 # custom_colormap.py
 
-import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 import numpy as np
 
@@ -14,6 +13,8 @@ class CustomColormap:
         return self.colormap
     
     def plot_colormap(self):
+        import matplotlib.pyplot as plt
+
         gradient = np.linspace(0, 1, 256)
         gradient = np.vstack((gradient, gradient))
 

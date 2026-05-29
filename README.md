@@ -91,7 +91,7 @@ Generate publication-quality figures directly from the GUI.
 - **Image Arithmetic**: Perform mathematical operations between FITS cubes or with constants using numpy-like expressions.
 - **Unit Conversion**: Convert spectral or intensity units for analysis.
 - **Baseline Subtraction**: Fit and subtract spectral baselines from data cubes.
-- **Clump Finding**: Identify structures using ClumpFind, FellWalker, and Dendrogram algorithms.
+- **Clump Finding**: Identify structures using ClumpFind, FellWalker, Dendrogram, and SCIMES (dendrogram clustering) algorithms.
 
 ## Research use
 
@@ -107,9 +107,12 @@ The tools below implement established analysis algorithms. If you use them for y
 
 ### Clump Finding
 
-- Williams, J. P., de Geus, E. J., & Blitz, L. (1994). Determining structure in molecular clouds. *The Astrophysical Journal*, 428, 693-712. [doi:10.1086/174279](https://doi.org/10.1086/174279)
-- Berry, D. S. (2015). FellWalker-A clump identification algorithm. *Astronomy and Computing*, 10, 22-31. [doi:10.1016/j.ascom.2014.11.004](https://doi.org/10.1016/j.ascom.2014.11.004)
-- Rosolowsky, E. W., Pineda, J. E., Kauffmann, J., & Goodman, A. A. (2008). Structural Analysis of Molecular Clouds: Dendrograms. *The Astrophysical Journal*, 679(2), 1338-1351. [doi:10.1086/587685](https://doi.org/10.1086/587685)
+Cite the paper corresponding to the algorithm you used:
+
+- **ClumpFind** — Williams, J. P., de Geus, E. J., & Blitz, L. (1994). Determining structure in molecular clouds. *The Astrophysical Journal*, 428, 693-712. [doi:10.1086/174279](https://doi.org/10.1086/174279)
+- **FellWalker** — Berry, D. S. (2015). FellWalker-A clump identification algorithm. *Astronomy and Computing*, 10, 22-31. [doi:10.1016/j.ascom.2014.11.004](https://doi.org/10.1016/j.ascom.2014.11.004)
+- **Dendrogram** — Rosolowsky, E. W., Pineda, J. E., Kauffmann, J., & Goodman, A. A. (2008). Structural Analysis of Molecular Clouds: Dendrograms. *The Astrophysical Journal*, 679(2), 1338-1351. [doi:10.1086/587685](https://doi.org/10.1086/587685)
+- **SCIMES** (Dendrogram clustering) — Colombo, D., Rosolowsky, E., Ginsburg, A., Duarte-Cabral, A., & Hughes, A. (2015). Graph-based interpretation of the molecular interstellar medium segmentation. *Monthly Notices of the Royal Astronomical Society*, 454(2), 2067-2091. [doi:10.1093/mnras/stv2063](https://doi.org/10.1093/mnras/stv2063) — a modified copy is bundled under [`takefits/logic/scimes/`](takefits/logic/scimes/) (BSD 3-Clause).
 
 ### Masking / Moment Analysis
 

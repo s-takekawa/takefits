@@ -706,6 +706,153 @@ class ChannelMapWindow(QMainWindow):
             return (2, 1)
         return (0, 1)
 
+    def _marker_plane_tile_index(self, plane: Optional[str]) -> Optional[int]:
+        plane_name = str(plane or "").strip()
+        prefix = f"{self.marker_plane_prefix}_"
+        if not plane_name.startswith(prefix):
+            return None
+        try:
+            return int(plane_name[len(prefix):])
+        except Exception:
+            return None
+
+    def _marker_plane_global_index(self, plane: Optional[str]) -> Optional[int]:
+        tile_index = self._marker_plane_tile_index(plane)
+        if tile_index is None or tile_index < 0:
+            return None
+        global_index = (int(self.current_page) * int(self.num_per_page)) + tile_index
+        if global_index < 0 or global_index >= len(list(self.range_label or [])):
+            return None
+        return global_index
+
+    def _marker_plane_center_pixel(self, plane: Optional[str]) -> Optional[float]:
+        global_index = self._marker_plane_global_index(plane)
+        if global_index is None:
+            return None
+        try:
+            label = list(self.range_label or [])[global_index]
+            return float(label[1])
+        except Exception:
+            return None
+
+    def _shared_marker_pixel_context(self) -> Tuple[float, float, float, float]:
+        source = getattr(self, "fits_viewer", None)
+
+        def _read(method_name: str, default: float = 0.0) -> float:
+            getter = getattr(source, method_name, None)
+            if callable(getter):
+                try:
+                    value = getter()
+                    return float(value) if value is not None else float(default)
+                except Exception:
+                    return float(default)
+            return float(default)
+
+        return (
+            _read("_get_shared_xpix"),
+            _read("_get_shared_ypix"),
+            _read("_get_shared_zpix"),
+            _read("_get_shared_spix"),
+        )
+
+    def _marker_pixel_vector(
+        self,
+        plane: Optional[str],
+        *,
+        x_pix: Optional[float] = None,
+        y_pix: Optional[float] = None,
+    ) -> Optional[List[float]]:
+        wcs = getattr(self, "wcs", None)
+        if wcs is None:
+            return None
+        try:
+            naxis = int(getattr(wcs, "naxis", 0) or 0)
+        except Exception:
+            naxis = 0
+        if naxis <= 0:
+            return None
+
+        shared_x, shared_y, shared_z, shared_s = self._shared_marker_pixel_context()
+        base = self.marker_plane_base(plane or self.default_marker_plane() or self.plane)
+        fixed_center = self._marker_plane_center_pixel(plane)
+        if fixed_center is None:
+            if base == "xy":
+                fixed_center = shared_z
+            elif base == "xz":
+                fixed_center = shared_y
+            elif base == "zy":
+                fixed_center = shared_x
+            else:
+                fixed_center = 0.0
+
+        vector: List[float] = []
+        for axis in range(naxis):
+            if axis == 0:
+                if base == "zy":
+                    vector.append(float(fixed_center))
+                else:
+                    vector.append(float(shared_x if x_pix is None else x_pix))
+            elif axis == 1:
+                if base == "xz":
+                    vector.append(float(fixed_center))
+                else:
+                    vector.append(float(shared_y if y_pix is None else y_pix))
+            elif axis == 2:
+                if base == "xy":
+                    vector.append(float(fixed_center))
+                elif base == "xz":
+                    vector.append(float(shared_z if y_pix is None else y_pix))
+                elif base == "zy":
+                    vector.append(float(shared_z if x_pix is None else x_pix))
+                else:
+                    vector.append(float(shared_z))
+            elif axis == 3:
+                vector.append(float(shared_s))
+            else:
+                vector.append(0.0)
+        return vector
+
+    def marker_world_defaults(self, plane: Optional[str] = None) -> Optional[List[float]]:
+        vector = self._marker_pixel_vector(plane)
+        if vector is None:
+            return None
+        try:
+            world = list(np.asarray(self.wcs.wcs_pix2world([vector], 0)[0], dtype=float).tolist())
+        except Exception:
+            return None
+        while len(world) < 4:
+            world.append(0.0)
+        return world[:4]
+
+    def marker_pix_to_world(
+        self,
+        plane: Optional[str],
+        pixel: Tuple[float, ...],
+    ) -> Optional[Tuple[float, float]]:
+        if pixel is None or len(pixel) < 2:
+            return None
+        vector = self._marker_pixel_vector(
+            plane,
+            x_pix=float(pixel[0]),
+            y_pix=float(pixel[1]),
+        )
+        if vector is None:
+            return None
+        try:
+            world = np.asarray(self.wcs.wcs_pix2world([vector], 0)[0], dtype=float)
+        except Exception:
+            return None
+        base = self.marker_plane_base(plane or self.default_marker_plane() or self.plane)
+        if base == "xy" and len(world) >= 2:
+            return (float(world[0]), float(world[1]))
+        if base == "xz" and len(world) >= 3:
+            return (float(world[0]), float(world[2]))
+        if base == "zy" and len(world) >= 3:
+            return (float(world[2]), float(world[1]))
+        if len(world) >= 2:
+            return (float(world[0]), float(world[1]))
+        return None
+
     def redraw_overlay_for_plane(self, plane: str) -> None:
         self.canvas.draw_idle()
 
@@ -870,6 +1017,7 @@ class ChannelMapWindow(QMainWindow):
     def on_motion(self, event):
         if self._drag_colorbar(event):
             return
+        self._update_magnifier_from_event(event)
         marker_manager = getattr(self, "marker_manager", None)
         if marker_manager is not None and getattr(self, "marker_mode_enabled", False):
             if marker_manager.is_dragging():
@@ -877,6 +1025,36 @@ class ChannelMapWindow(QMainWindow):
             else:
                 marker_manager.handle_hover(event)
             return
+
+    def _update_magnifier_from_event(self, event):
+        panel = getattr(getattr(self, "fits_viewer", None), "magnifier_panel", None)
+        if panel is None:
+            return False
+        try:
+            if not panel.isVisible():
+                return False
+        except Exception:
+            return False
+        axes = getattr(event, "inaxes", None)
+        if axes not in list(getattr(self, "axes", []) or []):
+            return False
+        if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
+            return False
+        updater = getattr(panel, "update_from_cursor", None)
+        if not callable(updater):
+            return False
+        try:
+            return bool(
+                updater(
+                    self,
+                    getattr(self, "plane", "xy"),
+                    event.xdata,
+                    event.ydata,
+                    source_axes=axes,
+                )
+            )
+        except Exception:
+            return False
 
     def on_key_press(self, event):
         key = str(getattr(event, "key", "") or "").lower()
@@ -886,6 +1064,16 @@ class ChannelMapWindow(QMainWindow):
         if key in self._VIEW_FORWARD_KEY_TOKENS:
             self.view_forward()
             return
+        if key == "f":
+            panel = getattr(getattr(self, "fits_viewer", None), "magnifier_panel", None)
+            toggler = getattr(panel, "toggle_lock", None)
+            if callable(toggler):
+                try:
+                    if panel.isVisible():
+                        toggler()
+                        return
+                except Exception:
+                    pass
         marker_manager = getattr(self, "marker_manager", None)
         if marker_manager is not None:
             marker_manager.handle_key_press(event)
@@ -1214,6 +1402,7 @@ class ChannelMapWindow(QMainWindow):
                         label = f"{label[0]} to {label[2]}"
                 self.ch_labels.append(ax.text(self.config['pos_chlabel_x'], self.config['pos_chlabel_y'], label,
                                         transform = ax.transAxes, verticalalignment = 'bottom', horizontalalignment = 'right',
+                                        fontsize=self.config.get('ch_label_size', 10),
                                         fontfamily=self.config['ch_label_font'], color = self.config['ch_label_color']))
                 
             else:
@@ -1419,6 +1608,7 @@ class ChannelMapWindow(QMainWindow):
         
         self.resize(self.figure_width, self.figure_height)
         #self.fig.tight_layout(rect=(0.1, 0.1, 0.95, 0.9))
+        self.apply_preferences(redraw=False)
         self.canvas.draw()
         self._schedule_colorbar_auto_layout_if_anchor_changed(force=False)
 
@@ -1753,11 +1943,198 @@ class ChannelMapWindow(QMainWindow):
                 ax.set_visible(False)
 
         self._refresh_contours()
-        self.update_axis_labels()
+        self.apply_preferences(redraw=False)
         self.canvas.draw_idle()
         self.prev_button.setEnabled(self.current_page > 0)
         self.next_button.setEnabled(end_index < total_images)
         
+
+
+    def apply_channel_label_settings(self, redraw: bool = True):
+        """Apply shared channel-label preference settings to this window."""
+        config = self.config if isinstance(self.config, dict) else {}
+        position = (
+            config.get('pos_chlabel_x', 0.98),
+            config.get('pos_chlabel_y', 0.02),
+        )
+        fontsize = config.get('ch_label_size', 10)
+        fontfamily = config.get('ch_label_font', 'Arial')
+        color = config.get('ch_label_color', 'grey')
+
+        for label in list(getattr(self, 'ch_labels', []) or []):
+            if label is None:
+                continue
+            label.set_position(position)
+            label.set_fontsize(fontsize)
+            label.set_fontfamily(fontfamily)
+            label.set_color(color)
+
+        if redraw and hasattr(self, 'canvas'):
+            self.canvas.draw_idle()
+
+    def _axis_role_for_coord_index(self, coord_index: int) -> str:
+        if self.plane_num == 0:
+            return "x" if coord_index == 0 else "y"
+        if self.plane_num == 1:
+            return "x" if coord_index == 0 else "y"
+        if self.plane_num == 2:
+            return "x" if coord_index == 2 else "y"
+        return "x" if coord_index == 0 else "y"
+
+    def _apply_ticklabel_style(self, coord, axis_role: str, config: dict):
+        if coord is None:
+            return
+        if axis_role == "x":
+            rotation = config.get('tick_xlabelrotation')
+            pad = config.get('tick_pad_x')
+            position = config.get('xticklabel_position')
+        else:
+            rotation = config.get('tick_ylabelrotation')
+            pad = config.get('tick_pad_y')
+            position = config.get('yticklabel_position')
+        coord.set_ticklabel(
+            rotation=rotation,
+            pad=pad,
+            size=config.get('tick_labelsize'),
+            color=config.get('tick_labelcolor'),
+            fontfamily=config.get('tick_font'),
+            exclude_overlapping=True,
+        )
+        coord.set_ticklabel_position(position)
+        coord.set_axislabel_position(position)
+        coord.set_ticks_position(config.get('default_ticks_position'))
+
+    def _apply_coordinate_format_preferences(self, ax, config: dict):
+        try:
+            if 'glon' in ax.coords:
+                try:
+                    coord_wrap = float(config.get('coord_wrap', 180)) * u.deg
+                except Exception:
+                    coord_wrap = 180 * u.deg
+                ax.coords['glon'].set_coord_type(coord_wrap=coord_wrap, coord_type='longitude')
+
+            axis_units = []
+            axis_types = []
+            for i in range(self.wcs.naxis):
+                axis_units.append(ax.coords[i].get_format_unit())
+                physical_type = self.wcs.world_axis_physical_types[i]
+                axis_types.append(None if physical_type is None else physical_type.split('.')[-1])
+            axis_format_decimal = np.isin(axis_types, ['lon', 'lat'])
+            if config.get('decimal') is False:
+                axis_format_decimal = [False for _ in axis_format_decimal]
+            for i in np.where(axis_format_decimal)[0]:
+                ax.coords[i].set_format_unit(axis_units[i], decimal=axis_format_decimal[i])
+        except Exception:
+            pass
+
+    def _apply_axis_preferences(self, config: dict):
+        if getattr(self, "fig", None) is not None:
+            self.fig.set_facecolor(config.get('fig_background_color'))
+
+        displayed = [bool(value) for value in getattr(self, "projection_slices", [])]
+        for ax in list(getattr(self, "axes", []) or []):
+            if ax is None:
+                continue
+            ax.set_facecolor(config.get('ax_background_color'))
+            self._apply_coordinate_format_preferences(ax, config)
+            ax.tick_params(
+                which='major',
+                direction=config.get('tick_direction'),
+                length=config.get('tick_length'),
+                color=config.get('tick_color'),
+                width=config.get('tick_width'),
+                labelsize=config.get('tick_labelsize'),
+                labelcolor=config.get('tick_labelcolor'),
+            )
+            ax.tick_params(which='minor', length=config.get('mtick_length'))
+            for spine in ax.spines.values():
+                spine.set_visible(True)
+                spine.set_zorder(5)
+                spine.set_linewidth(config.get('tick_width'))
+                spine.set_color(config.get('tick_color'))
+
+            try:
+                coords = list(ax.coords)
+            except Exception:
+                continue
+            for coord_index, coord in enumerate(coords):
+                if coord_index < len(displayed) and not displayed[coord_index]:
+                    try:
+                        coord.set_ticks_visible(False)
+                        coord.set_ticklabel_visible(False)
+                    except Exception:
+                        pass
+                    continue
+                role = self._axis_role_for_coord_index(coord_index)
+                self._apply_ticklabel_style(coord, role, config)
+                try:
+                    if coord_index == 0:
+                        coord.set_minor_frequency(config.get('x_mtick_freq', 5))
+                    elif coord_index == 1:
+                        coord.set_minor_frequency(config.get('y_mtick_freq', 5))
+                    elif coord_index == 2:
+                        coord.set_minor_frequency(config.get('z_mtick_freq', 5))
+                    coord.display_minor_ticks(True)
+                except Exception:
+                    pass
+
+    def _apply_colorbar_preferences(self, config: dict):
+        cax = getattr(self, "cax", None)
+        colorbar = getattr(self, "colorbar", None)
+        if cax is None or colorbar is None:
+            return
+        bounds = [
+            config.get('cbar_pos_x', 0.9),
+            config.get('cbar_pos_y', 0.11),
+            config.get('cbar_width', 0.04),
+            config.get('cbar_height', 0.77),
+        ]
+        try:
+            cax.set_position(bounds)
+        except Exception:
+            pass
+        orientation = str(config.get('colorbar_orientation', 'vertical') or '').lower()
+        if orientation not in ("vertical", "horizontal"):
+            orientation = "vertical"
+        if orientation != self._current_colorbar_orientation():
+            self._rebuild_colorbar(orientation)
+        else:
+            ColorSettingsPanel.apply_colorbar_settings(cax=cax, colorbar=colorbar, config=config)
+            self._set_colorbar_zorder()
+        if self._is_colorbar_auto_layout_enabled():
+            self._schedule_colorbar_auto_layout_if_anchor_changed(force=True)
+
+    def apply_preferences(self, redraw: bool = True):
+        """Apply the shared Preferences config to an open channel-map window."""
+        config = getattr(getattr(self, "fits_viewer", None), "config_manager", None)
+        config = getattr(config, "config", None) if config is not None else self.config
+        if not isinstance(config, dict):
+            return
+        self.config = config
+        self.decimal = config.get('decimal', True)
+        self.auto_precision_digits = bool(config.get('auto_precision_digits', True))
+        self.number_decimals = config.get('number_decimals', 6)
+        self.coord_wrap = config.get('coord_wrap', 180)
+
+        for formatter in list((getattr(self, "_marker_formats", {}) or {}).values()):
+            formatter.decimal = self.decimal
+            formatter.auto_precision_digits = self.auto_precision_digits
+            formatter.number_decimals = self.number_decimals
+            formatter.coord_wrap = self.coord_wrap
+
+        for image in list(getattr(self, "im_list", []) or []):
+            try:
+                image.cmap.set_bad(config.get('bad_color'))
+            except Exception:
+                pass
+
+        self._apply_axis_preferences(config)
+        self.update_axis_labels()
+        self.apply_channel_label_settings(redraw=False)
+        self._apply_colorbar_preferences(config)
+
+        if redraw and getattr(self, "canvas", None) is not None:
+            self.canvas.draw_idle()
 
 
     def update_axis_labels(self):

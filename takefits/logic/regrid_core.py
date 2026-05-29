@@ -371,7 +371,11 @@ class RegridEngine:
             if should_trim_nan_edges:
                 data, header = self._trim_nan_edges(data, header)
             self._update_data_extrema(header, data)
-            self._finalize_header(header, data.shape) 
+            self._finalize_header(
+                header,
+                data.shape,
+                preserve_existing_units=(mode == "template_fits"),
+            )
 
                     
             # Preserve beam metadata for non-manual modes by default
@@ -517,7 +521,7 @@ class RegridEngine:
         crval_spec_new = crval_new[spectral_wcs_idx]
         
         orig_spec_coords = (np.arange(n_spec_orig) - (crpix_spec_orig - 1)) * cdelt_spec_orig + crval_spec_orig
-        velocity_scale = self._spectral_velocity_scale_factor(spectral_wcs_idx, cdelt_spec_orig, cdelt_spec_new, n_spec_orig)
+        velocity_scale = self._spectral_velocity_scale_factor(spectral_wcs_idx, cdelt_spec_orig)
         if velocity_scale != 1.0:
             orig_spec_coords *= velocity_scale
 
@@ -779,7 +783,10 @@ class RegridEngine:
 
         template_header, shape_out = self._load_template_header(template_path)
         self._harmonize_spectral_axis(template_header)
-        self._ensure_header_units(template_header)
+        self._ensure_header_units(
+            template_header,
+            preserve_original_cunit_presence=False,
+        )
         self._ensure_header_pc(template_header)
 
         target_wcs = WCS(template_header)
@@ -821,7 +828,6 @@ class RegridEngine:
         work_dtype = self._reproject_float_dtype()
         data_spatial_regridded = np.empty(tuple(intermediate_shape), dtype=work_dtype)
 
-        # Prepare for cross-process WCS handling (serialize to headers)
         src_hdr_2d = source_wcs_2d.to_header()
         tgt_hdr_2d = target_wcs_2d.to_header()
 
@@ -830,14 +836,13 @@ class RegridEngine:
         
         regridded_planes = [None] * n_spec_orig
         
-        # Use ProcessPoolExecutor to avoid GIL and shared-WCS issues (segfault prevention)
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for i in range(n_spec_orig):
                 slicer = [slice(None)] * self.original_data.ndim
                 slicer[np_spectral_axis] = i
                 plane_data = self.original_data[tuple(slicer)]
-                plane_array = np.asarray(plane_data) # ensure copy for pickling
+                plane_array = np.asarray(plane_data)
 
                 fut = executor.submit(
                     _reproject_plane_worker,
@@ -846,7 +851,7 @@ class RegridEngine:
                     tgt_hdr_2d,
                     tuple(spatial_shape_out),
                     method,
-                    0.5 # default footprint threshold
+                    0.5,
                 )
                 futures[fut] = i
 
@@ -855,20 +860,11 @@ class RegridEngine:
                 idx = futures[fut]
                 reprojected_plane, used_fix, downgraded = fut.result()
                 
-                # Check flags returned by worker
                 if used_fix:
                     self._nan_high_order_fallback_used = True
                 if downgraded:
                     self._nan_high_order_downgraded = True
                 
-                # We need to slot this plane back into the full array.
-                # However, the worker returns just the 2D plane.
-                # Since we are iterating, we can't easily assign to 'data_spatial_regridded' 
-                # if it's not shared memory.
-                # But here we are just collecting results.
-                # Let's collect them in a list and stack, or assign to the array we pre-allocated.
-                
-                # Since 'data_spatial_regridded' is in the main process, we can assign to it.
                 slicer = [slice(None)] * data_spatial_regridded.ndim
                 slicer[np_spectral_axis] = idx
                 data_spatial_regridded[tuple(slicer)] = reprojected_plane
@@ -878,34 +874,34 @@ class RegridEngine:
 
         self._emit_progress(60)
         
-        # Get original spectral coordinates
-        crpix_spec_orig = self.original_wcs.wcs.crpix[spectral_wcs_idx]
-        crval_spec_orig = self.original_wcs.wcs.crval[spectral_wcs_idx]
-        cdelt_spec_orig = self.original_wcs.wcs.cdelt[spectral_wcs_idx]
-        orig_spec_coords = (np.arange(n_spec_orig) - (crpix_spec_orig - 1)) * cdelt_spec_orig + crval_spec_orig
+        # Get spectral coordinates in the same velocity unit. Astropy normalizes
+        # km/s FITS velocity axes to m/s inside WCS, so prefer normalized header
+        # values here to avoid unit-mismatched interpolation.
+        orig_spec_coords = self._spectral_axis_coordinates(
+            n_spec_orig,
+            spectral_wcs_idx,
+            header=self.original_header,
+            wcs_obj=self.original_wcs,
+        )
 
-        # Get target spectral coordinates from template
         n_spec_new = shape_out[np_spectral_axis]
-        crpix_spec_new = target_wcs.wcs.crpix[spectral_wcs_idx]
-        crval_spec_new = target_wcs.wcs.crval[spectral_wcs_idx]
-        cdelt_spec_new = target_wcs.wcs.cdelt[spectral_wcs_idx]
-        new_spec_coords = (np.arange(n_spec_new) - (crpix_spec_new - 1)) * cdelt_spec_new + crval_spec_new
+        new_spec_coords = self._spectral_axis_coordinates(
+            n_spec_new,
+            spectral_wcs_idx,
+            header=template_header,
+            wcs_obj=target_wcs,
+        )
         
-        # Reshape data for interpolation: from (n_spec, ny, nx) to (n_spec, ny*nx)
         data_reshaped = np.moveaxis(data_spatial_regridded, np_spectral_axis, 0)
         original_shape = data_reshaped.shape
         data_reshaped = data_reshaped.reshape(n_spec_orig, -1)
 
-        # Create interpolator
         interpolator = interp1d(
             orig_spec_coords, data_reshaped, axis=0, bounds_error=False,
             fill_value=np.nan, kind=method if method in ("nearest", "linear") else "linear"
         )
-        
-        # Apply interpolation
         regridded_spec_data = interpolator(new_spec_coords)
         
-        # Reshape back to final 3D shape
         final_data_reshaped = regridded_spec_data.reshape((n_spec_new,) + original_shape[1:])
         final_data = np.moveaxis(final_data_reshaped, 0, np_spectral_axis)
         preferred_dtype = self._preferred_float_dtype()
@@ -945,15 +941,9 @@ class RegridEngine:
         if axes <= 0:
             return
 
-        scale = 1e-3
-        threshold = 100.0
         for axis in range(1, axes + 1):
             ctype = header.get(f"CTYPE{axis}", "")
             if not self._is_velocity_axis(ctype):
-                continue
-
-            original_unit = header.get(f"CUNIT{axis}", "")
-            if not self._looks_like_meter_per_second_unit(original_unit):
                 continue
 
             cdelt_key = f"CDELT{axis}"
@@ -963,28 +953,38 @@ class RegridEngine:
             except (TypeError, ValueError):
                 continue
 
-            if not np.isfinite(cdelt) or abs(cdelt) < threshold:
+            if not np.isfinite(cdelt):
                 continue
 
-            header[cdelt_key] = cdelt * scale
+            original_unit = header.get(f"CUNIT{axis}", "")
+            should_scale = self._velocity_values_need_kms_scaling(
+                original_unit,
+                cdelt,
+                assume_missing_unit=True,
+            )
+            if not should_scale and not self._velocity_unit_is_missing(original_unit):
+                continue
 
-            crval_key = f"CRVAL{axis}"
-            if crval_key in header:
-                try:
-                    header[crval_key] = float(header[crval_key]) * scale
-                except (TypeError, ValueError):
-                    pass
+            if should_scale:
+                header[cdelt_key] = cdelt * 1e-3
 
-            axis_count = self._header_axis_count(header)
-            for pixel_axis in range(1, axis_count + 1):
-                cd_key = f"CD{axis}_{pixel_axis}"
-                if cd_key in header:
+                crval_key = f"CRVAL{axis}"
+                if crval_key in header:
                     try:
-                        header[cd_key] = float(header[cd_key]) * scale
+                        header[crval_key] = float(header[crval_key]) * 1e-3
                     except (TypeError, ValueError):
-                        continue
+                        pass
 
-            header[f"CUNIT{axis}"] = "km/s"
+                axis_count = self._header_axis_count(header)
+                for pixel_axis in range(1, axis_count + 1):
+                    cd_key = f"CD{axis}_{pixel_axis}"
+                    if cd_key in header:
+                        try:
+                            header[cd_key] = float(header[cd_key]) * 1e-3
+                        except (TypeError, ValueError):
+                            continue
+
+            self._set_axis_unit(header, axis, "km/s")
 
 
     def _reproject_to_system(self, params: Dict, method: str) -> Tuple[np.ndarray, fits.Header, WCS]:
@@ -1169,6 +1169,60 @@ class RegridEngine:
             return self.original_header.copy()
         return fits.Header()
 
+    @staticmethod
+    def _first_commentary_keyword(header: fits.Header) -> Optional[str]:
+        for card in header.cards:
+            if card.keyword in {"HISTORY", "COMMENT"}:
+                return card.keyword
+        return None
+
+    @classmethod
+    def _set_header_value_before_commentary(
+        cls,
+        header: fits.Header,
+        key: str,
+        value,
+        comment=None,
+        *,
+        after: Optional[str] = None,
+    ):
+        if key in header:
+            header[key] = value
+            if comment not in (None, ""):
+                try:
+                    header.comments[key] = comment
+                except Exception:
+                    pass
+            return
+
+        commentary_key = cls._first_commentary_keyword(header)
+        if after and after in header:
+            try:
+                after_index = header.index(after)
+                commentary_index = header.index(commentary_key) if commentary_key else None
+                if commentary_index is None or after_index < commentary_index:
+                    header.set(key, value, comment=comment, after=after)
+                    return
+            except Exception:
+                pass
+
+        if commentary_key:
+            header.set(key, value, comment=comment, before=commentary_key)
+        else:
+            header.set(key, value, comment=comment)
+
+    def _set_axis_unit(self, header: fits.Header, axis_number: int, unit_value):
+        key = f"CUNIT{axis_number}"
+        anchors = (
+            f"CDELT{axis_number}",
+            f"CRVAL{axis_number}",
+            f"CRPIX{axis_number}",
+            f"CTYPE{axis_number}",
+            f"NAXIS{axis_number}",
+        )
+        after = next((anchor for anchor in anchors if anchor in header), None)
+        self._set_header_value_before_commentary(header, key, unit_value, after=after)
+
     def _apply_wcs_to_header(self, header: fits.Header, wcs_obj: WCS, *, frame_hint: str | None = None):
         # Define a comprehensive list of WCS-related keyword prefixes to remove.
         # This ensures a clean slate before writing the new WCS.
@@ -1197,7 +1251,18 @@ class RegridEngine:
         if '' in wcs_header:
             del wcs_header['']
 
-        header.update(wcs_header)
+        last_inserted_key = None
+        for card in wcs_header.cards:
+            if not card.keyword:
+                continue
+            self._set_header_value_before_commentary(
+                header,
+                card.keyword,
+                card.value,
+                card.comment,
+                after=last_inserted_key,
+            )
+            last_inserted_key = card.keyword
 
         # Ensure WCS is initialized
         try:
@@ -1246,8 +1311,8 @@ class RegridEngine:
                 header["CTYPE1"] = _coerce_radec(header, True, ctype1)
             if not ctype2.startswith("DEC--"):
                 header["CTYPE2"] = _coerce_radec(header, False, ctype2)
-            header["CUNIT1"] = "deg"
-            header["CUNIT2"] = "deg"
+            self._set_axis_unit(header, 1, "deg")
+            self._set_axis_unit(header, 2, "deg")
 
         # Enforce RADESYS/EQUINOX/EPOCH
         if frame_name == "fk4":
@@ -1268,13 +1333,25 @@ class RegridEngine:
 
         return header
 
-    def _finalize_header(self, header: fits.Header, data_shape: Tuple[int, ...]):
+    def _finalize_header(
+        self,
+        header: fits.Header,
+        data_shape: Tuple[int, ...],
+        *,
+        preserve_existing_units: bool = False,
+    ):
         header["NAXIS"] = len(data_shape)
         for idx in range(len(data_shape)):
             axis_number = idx + 1
             data_axis = len(data_shape) - axis_number
             header[f"NAXIS{axis_number}"] = int(data_shape[data_axis])
-            header[f"CUNIT{axis_number}"] = self.original_header.get(f"CUNIT{axis_number}", "")
+            unit_key = f"CUNIT{axis_number}"
+            if preserve_existing_units and header.get(unit_key):
+                continue
+            original_unit = ""
+            if self.original_header is not None:
+                original_unit = self.original_header.get(unit_key, "")
+            self._set_axis_unit(header, axis_number, original_unit)
 
     def _annotate_history(
         self,
@@ -1429,6 +1506,53 @@ class RegridEngine:
         np_axis = self.original_data.ndim - 1 - spectral_wcs_idx
         self._spectral_numpy_axis_cache = np_axis
         return np_axis
+
+    def _spectral_axis_coordinates(
+        self,
+        size: int,
+        axis_index: int,
+        *,
+        header: Optional[fits.Header],
+        wcs_obj: WCS,
+    ) -> np.ndarray:
+        axis_number = axis_index + 1
+        coords: Optional[np.ndarray] = None
+        cdelt_value: Optional[float] = None
+        unit_value: object = None
+        ctype_value = ""
+
+        if header is not None:
+            try:
+                crpix = float(header.get(f"CRPIX{axis_number}"))
+                crval = float(header.get(f"CRVAL{axis_number}"))
+                cdelt = float(header.get(f"CDELT{axis_number}"))
+                coords = (np.arange(size, dtype=float) - (crpix - 1.0)) * cdelt + crval
+                cdelt_value = cdelt
+                unit_value = header.get(f"CUNIT{axis_number}")
+                ctype_value = header.get(f"CTYPE{axis_number}", "")
+            except (TypeError, ValueError):
+                coords = None
+
+        if coords is None:
+            crpix = float(wcs_obj.wcs.crpix[axis_index])
+            crval = float(wcs_obj.wcs.crval[axis_index])
+            cdelt = float(wcs_obj.wcs.cdelt[axis_index])
+            coords = (np.arange(size, dtype=float) - (crpix - 1.0)) * cdelt + crval
+            cdelt_value = cdelt
+            if axis_index < len(wcs_obj.wcs.cunit):
+                unit_value = wcs_obj.wcs.cunit[axis_index]
+            if axis_index < len(wcs_obj.wcs.ctype):
+                ctype_value = wcs_obj.wcs.ctype[axis_index]
+
+        if self._is_velocity_axis(str(ctype_value)):
+            if self._velocity_values_need_kms_scaling(
+                unit_value,
+                float(cdelt_value or 0.0),
+                assume_missing_unit=True,
+            ):
+                coords = coords * 1e-3
+
+        return coords
 
     def _get_spectral_slice(self, index: int) -> np.ndarray:
         if index < 0:
@@ -1841,33 +1965,21 @@ class RegridEngine:
         self,
         spectral_axis_index: int,
         cdelt_spec_orig: float,
-        cdelt_spec_new: float,
-        n_spec_orig: int,
-        ) -> float:
-        """
-        Robustly determines the velocity scaling factor, accounting for common
-        unit inconsistencies in FITS headers (e.g., CUNIT=m/s with km/s values).
-        """
+    ) -> float:
         try:
-            if spectral_axis_index < len(self.original_wcs.wcs.cunit):
-                unit_value = self.original_wcs.wcs.cunit[spectral_axis_index]
-                unit_text = str(unit_value or "").strip().lower().replace(" ", "")
-            else:
-                unit_text = ""
-
-            is_ms = "m/s" in unit_text or unit_text.endswith("ms-1")
-
-            # Only apply the 1000x scaling factor if the unit is m/s AND the
-            # actual step value (CDELT) is large, suggesting it's truly in m/s.
-            # If CDELT is small (e.g., 2.0), we assume the CUNIT is a mistake
-            # and the values are already in km/s, so we DO NOT scale.
-            if is_ms and abs(cdelt_spec_orig) > 100.0:
-                return 1e-3 # Scale from m/s to km/s
-
+            unit_value = (
+                self.original_wcs.wcs.cunit[spectral_axis_index]
+                if spectral_axis_index < len(self.original_wcs.wcs.cunit)
+                else None
+            )
+            if self._velocity_values_need_kms_scaling(
+                unit_value,
+                cdelt_spec_orig,
+                assume_missing_unit=False,
+            ):
+                return 1e-3
         except Exception:
-            # On any failure, default to no scaling.
             return 1.0
-        # If the conditions are not met, do not apply any scaling.
         return 1.0
 
 
@@ -1892,7 +2004,7 @@ class RegridEngine:
                         is_velocity=True,
                     )
                 if orig_unit:
-                    template_header[f"CUNIT{idx + 1}"] = orig_unit
+                    self._set_axis_unit(template_header, idx + 1, orig_unit)
 
         self._synchronize_rest_metadata(template_header)
 
@@ -2214,14 +2326,41 @@ class RegridEngine:
         if value is None:
             return False
         text = str(value).strip().lower().replace(" ", "")
-        return any(token in text for token in ("m/s", "ms-1", "meter/second", "metre/second"))
+        return text in {"m/s", "ms-1", "meter/second", "metre/second"}
+
+    @staticmethod
+    def _velocity_unit_is_missing(value: object) -> bool:
+        return value is None or str(value).strip() == ""
+
+    @classmethod
+    def _velocity_values_need_kms_scaling(
+        cls,
+        unit_value: object,
+        cdelt_value: float,
+        *,
+        assume_missing_unit: bool,
+    ) -> bool:
+        try:
+            cdelt = float(cdelt_value)
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(cdelt) or abs(cdelt) < 100.0:
+            return False
+        return cls._looks_like_meter_per_second_unit(unit_value) or (
+            assume_missing_unit and cls._velocity_unit_is_missing(unit_value)
+        )
 
     @staticmethod
     def _is_velocity_axis(ctype: str) -> bool:
         upper = (ctype or "").upper()
         return any(token in upper for token in ("VRAD", "VELO", "VOPT"))
 
-    def _ensure_header_units(self, header: fits.Header):
+    def _ensure_header_units(
+        self,
+        header: fits.Header,
+        *,
+        preserve_original_cunit_presence: bool = True,
+    ):
         original_ctypes = list(self.original_wcs.wcs.ctype)
         original_cunits = list(self.original_wcs.wcs.cunit)
         axes = header.get("WCSAXES", header.get("NAXIS", len(original_cunits)))
@@ -2238,7 +2377,11 @@ class RegridEngine:
 
             # If original header exists and CUNIT was not present for this axis, ensure it's not in the new header.
             # The default for get is False, meaning if the axis didn't exist in original, we treat it as "no CUNIT".
-            if self.original_header and not original_cunits_present.get(idx, False):
+            if (
+                preserve_original_cunit_presence
+                and self.original_header
+                and not original_cunits_present.get(idx, False)
+            ):
                 if key in header:
                     del header[key]
                 continue
@@ -2262,7 +2405,7 @@ class RegridEngine:
                      sanitized = "km/s"
 
             if sanitized:
-                header[key] = sanitized
+                self._set_axis_unit(header, idx + 1, sanitized)
             elif key in header:
                 # If sanitization results in empty string, remove the key if it exists.
                 del header[key]
@@ -2284,13 +2427,21 @@ class RegridEngine:
             except (ValueError, TypeError):
                 return "km/s" if is_velocity else ""
         
-        # FIX: Do not incorrectly relabel m/s as km/s.
-        # This preserves the original unit, preventing the 1000x scaling error.
         if is_velocity:
             if unit.is_equivalent(u.m / u.s):
-                return "m/s"
-            if unit.is_equivalent(u.km / u.s):
-                return "km/s"
+                try:
+                    meters_per_second = (1.0 * unit).to(u.m / u.s).value
+                    if np.isclose(meters_per_second, 1000.0):
+                        return "km/s"
+                    if np.isclose(meters_per_second, 1.0):
+                        return "m/s"
+                except Exception:
+                    pass
+                try:
+                    unit_text = unit.to_string(format="fits").replace(" ", "")
+                    return unit_text or "km/s"
+                except Exception:
+                    return "km/s"
         
         try:
             return unit.to_string(format="fits").replace(" ", "")
@@ -2970,7 +3121,7 @@ class RegridEngine:
             is_velocity = self._is_velocity_axis(ctype)
             sanitized_unit = self._sanitize_unit_value(unit, is_velocity=is_velocity)
             new_header[f"CTYPE{i + 1}"] = ctype
-            new_header[f"CUNIT{i + 1}"] = sanitized_unit
+            self._set_axis_unit(new_header, i + 1, sanitized_unit)
             new_header[f"CRVAL{i + 1}"] = anchor_arr[i]
             new_header[f"CDELT{i + 1}"] = new_cdelt_arr[i]
 
@@ -3156,8 +3307,6 @@ class RegridEngine:
             velocity_scale = self._spectral_velocity_scale_factor(
                 spectral_wcs_idx,
                 cdelt_spec_orig,
-                cdelt_spec_new,
-                n_spec_orig,
             )
             if velocity_scale != 1.0:
                 orig_spec_coords = orig_spec_coords * velocity_scale

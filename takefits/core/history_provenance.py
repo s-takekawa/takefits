@@ -92,6 +92,12 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def sanitize_fits_history_text(value: Any) -> str:
+    """Return text that Astropy can store in a FITS HISTORY card."""
+    ascii_text = str(value).encode("ascii", "replace").decode("ascii")
+    return "".join(ch if " " <= ch <= "~" else "?" for ch in ascii_text)
+
+
 def _coerce_record(record: Any) -> Any:
     if hasattr(record, "action") and hasattr(record, "params"):
         return record
@@ -204,6 +210,11 @@ def _format_value(value: Any) -> str:
     return str(value)
 
 
+def _format_path_value(value: Any) -> str:
+    text = str(value or "")
+    return text.replace("\\", "/").rstrip("/").split("/")[-1]
+
+
 def _extract_action_params(action_name: str, raw_params: Dict[str, Any]) -> Dict[str, Any]:
     params = dict(raw_params or {})
     if action_name == "compute_regrid":
@@ -234,8 +245,8 @@ def _summarize_action_params(action_name: str, params: Dict[str, Any]) -> str:
         value = params.get(key)
         if value is None:
             continue
-        if key == "mask_path":
-            value = str(value).split("/")[-1]
+        if key.endswith("_path"):
+            value = _format_path_value(value)
         parts.append(f"{key}={_format_value(value)}")
 
     if not parts:
@@ -551,9 +562,10 @@ def build_processing_history_lines_from_records(
 
     if not lines:
         return []
+    safe_lines = [sanitize_fits_history_text(line) for line in lines]
     if max_entries is None:
-        return lines
-    return lines[-max_entries:]
+        return safe_lines
+    return safe_lines[-max_entries:]
 
 
 def build_processing_history_lines_with_action(

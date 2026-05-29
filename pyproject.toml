@@ -8,8 +8,11 @@ dynamic = ["version"]
 description = "GUI-based astronomical FITS viewer and analysis tool"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.11"
-license = "MIT"
-license-files = ["LICENSE"]
+license = "MIT AND BSD-3-Clause"
+license-files = [
+  "LICENSE",
+  "takefits/logic/scimes/LICENSE",
+]
 authors = [{ name = "Shunya Takekawa" }]
 keywords = ["astronomy", "fits", "radio astronomy", "visualization", "gui"]
 classifiers = [
@@ -31,6 +34,7 @@ dependencies = [
   "PyYAML>=6.0.2",
   "astrodendro>=0.3.1",
   "scikit-image>=0.26.0",
+  "scikit-learn>=1.4",
 ]
 
 [project.urls]
@@ -56,4 +60,6 @@ include-package-data = false
 
 [tool.setuptools.packages.find]
 include = ["takefits*"]
-exclude = ["takefits.logic.scimes", "takefits.logic.scimes.*"]
+
+[tool.setuptools.package-data]
+"takefits.logic.scimes" = ["LICENSE", "README.md"]

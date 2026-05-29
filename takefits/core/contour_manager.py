@@ -5,7 +5,7 @@ import os
 import weakref
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING, Set, Any
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING, Set
 
 import numpy as np
 import matplotlib.cm as cm
@@ -21,10 +21,6 @@ try:
     from scipy.ndimage import gaussian_filter
 except Exception:  # pragma: no cover - scipy is expected but guard just in case
     gaussian_filter = None
-
-from matplotlib.collections import LineCollection
-
-
 
 ContourItemProvider = Callable[[], Sequence["ContourItem"]]
 
@@ -705,6 +701,34 @@ class ContourLayer:
                 pass
         self._active = True
 
+    @staticmethod
+    def _mark_contour_artist_for_export(artist: object) -> None:
+        setattr(artist, "_takefits_contour_artist", True)
+        set_gid = getattr(artist, "set_gid", None)
+        if callable(set_gid):
+            try:
+                set_gid("takefits-contour")
+            except Exception:
+                pass
+
+        for method_name, value in (
+            ("set_rasterized", False),
+            ("set_snap", False),
+            ("set_antialiased", True),
+            ("set_capstyle", "round"),
+            ("set_joinstyle", "round"),
+            ("set_solid_capstyle", "round"),
+            ("set_dash_capstyle", "round"),
+            ("set_solid_joinstyle", "round"),
+            ("set_dash_joinstyle", "round"),
+        ):
+            method = getattr(artist, method_name, None)
+            if callable(method):
+                try:
+                    method(value)
+                except Exception:
+                    pass
+
     def _draw_overlay_state(self, state: ContourState) -> None:
         if state is None or not state.items:
             return
@@ -737,17 +761,6 @@ class ContourLayer:
                 continue
             ax = target_item.ax
             wcs = getattr(ax, "wcs", None)
-
-            # Optimization: Group segments by style (color, linewidth, linestyle) to use LineCollection
-            # Key: (color_tuple_or_string, linewidth, linestyle)
-            # Value: list of segments (pixels) along with color if it varies per segment
-            # Actually LineCollection handles varying colors well if we pass a list.
-            # But line style/width usually constant per collection for best performance.
-            
-            # For "rainbow" mode or per-segment color, we will have varying colors.
-            # We can use one LineCollection per (linewidth, linestyle) and pass a list of colors.
-
-            grouped_segments: Dict[Tuple[float, str], List[Tuple[np.ndarray, Any]]] = {}
 
             for segment in item_state.segments:
                 coords = None
@@ -788,27 +801,18 @@ class ContourLayer:
 
                 linewidth = overlay_params.linewidth or 1.0
                 linestyle = getattr(segment, "linestyle", None) or ("dashed" if segment.level < 0 else "solid")
+                if isinstance(color_to_apply, str) and color_to_apply.lower() == "original":
+                    color_to_apply = "white"
 
-                key = (linewidth, linestyle)
-                if key not in grouped_segments:
-                    grouped_segments[key] = []
-                grouped_segments[key].append((coords, color_to_apply))
-
-            # Create LineCollections
-            for (lw, ls), seg_data in grouped_segments.items():
-                if not seg_data:
-                    continue
-                pix_segments = [s[0] for s in seg_data]
-                colors = [s[1] for s in seg_data]
-                
-                lc = LineCollection(
-                    pix_segments,
-                    colors=colors,
-                    linewidths=lw,
-                    linestyles=ls
+                line, = ax.plot(
+                    coords[:, 0],
+                    coords[:, 1],
+                    color=color_to_apply,
+                    linewidth=linewidth,
+                    linestyle=linestyle,
                 )
-                ax.add_collection(lc)
-                new_artists.append(lc)
+                self._mark_contour_artist_for_export(line)
+                new_artists.append(line)
 
         if new_artists:
             self._overlay_artists[overlay_id] = new_artists
@@ -1092,6 +1096,7 @@ class ContourLayer:
 
                     for coll in contour.collections:
                         drawn_artists.append(coll)
+                        self._mark_contour_artist_for_export(coll)
                         
                         try:
                             level = coll.get_array()[0]

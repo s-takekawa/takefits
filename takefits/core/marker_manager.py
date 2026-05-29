@@ -472,7 +472,6 @@ class MarkerManager(QObject):
         viewer = self._viewer_for_plane(plane)
         format_pix = getattr(viewer, "format_pix", None) if viewer else None
         wcs = getattr(viewer, "wcs", None) if viewer else None
-        base_plane = self._base_plane_for(plane)
 
         # Attach world endpoints for lines so orientation survives frame changes on load.
         if format_pix is not None and wcs is not None:
@@ -482,8 +481,12 @@ class MarkerManager(QObject):
                     continue
                 try:
                     start, end = marker._endpoints()
-                    wx0, wy0 = format_pix.pix_to_wcs(wcs, start[0], start[1], base_plane)
-                    wx1, wy1 = format_pix.pix_to_wcs(wcs, end[0], end[1], base_plane)
+                    start_world = self._pixel_to_world_pair(plane, start)
+                    end_world = self._pixel_to_world_pair(plane, end)
+                    if start_world is None or end_world is None:
+                        continue
+                    wx0, wy0 = start_world
+                    wx1, wy1 = end_world
                     meta = dict(state.metadata)
                     meta["pixel_endpoints"] = [(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))]
                     meta["world_endpoints"] = [(float(wx0), float(wy0)), (float(wx1), float(wy1))]
@@ -546,7 +549,7 @@ class MarkerManager(QObject):
                     layer.world_frame = world_frame
                 
                 # Prepare defaults
-                defaults = self._shared_world_defaults()
+                defaults = self._shared_world_defaults(target_plane)
 
                 viewer = self._viewer_for_plane(target_plane)
                 target_wcs = getattr(viewer, "wcs", None)
@@ -691,8 +694,8 @@ class MarkerManager(QObject):
             raise ValueError(f"No markers imported; plane '{plane}' is incompatible with this viewer.")
         return primary_plane
 
-    def _shared_world_defaults(self) -> List[float]:
-        return shared_world_defaults(getattr(self, "viewer", None))
+    def _shared_world_defaults(self, plane: Optional[PlaneId] = None) -> List[float]:
+        return shared_world_defaults(getattr(self, "viewer", None), plane)
 
     def world_frame_for_plane(self, plane: PlaneId) -> Optional[str]:
         layer = self._layers.get(plane)
@@ -1334,24 +1337,68 @@ class MarkerManager(QObject):
         viewer = self._viewer_for_plane(plane)
         if viewer is None:
             return
-        format_pix = getattr(viewer, "format_pix", None)
-        wcs = getattr(viewer, "wcs", None)
-        if format_pix is None or wcs is None:
+        world_pair = self._pixel_to_world_pair(plane, marker.pixel)
+        if world_pair is None:
             return
-        try:
-            base_plane = self._base_plane_for(plane)
-            wx, wy = format_pix.pix_to_wcs(wcs, marker.pixel[0], marker.pixel[1], base_plane)
-        except Exception:
-            return
+        wx, wy = world_pair
         marker.apply_new_world((wx, wy))
         layer = self._layers.get(plane)
         if layer is None:
             return
+        wcs = getattr(viewer, "wcs", None)
         frame_name = _frame_name_from_wcs(wcs)
         if frame_name and not layer.world_frame:
             layer.world_frame = frame_name
         if marker.marker_id not in layer.markers:
             layer.markers[marker.marker_id] = marker
+
+    def _pixel_to_world_pair(
+        self,
+        plane: PlaneId,
+        pixel: Tuple[float, float] | Tuple[float, ...],
+    ) -> Optional[Tuple[float, float]]:
+        viewer = self._viewer_for_plane(plane)
+        if viewer is None:
+            return None
+
+        custom_resolver = getattr(viewer, "marker_pix_to_world", None)
+        if callable(custom_resolver):
+            try:
+                resolved = custom_resolver(plane, pixel)
+            except Exception:
+                resolved = None
+            if isinstance(resolved, (tuple, list)) and len(resolved) >= 2:
+                try:
+                    wx = float(resolved[0])
+                    wy = float(resolved[1])
+                except Exception:
+                    wx = wy = None
+                if wx is not None and wy is not None and math.isfinite(wx) and math.isfinite(wy):
+                    return (wx, wy)
+
+        format_pix = getattr(viewer, "format_pix", None)
+        wcs = getattr(viewer, "wcs", None)
+        if format_pix is None or wcs is None:
+            return None
+        base_plane = self._base_plane_for(plane)
+        plane_candidates = []
+        if plane:
+            plane_candidates.append(plane)
+        if base_plane and base_plane not in plane_candidates:
+            plane_candidates.append(base_plane)
+        for plane_name in plane_candidates:
+            try:
+                wx, wy = format_pix.pix_to_wcs(wcs, pixel[0], pixel[1], plane_name)
+            except Exception:
+                continue
+            try:
+                wx = float(wx)
+                wy = float(wy)
+            except Exception:
+                continue
+            if math.isfinite(wx) and math.isfinite(wy):
+                return (wx, wy)
+        return None
 
     def _create_marker_from_config(self, plane: PlaneId, pixel: Tuple[float, float]) -> List[Marker]:
         config = self._pending_placement or {}

@@ -4,6 +4,7 @@ from takefits.ui.subwindow import SubWindow, SubWindow_control
 
 from takefits.ui.control_panel import ControlPanel
 from takefits.ui.range_control import RangeControlPanel
+from takefits.ui.magnifier_panel import MagnifierPanel
 from takefits.tools.regrid_panel import RegridPanel
 from takefits.logic.regridder import Regridder
 from takefits.ui.save_fits_dialog import SaveFITS
@@ -46,7 +47,7 @@ from PySide6.QtWidgets import (
     QToolTip,
 )
 from PySide6.QtCore import QThread, QTimer, QSignalBlocker, QEvent, Qt
-from PySide6.QtGui import QCursor
+from PySide6.QtGui import QCursor, QGuiApplication
 import base64
 import io
 import os
@@ -146,6 +147,7 @@ class MainWindow(FITSViewer):
         self.menu_bar.main_action.setChecked(True)
         self.control_panel = None
         self.range_panel = None
+        self.magnifier_panel = None
         if self._browse_first_startup:
             self.menu_bar.control_panel_action.setChecked(False)
             self.menu_bar.range_panel_action.setChecked(False)
@@ -447,6 +449,42 @@ class MainWindow(FITSViewer):
             self.range_panel.hide()
         return self.range_panel
 
+    def ensure_magnifier_panel(self):
+        """Create the live cursor magnifier panel on first demand."""
+        if getattr(self, "magnifier_panel", None) is None:
+            self.magnifier_panel = MagnifierPanel(self)
+            self.magnifier_panel.setProperty("_default_position_applied", False)
+        return self.magnifier_panel
+
+    def _position_magnifier_panel_at_screen_top_right(self, panel):
+        if panel is None:
+            return
+        try:
+            panel.adjustSize()
+        except Exception:
+            pass
+        try:
+            screen = QGuiApplication.screenAt(self.frameGeometry().center())
+        except Exception:
+            screen = None
+        if screen is None:
+            try:
+                screen = QGuiApplication.primaryScreen()
+            except Exception:
+                screen = None
+        if screen is None:
+            return
+        try:
+            available = screen.availableGeometry()
+            hint = panel.sizeHint()
+            width = max(int(panel.width()), int(hint.width()))
+            margin = 12
+            x = available.right() - width - margin + 1
+            y = available.top() + margin
+            panel.move(max(available.left(), x), y)
+        except Exception:
+            return
+
     def _open_control_panel_tool(self, method_name: str):
         panel = self.ensure_control_panel(visible=False)
         opener = getattr(panel, str(method_name), None)
@@ -663,7 +701,12 @@ class MainWindow(FITSViewer):
         undo_fn = getattr(active_window, "undo_last_action", None)
         redo_fn = getattr(active_window, "redo_last_action", None)
         if session is not None and callable(undo_fn) and callable(redo_fn):
-            return active_window
+            try:
+                has_history = bool(session.can_undo() or session.can_redo())
+            except Exception:
+                has_history = False
+            if has_history:
+                return active_window
         return self
 
     def _format_action_label(self, action_name: str) -> str:
@@ -1318,6 +1361,7 @@ class MainWindow(FITSViewer):
         _add("main_window", self)
         _add("control_panel", getattr(self, "control_panel", None))
         _add("range_panel", getattr(self, "range_panel", None))
+        _add("magnifier_panel", getattr(self, "magnifier_panel", None))
         _add("marker_panel", getattr(self, "marker_panel", None))
         _add("regrid_panel", getattr(self, "_regrid_panel", None))
 
@@ -3041,6 +3085,7 @@ class MainWindow(FITSViewer):
         state["main_window"] = self._capture_window_geometry(self)
         state["control_panel"] = self._capture_window_geometry(getattr(self, "control_panel", None))
         state["range_panel"] = self._capture_window_geometry(getattr(self, "range_panel", None))
+        state["magnifier_panel"] = self._capture_window_geometry(getattr(self, "magnifier_panel", None))
         state["marker_panel"] = self._capture_window_geometry(getattr(self, "marker_panel", None))
         state["regrid_panel"] = self._capture_window_geometry(getattr(self, "_regrid_panel", None))
 
@@ -3113,6 +3158,7 @@ class MainWindow(FITSViewer):
         self._restore_window_geometry(self, geometry_state.get("main_window"))
         self._restore_window_geometry(getattr(self, "control_panel", None), geometry_state.get("control_panel"))
         self._restore_window_geometry(getattr(self, "range_panel", None), geometry_state.get("range_panel"))
+        self._restore_window_geometry(getattr(self, "magnifier_panel", None), geometry_state.get("magnifier_panel"))
         self._restore_window_geometry(getattr(self, "marker_panel", None), geometry_state.get("marker_panel"))
         self._restore_window_geometry(getattr(self, "_regrid_panel", None), geometry_state.get("regrid_panel"))
 
@@ -3478,6 +3524,7 @@ class MainWindow(FITSViewer):
         panel_state = {
             "control_panel_visible": bool(getattr(self, "control_panel", None) and self.control_panel.isVisible()),
             "range_panel_visible": bool(getattr(self, "range_panel", None) and self.range_panel.isVisible()),
+            "magnifier_panel_visible": bool(getattr(self, "magnifier_panel", None) and self.magnifier_panel.isVisible()),
             "marker_panel_visible": bool(getattr(self, "marker_panel", None) and self.marker_panel.isVisible()),
             "regrid_panel_visible": bool(getattr(self, "_regrid_panel", None) and self._regrid_panel.isVisible()),
         }
@@ -5596,6 +5643,12 @@ class MainWindow(FITSViewer):
             self.hide_range_panel()
         if hasattr(self, "menu_bar") and hasattr(self.menu_bar, "range_panel_action"):
             self.menu_bar.range_panel_action.setChecked(bool(panel_state.get("range_panel_visible", True)))
+        if panel_state.get("magnifier_panel_visible", False):
+            self.show_magnifier_panel()
+        else:
+            self.hide_magnifier_panel()
+        if hasattr(self, "menu_bar") and hasattr(self.menu_bar, "magnifier_panel_action"):
+            self.menu_bar.magnifier_panel_action.setChecked(bool(panel_state.get("magnifier_panel_visible", False)))
 
         sub_state = panel_state.get("subwindows")
         if isinstance(sub_state, dict) and self.data.ndim > 2:
@@ -6815,6 +6868,18 @@ class MainWindow(FITSViewer):
             panel.show()
         self._set_panel_toggle_checked("range_panel_action", True)
 
+    def show_magnifier_panel(self):
+        panel = self.ensure_magnifier_panel()
+        if not bool(panel.property("_default_position_applied")):
+            self._position_magnifier_panel_at_screen_top_right(panel)
+            panel.setProperty("_default_position_applied", True)
+        if not panel.isVisible():
+            panel.show()
+        panel.raise_()
+        panel.activateWindow()
+        self._set_panel_toggle_checked("magnifier_panel_action", True)
+        self._refresh_magnifier_from_current_cursor("xy", force=True)
+
     def hide_control_panel(self):
         panel = getattr(self, "control_panel", None)
         if panel is not None:
@@ -6827,10 +6892,18 @@ class MainWindow(FITSViewer):
             panel.hide()
         self._set_panel_toggle_checked("range_panel_action", False)
 
+    def hide_magnifier_panel(self):
+        panel = getattr(self, "magnifier_panel", None)
+        if panel is not None:
+            panel.hide()
+        self._set_panel_toggle_checked("magnifier_panel_action", False)
+
     def on_control_panel_closed(self):
         # When control panel is closed, uncheck the menu action
         self.menu_bar.control_panel_action.setChecked(False)
 
+    def on_magnifier_panel_closed(self):
+        self._set_panel_toggle_checked("magnifier_panel_action", False)
 
     def clear_all_regions_globally(self):
         """
@@ -6869,18 +6942,13 @@ class MainWindow(FITSViewer):
 
     # ------------------------------------------------------------------
     # Region save/load
-    def save_regions_dialog(self):
-        if not hasattr(self, "region_manager"):
-            return
-        # Collect candidates (manager, plane, label) that have regions
+    def _region_target_candidates(self):
         candidates = []
-        # Main viewer
         main_regions = getattr(self.region_manager, "regions", [])
         if main_regions:
             planes = {getattr(r, "plane", None) or getattr(self, "plane", "xy") for r in main_regions}
             for plane_name in planes:
                 candidates.append((self.region_manager, plane_name.lower(), "Main"))
-        # Integ windows
         if hasattr(self, "integ_result_windows"):
             for window_ref in list(self.integ_result_windows):
                 window = window_ref()
@@ -6913,11 +6981,6 @@ class MainWindow(FITSViewer):
                 for plane_name in planes:
                     candidates.append((mgr, plane_name.lower(), label))
 
-        if not candidates:
-            QMessageBox.information(self, "Regions", "No regions to save.")
-            return
-
-        # Deduplicate manager/plane combos
         unique = []
         seen = set()
         for mgr, plane_name, label in candidates:
@@ -6926,6 +6989,15 @@ class MainWindow(FITSViewer):
                 continue
             seen.add(key)
             unique.append((mgr, plane_name, label))
+        return unique
+
+    def _choose_region_target(self, title: str, prompt: str):
+        if not hasattr(self, "region_manager"):
+            return None
+        unique = self._region_target_candidates()
+        if not unique:
+            QMessageBox.information(self, "Regions", "No regions to save.")
+            return None
 
         if len(unique) == 1:
             target_manager, target_plane, _label = unique[0]
@@ -6936,27 +7008,104 @@ class MainWindow(FITSViewer):
                 if len(short_lbl) > 24:
                     short_lbl = short_lbl[:21] + "..."
                 items.append(f"{short_lbl} - {pl.upper()}")
-            choice, ok = QInputDialog.getItem(self, "Save Regions", "Select panel/plane to save:", items, 0, False)
+            choice, ok = QInputDialog.getItem(self, title, prompt, items, 0, False)
             if not ok or not choice:
-                return
+                return None
             idx = items.index(choice)
             target_manager, target_plane, _label = unique[idx]
+        return target_manager, target_plane
+
+    def _enable_region_mode_after_import(self):
+        if getattr(self, "region_mode_enabled", False):
+            return
+        try:
+            try:
+                self.menu_bar.circle_action.setChecked(True)
+            except Exception:
+                pass
+            self.set_region_shape("circle")
+        except Exception:
+            pass
+
+    def _load_regions_into_open_xy_windows_from_dict(self, payload):
+        if not hasattr(self, "integ_result_windows"):
+            return
+        for window_ref in list(self.integ_result_windows):
+            window = window_ref()
+            if window is None:
+                continue
+            try:
+                if getattr(window, "plane", "").lower() != "xy":
+                    continue
+                if hasattr(window, "region_manager"):
+                    window.region_manager.import_regions_from_dict(payload, clear_existing=True)
+            except Exception:
+                continue
+
+    def _load_regions_into_open_xy_windows_from_ds9(self, content: str):
+        if not hasattr(self, "integ_result_windows"):
+            return
+        for window_ref in list(self.integ_result_windows):
+            window = window_ref()
+            if window is None:
+                continue
+            try:
+                if getattr(window, "plane", "").lower() != "xy":
+                    continue
+                if hasattr(window, "region_manager"):
+                    window.region_manager.import_regions_from_ds9_text(content, clear_existing=True)
+            except Exception:
+                continue
+
+    def _detect_region_file_kind(self, content: str) -> tuple[str, object]:
+        stripped = content.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                payload = json.loads(content)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and payload.get("format") == "takefits.region":
+                return ("takefits", payload)
+        return ("ds9", content)
+
+    def save_regions_dialog(self):
+        target = self._choose_region_target("Save Regions", "Select panel/plane to save:")
+        if target is None:
+            return
+        target_manager, target_plane = target
         default_dir = os.path.dirname(getattr(self, "filename_path", "")) or os.getcwd()
-        path, _ = QFileDialog.getSaveFileName(
+        path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "Save Regions",
             os.path.join(default_dir, f"regions_{target_plane}.region"),
-            "Region Files (*.region.json *.region *.json);;All Files (*)",
+            "TakeFITS Region (*.region.json *.region *.json);;DS9 Region Files (*.reg);;All Files (*)",
         )
         if not path:
             return
-        if not path.lower().endswith((".region.json", ".region", ".json")):
-            path += ".region"
+        ext_lower = os.path.splitext(path)[1].lower()
+        save_ds9 = selected_filter.startswith("DS9") or ext_lower == ".reg"
+        if not ext_lower:
+            if save_ds9:
+                path += ".reg"
+            else:
+                path += ".region"
         try:
-            payload = target_manager.export_regions_to_dict(target_plane)
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, indent=2)
-            QMessageBox.information(self, "Regions", f"Saved {len(payload.get('regions', []))} region(s).")
+            if save_ds9:
+                content, summary = target_manager.export_regions_to_ds9(target_plane)
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                count = int(summary.get("count", 0))
+                flattened = int(summary.get("flattened_cubes", 0))
+                message = f"Saved {count} region(s) in DS9 format."
+                if flattened:
+                    noun = "region" if flattened == 1 else "regions"
+                    message += f" {flattened} cube {noun} were flattened to 2D box entries with preserved Z metadata."
+                QMessageBox.information(self, "Regions", message)
+            else:
+                payload = target_manager.export_regions_to_dict(target_plane)
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2)
+                QMessageBox.information(self, "Regions", f"Saved {len(payload.get('regions', []))} region(s).")
         except Exception as exc:
             QMessageBox.warning(self, "Regions", f"Failed to save regions: {exc}")
 
@@ -6964,43 +7113,34 @@ class MainWindow(FITSViewer):
         if not hasattr(self, "region_manager"):
             return
         default_dir = os.path.dirname(getattr(self, "filename_path", "")) or os.getcwd()
-        path, _ = QFileDialog.getOpenFileName(
+        path, _selected_filter = QFileDialog.getOpenFileName(
             self,
             "Load Regions",
             default_dir,
-            "Region Files (*.region.json *.region *.json);;All Files (*)",
+            "Region Files (*.region.json *.region *.json *.reg);;All Files (*)",
         )
         if not path:
             return
         try:
             with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            # Load into main viewer
-            self.region_manager.import_regions_from_dict(payload, clear_existing=True)
-            # If region mode was off, enable it with circle mode for immediate interaction
-            if not getattr(self, "region_mode_enabled", False):
-                try:
-                    try:
-                        self.menu_bar.circle_action.setChecked(True)
-                    except Exception:
-                        pass
-                    self.set_region_shape("circle")
-                except Exception:
-                    pass
-            # Also load into any open integration result windows on the XY plane
-            if hasattr(self, "integ_result_windows"):
-                for window_ref in list(self.integ_result_windows):
-                    window = window_ref()
-                    if window is None:
-                        continue
-                    try:
-                        if getattr(window, "plane", "").lower() != "xy":
-                            continue
-                        if hasattr(window, "region_manager"):
-                            window.region_manager.import_regions_from_dict(payload, clear_existing=True)
-                    except Exception:
-                        continue
-            QMessageBox.information(self, "Regions", "Regions loaded.")
+                content = handle.read()
+            kind, payload = self._detect_region_file_kind(content)
+            if kind == "ds9":
+                summary = self.region_manager.import_regions_from_ds9_text(content, clear_existing=True)
+                self._enable_region_mode_after_import()
+                self._load_regions_into_open_xy_windows_from_ds9(content)
+                loaded = int(summary.get("loaded", 0))
+                skipped = int(summary.get("skipped", 0))
+                message = f"Imported {loaded} DS9 region(s)."
+                if skipped:
+                    noun = "entry" if skipped == 1 else "entries"
+                    message += f" Skipped {skipped} unsupported {noun}."
+                QMessageBox.information(self, "Regions", message)
+            else:
+                self.region_manager.import_regions_from_dict(payload, clear_existing=True)
+                self._enable_region_mode_after_import()
+                self._load_regions_into_open_xy_windows_from_dict(payload)
+                QMessageBox.information(self, "Regions", "Regions loaded.")
         except Exception as exc:
             QMessageBox.warning(self, "Regions", f"Failed to load regions: {exc}")
 

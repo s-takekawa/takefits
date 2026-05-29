@@ -1622,12 +1622,18 @@ class IntegResultWindow(QMainWindow):
 
         # Initialize click cursor lines
         self.click_v_line = self.overlay_ax.axvline(
-            0, 0, 1, visible=False, lw=config.get('click_linewidth', 0.75),
-            c=config.get('click_linecolor', 'greenyellow'), animated=True
+            0, 0, 1, visible=False, lw=config.get('click_linewidth', 0.5),
+            c=config.get('click_linecolor', 'cyan'),
+            ls=str(config.get('click_linestyle', '-')),
+            alpha=float(config.get('click_alpha', 1.0)),
+            animated=True
         )
         self.click_h_line = self.overlay_ax.axhline(
-            0, 0, 1, visible=False, lw=config.get('click_linewidth', 0.75),
-            c=config.get('click_linecolor', 'greenyellow'), animated=True
+            0, 0, 1, visible=False, lw=config.get('click_linewidth', 0.5),
+            c=config.get('click_linecolor', 'cyan'),
+            ls=str(config.get('click_linestyle', '-')),
+            alpha=float(config.get('click_alpha', 1.0)),
+            animated=True
         )
 
         # Initialize and configure the coordinate label (for intensity)
@@ -1749,6 +1755,7 @@ class IntegResultWindow(QMainWindow):
         central_widget = QWidget()
         central_widget.setLayout(layout)
         self.setCentralWidget(central_widget)
+        self.apply_preferences(redraw=False)
         self.label.raise_()
         # Prime background for overlay-based draws
         self.canvas.draw()
@@ -1828,6 +1835,156 @@ class IntegResultWindow(QMainWindow):
         if width <= 0 or height <= 0:
             return
         label.setGeometry(x, y, width, height)
+
+    def _apply_ticklabel_style(self, coord, axis_role: str, config: dict, **extra_kwargs):
+        if coord is None:
+            return
+        if axis_role == "x":
+            rotation = config.get('tick_xlabelrotation')
+            pad = config.get('tick_pad_x')
+            position = config.get('xticklabel_position')
+        else:
+            rotation = config.get('tick_ylabelrotation')
+            pad = config.get('tick_pad_y')
+            position = config.get('yticklabel_position')
+        kwargs = {
+            "rotation": rotation,
+            "pad": pad,
+            "size": config.get('tick_labelsize'),
+            "color": config.get('tick_labelcolor'),
+            "fontfamily": config.get('tick_font'),
+        }
+        kwargs.update(extra_kwargs)
+        coord.set_ticklabel(**kwargs)
+        coord.set_ticklabel_position(position)
+        coord.set_axislabel_position(position)
+        coord.set_ticks_position(config.get('default_ticks_position'))
+
+    def _apply_colorbar_preferences(self, config: dict):
+        cax = getattr(self, "cax", None)
+        colorbar = getattr(self, "colorbar", None)
+        if cax is None or colorbar is None:
+            return
+        bounds = [
+            config.get('cbar_pos_x', 0.9),
+            config.get('cbar_pos_y', 0.11),
+            config.get('cbar_width', 0.04),
+            config.get('cbar_height', 0.77),
+        ]
+        try:
+            cax.set_position(bounds)
+        except Exception:
+            pass
+        orientation = str(config.get('colorbar_orientation', 'vertical') or '').lower()
+        if orientation not in ("vertical", "horizontal"):
+            orientation = "vertical"
+        if orientation != self._current_colorbar_orientation():
+            self._rebuild_colorbar(orientation)
+        else:
+            ColorSettingsPanel.apply_colorbar_settings(cax=cax, colorbar=colorbar, config=config)
+            self._set_colorbar_zorder()
+        if self._is_colorbar_auto_layout_enabled():
+            self._schedule_colorbar_auto_layout_if_anchor_changed(force=True)
+
+    def apply_preferences(self, redraw: bool = True):
+        """Apply the shared Preferences config to an open integration result window."""
+        config = getattr(getattr(self, "fits_viewer", None), "config_manager", None)
+        config = getattr(config, "config", None) if config is not None else self.config
+        if not isinstance(config, dict):
+            return
+        self.config = config
+        self.decimal = config.get('decimal', True)
+        self.auto_precision_digits = bool(config.get('auto_precision_digits', True))
+        self.number_decimals = config.get('number_decimals', 6)
+        self.coord_wrap = config.get('coord_wrap', 180)
+        if getattr(self, "format_pix", None) is not None:
+            self.format_pix.decimal = self.decimal
+            self.format_pix.auto_precision_digits = self.auto_precision_digits
+            self.format_pix.number_decimals = self.number_decimals
+            self.format_pix.coord_wrap = self.coord_wrap
+
+        self.resize(config.get('figure_width', self.width()), config.get('figure_height', self.height()))
+        self.fig.subplots_adjust(
+            left=config.get('ax_pos_l'),
+            right=config.get('ax_pos_r'),
+            bottom=config.get('ax_pos_b'),
+            top=config.get('ax_pos_t'),
+        )
+        self.fig.set_facecolor(config.get('fig_background_color'))
+        self.ax.set_facecolor(config.get('ax_background_color'))
+        try:
+            self.im.cmap.set_bad(config.get('bad_color'))
+        except Exception:
+            pass
+        if getattr(self, "overlay_ax", None) is not None:
+            self.overlay_ax.set_position(self.ax.get_position())
+
+        coords = list(self.ax.coords)
+        xtick_label_position = config.get('xticklabel_position')
+        ytick_label_position = config.get('yticklabel_position')
+        if len(coords) > 0:
+            coords[0].set_axislabel(
+                self.xlabel,
+                fontsize=config.get('axislabel_fontsize'),
+                fontfamily=config.get('axislabel_fontfamily'),
+                color=config.get('axislabel_color'),
+            )
+            coords[0].set_axislabel_position(xtick_label_position)
+            self._apply_ticklabel_style(coords[0], "x", config, ha='right', va='top')
+            coords[0].set_minor_frequency(config.get('x_mtick_freq', 5))
+        if len(coords) > 1:
+            coords[1].set_axislabel(
+                self.ylabel,
+                fontsize=config.get('axislabel_fontsize'),
+                fontfamily=config.get('axislabel_fontfamily'),
+                color=config.get('axislabel_color'),
+            )
+            coords[1].set_axislabel_position(ytick_label_position)
+            self._apply_ticklabel_style(coords[1], "y", config, ha='center', va='top')
+            coords[1].set_minor_frequency(config.get('y_mtick_freq', 5))
+        if len(coords) > 2:
+            z_axis_role = "x" if self.plane == 'zy' else "y"
+            coords[2].set_axislabel(
+                self.zlabel,
+                fontsize=config.get('axislabel_fontsize'),
+                fontfamily=config.get('axislabel_fontfamily'),
+                color=config.get('axislabel_color'),
+            )
+            self._apply_ticklabel_style(coords[2], z_axis_role, config, ha='center', va='top')
+            coords[2].set_minor_frequency(config.get('z_mtick_freq', 5))
+
+        self.ax.tick_params(
+            axis='both',
+            which='major',
+            direction=config.get('tick_direction'),
+            length=config.get('tick_length'),
+            color=config.get('tick_color'),
+            width=config.get('tick_width'),
+            labelsize=config.get('tick_labelsize'),
+            labelcolor=config.get('tick_labelcolor'),
+        )
+        for spine in self.ax.spines.values():
+            spine.set_visible(True)
+            spine.set_zorder(5)
+            spine.set_linewidth(config.get('tick_width'))
+            spine.set_color(config.get('tick_color'))
+        self.ax.tick_params(which='minor', length=config.get('mtick_length'))
+
+        for line in (getattr(self, "click_v_line", None), getattr(self, "click_h_line", None)):
+            if line is None:
+                continue
+            line.set_color(config.get('click_linecolor'))
+            line.set_linewidth(config.get('click_linewidth'))
+            line.set_linestyle(str(config.get('click_linestyle', '-')))
+            line.set_alpha(float(config.get('click_alpha', 1.0)))
+        if getattr(self, "label", None) is not None:
+            self.label.setStyleSheet(f"QLabel {{ color : {config.get('click_label_color', 'grey')}; }}")
+            self._position_click_label()
+
+        self._apply_colorbar_preferences(config)
+        self._background = None
+        if redraw and getattr(self, "canvas", None) is not None:
+            self.canvas.draw_idle()
 
     def _capture_overlay_background(self):
         canvas = getattr(self, "canvas", None)
@@ -2328,6 +2485,35 @@ class IntegResultWindow(QMainWindow):
             self.toolbar.set_message('')
             return
         self.toolbar.set_message(self._toolbar_message_text(event.xdata, event.ydata, intensity=intensity))
+
+    def _update_magnifier_from_event(self, event):
+        panel = getattr(getattr(self, "fits_viewer", None), "magnifier_panel", None)
+        if panel is None:
+            return False
+        try:
+            if not panel.isVisible():
+                return False
+        except Exception:
+            return False
+        if event is None or event.inaxes not in (self.ax, self.overlay_ax):
+            return False
+        if event.xdata is None or event.ydata is None:
+            return False
+        updater = getattr(panel, "update_from_cursor", None)
+        if not callable(updater):
+            return False
+        try:
+            return bool(
+                updater(
+                    self,
+                    getattr(self, "plane", "xy"),
+                    event.xdata,
+                    event.ydata,
+                    source_axes=self.ax,
+                )
+            )
+        except Exception:
+            return False
 
     def _sample_intensity(self, x, y):
         xp, yp = int(round(x)), int(round(y))
@@ -3938,6 +4124,7 @@ class IntegResultWindow(QMainWindow):
     def on_motion(self, event):
         if self._drag_colorbar(event):
             return
+        self._update_magnifier_from_event(event)
         marker_manager = getattr(self, 'marker_manager', None)
         if marker_manager is not None and getattr(self, 'marker_mode_enabled', False):
             if marker_manager.is_dragging():
@@ -4008,6 +4195,16 @@ class IntegResultWindow(QMainWindow):
         if key in self._VIEW_FORWARD_KEY_TOKENS:
             self.view_forward()
             return
+        if key == "f":
+            panel = getattr(getattr(self, "fits_viewer", None), "magnifier_panel", None)
+            toggler = getattr(panel, "toggle_lock", None)
+            if callable(toggler):
+                try:
+                    if panel.isVisible():
+                        toggler()
+                        return
+                except Exception:
+                    pass
 
         region_manager = getattr(self, 'region_manager', None)
         if region_manager is not None:

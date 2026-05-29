@@ -99,6 +99,11 @@ class MenuBar:
         window_menu.addAction(self.range_panel_action)
         self.range_panel_action.triggered.connect(self.toggle_range_panel)
         self.range_panel_action.setChecked(True)
+
+        self.magnifier_panel_action = QAction("Magnifier", self.parent, checkable=True)
+        window_menu.addAction(self.magnifier_panel_action)
+        self.magnifier_panel_action.triggered.connect(self.toggle_magnifier_panel)
+        self.magnifier_panel_action.setChecked(False)
         
         window_menu.addSeparator()
         self.main_action = QAction("X-Y (Main)", self.parent, checkable=True)
@@ -384,6 +389,12 @@ class MenuBar:
             self.parent.show_range_panel()
         else:
             self.parent.hide_range_panel()
+
+    def toggle_magnifier_panel(self):
+        if self.magnifier_panel_action.isChecked():
+            self.parent.show_magnifier_panel()
+        else:
+            self.parent.hide_magnifier_panel()
 
 
     def toggle_main_window(self):
