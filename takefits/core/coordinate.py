@@ -40,6 +40,23 @@ def _is_degree_unit(unit) -> bool:
     return text in {"deg", "degree"}
 
 
+def _is_pv_scalar_axis(fits_viewer, axis_index: int) -> bool:
+    header = getattr(fits_viewer, "header", None)
+    if header is None:
+        return False
+    if not (
+        str(header.get("PVXAXIS", "") or "").strip()
+        or str(header.get("PVPATH", "") or "").strip()
+    ):
+        return False
+    try:
+        axis_no = int(axis_index) + 1
+    except Exception:
+        return False
+    ctype = str(header.get(f"CTYPE{axis_no}", "") or "").strip().upper().split("-")[0]
+    return ctype in {"PHI", "OFFSET"}
+
+
 def _wrap_longitude_value(value: float, axis_type: object, coord_wrap: object = 180) -> float:
     axis_upper = str(axis_type or "").upper()
     wrapped = float(value)
@@ -483,6 +500,8 @@ class Format_pix_to_wcs:
                 xtype, ytype = state.ax_xtype, state.ax_ytype
         x_unit_is_deg = _is_degree_unit(xunit)
         y_unit_is_deg = _is_degree_unit(yunit)
+        x_is_pv_scalar = _is_pv_scalar_axis(self.fits_viewer, x_axis_index)
+        y_is_pv_scalar = _is_pv_scalar_axis(self.fits_viewer, y_axis_index)
 
         display_frame = "native"
         fallback_native_world = None
@@ -531,8 +550,16 @@ class Format_pix_to_wcs:
 
         xtype_upper = (display_xtype or '').upper()
         ytype_upper = (display_ytype or '').upper()
-        x_is_angular_axis = axis_is_longitude(display_xtype) or axis_is_latitude(display_xtype) or x_unit_is_deg
-        y_is_angular_axis = axis_is_longitude(display_ytype) or axis_is_latitude(display_ytype) or y_unit_is_deg
+        x_is_angular_axis = (
+            axis_is_longitude(display_xtype)
+            or axis_is_latitude(display_xtype)
+            or (x_unit_is_deg and not x_is_pv_scalar)
+        )
+        y_is_angular_axis = (
+            axis_is_longitude(display_ytype)
+            or axis_is_latitude(display_ytype)
+            or (y_unit_is_deg and not y_is_pv_scalar)
+        )
 
         if x_is_angular_axis:
             display_x = _wrap_longitude_value(display_x, display_xtype, self.coord_wrap)

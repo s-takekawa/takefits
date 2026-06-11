@@ -508,50 +508,69 @@ class EllipseRegion(Region):
         region_pixels = data[mask]
         return self._calculate_stats(region_pixels)
 
+    def _outline_display_points(self, axes, half_w, half_h, phis):
+        """Return display-space coords of outline points at parametric *phis*."""
+        x_local = half_w * np.cos(phis)
+        y_local = half_h * np.sin(phis)
+        gx, gy = self._to_global(x_local, y_local)
+        return axes.transData.transform(np.column_stack([gx, gy]))
+
+    def _nearest_outline_phi(self, axes, ex, ey, half_w, half_h):
+        """Parametric angle and display distance of the outline point nearest
+        to (*ex*, *ey*). Two-stage sampling keeps the hit band gap-free even on
+        large ellipses without an iterative closest-point solve."""
+        coarse = np.linspace(0.0, 2.0 * math.pi, 121)[:-1]
+        disp = self._outline_display_points(axes, half_w, half_h, coarse)
+        d = np.hypot(disp[:, 0] - ex, disp[:, 1] - ey)
+        i = int(np.argmin(d))
+        step = coarse[1] - coarse[0]
+        fine = np.linspace(coarse[i] - step, coarse[i] + step, 41)
+        fdisp = self._outline_display_points(axes, half_w, half_h, fine)
+        fd = np.hypot(fdisp[:, 0] - ex, fdisp[:, 1] - ey)
+        j = int(np.argmin(fd))
+        return float(fine[j] % (2.0 * math.pi)), float(fd[j])
+
+    def _outline_cursor(self, axes, half_w, half_h, phi):
+        """Pick a resize cursor from the outline point's screen-space direction
+        so the feedback stays correct for rotated ellipses."""
+        c_disp = axes.transData.transform(self.center)
+        p_disp = self._outline_display_points(axes, half_w, half_h, np.array([phi]))[0]
+        ang = math.degrees(math.atan2(p_disp[1] - c_disp[1], p_disp[0] - c_disp[0])) % 180.0
+        if ang < 22.5 or ang >= 157.5:
+            return Qt.CursorShape.SizeHorCursor
+        if ang < 67.5:
+            return Qt.CursorShape.SizeBDiagCursor
+        if ang < 112.5:
+            return Qt.CursorShape.SizeVerCursor
+        return Qt.CursorShape.SizeFDiagCursor
+
     def get_resize_handle(self, event, tolerance):
         if event.x is None or event.y is None:
             return None
         axes = self.mpl_patch.axes
         if axes is None:
             return None
-        if self.width == 0 or self.height == 0:
+        if self.width <= 0 or self.height <= 0:
             return None
 
         half_w = self.width / 2.0
         half_h = self.height / 2.0
-        handle_defs = [
-            ('left', (-half_w, 0.0)),
-            ('right', (half_w, 0.0)),
-            ('top', (0.0, half_h)),
-            ('bottom', (0.0, -half_h))
-        ]
 
-        handle_tolerance = tolerance * 1.5
-        handles = []
-        for name, (hx, hy) in handle_defs:
-            gx, gy = self._to_global(hx, hy)
-            disp = axes.transData.transform((gx, gy))
-            distance = math.hypot(event.x - disp[0], event.y - disp[1])
-            if distance <= handle_tolerance:
-                handles.append(name)
+        # Keep an interior move zone: clicking well inside (norm < 0.5) is not a
+        # resize target, so the body can still be grabbed to move the ellipse.
+        if event.xdata is not None and event.ydata is not None:
+            xl, yl = self._to_local(event.xdata, event.ydata)
+            if (xl / half_w) ** 2 + (yl / half_h) ** 2 < 0.5:
+                return None
 
-        if not handles:
+        # The whole outline is grabbable for resize (not just the 4 axis tips),
+        # so a tilted ellipse can be resized without hunting for its axis ends.
+        phi, distance = self._nearest_outline_phi(axes, event.x, event.y, half_w, half_h)
+        if distance > tolerance:
             return None
 
-        edges_set = set(handles)
-        horizontal = any(edge in edges_set for edge in ('left', 'right'))
-        vertical = any(edge in edges_set for edge in ('top', 'bottom'))
-
-        if horizontal and vertical:
-            cursor = Qt.CursorShape.SizeAllCursor
-        elif horizontal:
-            cursor = Qt.CursorShape.SizeHorCursor
-        elif vertical:
-            cursor = Qt.CursorShape.SizeVerCursor
-        else:
-            cursor = Qt.CursorShape.SizeAllCursor
-
-        return {'type': 'ellipse', 'edges': edges_set, 'cursor': cursor}
+        cursor = self._outline_cursor(axes, half_w, half_h, phi)
+        return {'type': 'ellipse', 'phi': phi, 'cursor': cursor}
 
     def set_angle(self, angle_deg):
         self.angle = angle_deg % 360.0

@@ -10,10 +10,13 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from takefits.core.color import ColorMode, default_color_settings_map
 from takefits.core.custom_colormap import CustomColormap, ColorDefinitions
 from takefits.logic.data_tools import (
+    LazyScaledArray,
     estimate_array_nbytes,
     fast_nanminmax,
     MEMMAP_THRESHOLD_BYTES,
 )
+
+_HISTOGRAM_MAX_SAMPLES = 1_000_000
 
 
 class RegisterColor:
@@ -847,20 +850,35 @@ class ColorSettingsPanel(QWidget):
 
     def _histogram_cache_key(self):
         raw_data = getattr(self, "data", None)
-        array = np.asanyarray(raw_data)
-        shape = tuple(int(axis) for axis in getattr(array, "shape", ()) or ())
-        dtype = str(getattr(getattr(array, "dtype", None), "str", getattr(array, "dtype", "")) or "")
+        shape = tuple(int(axis) for axis in getattr(raw_data, "shape", ()) or ())
+        dtype_obj = getattr(raw_data, "dtype", None)
+        dtype = str(getattr(dtype_obj, "str", dtype_obj) or "")
+        scale_key = None
+        if isinstance(raw_data, LazyScaledArray):
+            raw = getattr(raw_data, "_raw", None)
+            raw_dtype = getattr(raw, "dtype", None)
+            dtype = str(getattr(raw_dtype, "str", raw_dtype) or dtype)
+            scale_key = (
+                getattr(raw_data, "_bzero", None),
+                getattr(raw_data, "_bscale", None),
+                getattr(raw_data, "_blank", None),
+            )
         nbytes = self._data_nbytes
         try:
             nbytes = int(nbytes) if nbytes is not None else None
         except Exception:
             nbytes = None
+        try:
+            size = int(getattr(raw_data, "size", 0) or 0)
+        except Exception:
+            size = 0
         return (
             str(getattr(self.mode, "value", self.mode)),
             id(raw_data),
             shape,
             dtype,
-            int(getattr(array, "size", 0) or 0),
+            scale_key,
+            size,
             nbytes,
         )
 
@@ -888,11 +906,43 @@ class ColorSettingsPanel(QWidget):
         except Exception:
             pass
 
+    @staticmethod
+    def _histogram_sample_by_flat_index(array, max_samples=None):
+        if max_samples is None:
+            max_samples = _HISTOGRAM_MAX_SAMPLES
+        total = int(getattr(array, "size", 0) or 0)
+        if total <= 0:
+            return np.asarray([], dtype=float)
+        if total <= max_samples:
+            return np.asarray(array).reshape(-1)
+        stride = max(1, int(np.ceil(total / max_samples)))
+        indices = np.arange(0, total, stride, dtype=np.intp)
+        if indices.size > max_samples:
+            indices = indices[:max_samples]
+        return np.asarray(array.flat[indices])
+
+    def _histogram_source_sample(self):
+        raw_data = getattr(self, "data", None)
+        if isinstance(raw_data, LazyScaledArray):
+            raw = getattr(raw_data, "_raw", None)
+            if raw is None:
+                return np.asarray([], dtype=float)
+            raw_sample = self._histogram_sample_by_flat_index(raw)
+            return raw_data._apply_scaling(raw_sample)
+
+        if raw_data is None:
+            return np.asarray([], dtype=float)
+        array = np.asanyarray(raw_data)
+        should_sample = (
+            self._data_nbytes is not None
+            and self._data_nbytes > MEMMAP_THRESHOLD_BYTES
+        )
+        if should_sample:
+            return self._histogram_sample_by_flat_index(array)
+        return array.ravel()
+
     def _compute_histogram_cache(self):
-        data = np.asanyarray(self.data).ravel()
-        if self._data_nbytes is not None and self._data_nbytes > MEMMAP_THRESHOLD_BYTES:
-            stride = max(1, int(np.ceil(data.size / 1_000_000)))
-            data = data[::stride]
+        data = self._histogram_source_sample()
         with np.errstate(invalid='ignore'):
             data = data[np.isfinite(data)]
         if data.size == 0:

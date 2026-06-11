@@ -1,45 +1,20 @@
 # ui/control_panel.py
+import importlib.util
+import os
+
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QDialog,
                              QHBoxLayout, QLabel, QLineEdit, QMessageBox)
-from takefits.tools.color_scale import ColorSettingsPanel
-from takefits.tools.unit_conversion_panel import UnitConversionPanel
-from takefits.tools.scaling_panel import ScalingPanel
-from takefits.tools.integration import IntegSettingsPanel
-from takefits.tools.channel_map import ChannelMapSettingPanel
-from takefits.tools.baseline import BaselinePanel
-from takefits.tools.spectrum import SpecWindow
-from takefits.tools.contour_panel import ContourPanel
-from takefits.tools.clump_finding_panel import ClumpFindingPanel
-from takefits.core.contour_manager import ContourManager
 
-from takefits.tools.smoothing import SmoothSettingsPanel
-from takefits.tools.pv_diagram import PVdiagram 
-from takefits.tools.masking import MaskSettingsPanel
-from takefits.tools.arithmetic import CubeArithmeticPanel
 
-import os
-#import json
-#import re
-#import traceback
-try:
-    from openai import OpenAI # type: ignore
-except ImportError:
-    #print("\033[91mError: 'openai' library not found. Please install it using 'pip install openai'.\033[0m")
-    OpenAI = None
-# --- AI Handler Import ---
-from takefits.core.ai_handler import AIHandler
-# --- API Key Setup ---
-# IMPORTANT: Set your OpenAI API key securely via the OPENAI_API_KEY environment variable.
-if OpenAI:
+def _openai_package_available() -> bool:
     try:
-        client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-        if not client.api_key:
-            raise ValueError("OpenAI API key not found. Set the OPENAI_API_KEY environment variable.")
-    except Exception as e:
-         print(f"\033[91mAPI Initialization Error: Failed to initialize OpenAI client: {e}\nAI features will be disabled.\033[0m")
-         client = None
-else:
-    client = None
+        return importlib.util.find_spec("openai") is not None
+    except Exception:
+        return False
+
+
+def _openai_api_key() -> str:
+    return str(os.environ.get("OPENAI_API_KEY") or "").strip()
 
 # --- AI Prompt Dialog Class ---
 class AIPromptDialog(QDialog):
@@ -111,8 +86,8 @@ class ControlPanel(QWidget):
         self.arithmetic_panel = None
         self.clump_finding_panel = None
 
-        # Instantiate the AI Handler (if OpenAI client is available)
-        self.ai_handler = AIHandler(client, self) if client else None
+        self.ai_handler = None
+        self._ai_handler_error = ""
 
         self.initUI()
 
@@ -123,13 +98,13 @@ class ControlPanel(QWidget):
 
         # --- Create and Connect Buttons ---
         # AI Command
-        if OpenAI is not None:
+        if _openai_package_available():
             self.ai_command_button = QPushButton('AI Command', self)
             self.ai_command_button.clicked.connect(self._open_ai_prompt_dialog)
             layout.addWidget(self.ai_command_button)
-            if self.ai_handler is None:
+            if not _openai_api_key():
                 self.ai_command_button.setEnabled(False)
-                self.ai_command_button.setToolTip("AI features disabled. Check API key/installation.")
+                self.ai_command_button.setToolTip("AI features disabled. Set OPENAI_API_KEY.")
 
         # Arithmetic
         self.arithmetic_button = QPushButton("Arithmetic", self)
@@ -245,10 +220,42 @@ class ControlPanel(QWidget):
             print(f"Could not position control panel: {e}") # Handle cases where fits_viewer might not be ready
 
     # --- AI Command Handling ---
+    def _ensure_ai_handler(self) -> bool:
+        if self.ai_handler is not None:
+            return True
+        if not _openai_package_available():
+            self._ai_handler_error = "OpenAI library is not installed."
+            return False
+        api_key = _openai_api_key()
+        if not api_key:
+            self._ai_handler_error = "OpenAI API key not found. Set OPENAI_API_KEY."
+            return False
+        try:
+            from openai import OpenAI  # type: ignore
+            from takefits.core.ai_handler import AIHandler
+
+            client = OpenAI(api_key=api_key)
+            if not client.api_key:
+                raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY.")
+            self.ai_handler = AIHandler(client, self)
+            self._ai_handler_error = ""
+            return True
+        except Exception as e:
+            self._ai_handler_error = str(e)
+            print(
+                "\033[91mAPI Initialization Error: "
+                f"Failed to initialize OpenAI client: {e}\n"
+                "AI features will be disabled.\033[0m"
+            )
+            return False
+
     def _open_ai_prompt_dialog(self):
         """Opens the AI prompt dialog and delegates processing to AIHandler."""
-        if self.ai_handler is None:
-            QMessageBox.warning(self, "AI Error", "AI features are currently disabled.")
+        if not self._ensure_ai_handler():
+            message = "AI features are currently disabled."
+            if self._ai_handler_error:
+                message = f"{message}\n{self._ai_handler_error}"
+            QMessageBox.warning(self, "AI Error", message)
             return
 
         dialog = AIPromptDialog(self) # Use ControlPanel as parent
@@ -286,6 +293,8 @@ class ControlPanel(QWidget):
             except RuntimeError:
                 self.chmap_settings_panel = None
 
+        from takefits.tools.channel_map import ChannelMapSettingPanel
+
         self.chmap_settings_panel = ChannelMapSettingPanel(self.fits_viewer, self.subwindows)
         self.chmap_settings_panel.show()
         self.chmap_settings_panel.destroyed.connect(self.on_chmap_settings_closed)
@@ -305,6 +314,8 @@ class ControlPanel(QWidget):
                 return
             except RuntimeError:
                 self.clump_finding_panel = None
+
+        from takefits.tools.clump_finding_panel import ClumpFindingPanel
 
         self.clump_finding_panel = ClumpFindingPanel(self.fits_viewer, self.subwindows)
         self.clump_finding_panel.show()
@@ -332,6 +343,8 @@ class ControlPanel(QWidget):
                 seed()
             except Exception:
                 pass
+        from takefits.tools.color_scale import ColorSettingsPanel
+
         # Pass fits_viewer and subwindows to the panel
         self.color_settings_panel = ColorSettingsPanel(self.fits_viewer, self.subwindows)
         self.color_settings_panel.show()
@@ -359,6 +372,8 @@ class ControlPanel(QWidget):
             except RuntimeError:
                 self.scaling_panel = None
 
+        from takefits.tools.scaling_panel import ScalingPanel
+
         self.scaling_panel = ScalingPanel(self.fits_viewer, self.subwindows)
         self.scaling_panel.show()
         self.scaling_panel.destroyed.connect(self.on_scaling_panel_closed)
@@ -378,6 +393,8 @@ class ControlPanel(QWidget):
                 return
             except RuntimeError:
                 self.unit_conversion_panel = None
+
+        from takefits.tools.unit_conversion_panel import UnitConversionPanel
 
         self.unit_conversion_panel = UnitConversionPanel(self.fits_viewer, self.subwindows)
         self.unit_conversion_panel.show()
@@ -399,6 +416,8 @@ class ControlPanel(QWidget):
             except RuntimeError:
                 self.pvd_panel = None
 
+        from takefits.tools.pv_diagram import PVdiagram
+
         self.pvd_panel = PVdiagram(self.fits_viewer)
         self.pvd_panel.show()
         self.pvd_panel.destroyed.connect(self.on_pvd_closed)
@@ -418,6 +437,8 @@ class ControlPanel(QWidget):
                 return
             except RuntimeError:
                 self.integ_settings_panel = None
+
+        from takefits.tools.integration import IntegSettingsPanel
 
         self.integ_settings_panel = IntegSettingsPanel(self.fits_viewer, self.subwindows)
         self.integ_settings_panel.show()
@@ -441,6 +462,8 @@ class ControlPanel(QWidget):
                 return
             except RuntimeError:
                 self.mask_settings_panel = None
+
+        from takefits.tools.masking import MaskSettingsPanel
 
         self.mask_settings_panel = MaskSettingsPanel(self.fits_viewer, self.subwindows)
         self.mask_settings_panel.show()
@@ -469,6 +492,8 @@ class ControlPanel(QWidget):
                 return
             except RuntimeError:
                 self.spec_window = None
+
+        from takefits.tools.spectrum import SpecWindow
 
         self.spec_window = SpecWindow(self.fits_viewer)
         
@@ -552,6 +577,8 @@ class ControlPanel(QWidget):
             except RuntimeError:
                 self.baseline_panel = None
 
+        from takefits.tools.baseline import BaselinePanel
+
         self.baseline_panel = BaselinePanel(self.fits_viewer, self.subwindows)
 
         if hasattr(self.fits_viewer, 'position_updated'):
@@ -581,6 +608,8 @@ class ControlPanel(QWidget):
             except RuntimeError:
                 self.smooth_settings_panel = None
 
+        from takefits.tools.smoothing import SmoothSettingsPanel
+
         self.smooth_settings_panel = SmoothSettingsPanel(self.fits_viewer, self.subwindows)
         self.smooth_settings_panel.show()
         self.smooth_settings_panel.destroyed.connect(self.on_smooth_settings_closed)
@@ -604,6 +633,9 @@ class ControlPanel(QWidget):
             sub_register = getattr(sub, "_register_contour_layer", None)
             if callable(sub_register):
                 sub_register()
+
+        from takefits.core.contour_manager import ContourManager
+        from takefits.tools.contour_panel import ContourPanel
 
         default_targets = ContourManager.instance().layer_ids_for_owner(self.fits_viewer)
         if not default_targets:
@@ -633,6 +665,8 @@ class ControlPanel(QWidget):
                 return
             except RuntimeError:
                 self.arithmetic_panel = None
+
+        from takefits.tools.arithmetic import CubeArithmeticPanel
 
         self.arithmetic_panel = CubeArithmeticPanel(self.fits_viewer, self.subwindows)
         self.arithmetic_panel.show()

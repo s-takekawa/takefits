@@ -58,6 +58,44 @@ def _build_third_axis_label(header):
         return f"{base}  [{cunit3}]"
     return base
 
+
+def _is_pv_fits_header(header) -> bool:
+    return bool(str(header.get("PVXAXIS", "") or "").strip() or str(header.get("PVPATH", "") or "").strip())
+
+
+def _pv_axis_ctype_head(header, axis_index: int) -> str:
+    try:
+        axis_no = int(axis_index) + 1
+    except Exception:
+        return ""
+    return str(header.get(f"CTYPE{axis_no}", "") or "").strip().upper().split("-")[0]
+
+
+def _pv_axis_unit(header, axis_index: int) -> str:
+    try:
+        axis_no = int(axis_index) + 1
+    except Exception:
+        return ""
+    return _normalized_header_unit_text(header.get(f"CUNIT{axis_no}", ""))
+
+
+def _is_pv_scalar_axis(header, axis_index: int) -> bool:
+    if not _is_pv_fits_header(header):
+        return False
+    return _pv_axis_ctype_head(header, axis_index) in {"PHI", "OFFSET"}
+
+
+def _pv_scalar_axis_label(header, axis_index: int) -> str:
+    ctype = _pv_axis_ctype_head(header, axis_index)
+    if ctype == "PHI":
+        base = "Phi"
+    elif ctype == "OFFSET":
+        base = "Position"
+    else:
+        return ""
+    unit = _pv_axis_unit(header, axis_index)
+    return f"{base} [{unit}]" if unit else base
+
 class DisplayMap:
     def __init__(
         self,
@@ -80,6 +118,10 @@ class DisplayMap:
                'vrad': f'{self.third_axis_label}',
                'freq': f'{self.third_axis_label}'
                }
+        for idx in range(getattr(wcs, "naxis", 0)):
+            label = _pv_scalar_axis_label(header, idx)
+            if label:
+                self.coords_dict[_pv_axis_ctype_head(header, idx).lower()] = label
                
         self.config = config
         self.colorscale = config.get('colorscale', 'Rainbow')  # default color pattern
@@ -470,6 +512,8 @@ class DisplayMap:
         for idx, coord in enumerate(self.ax.coords):
             ctype_str = (axis_ctype[idx] or '').upper()
             ctype_head = ctype_str.split('-')[0]
+            if _is_pv_scalar_axis(self.header, idx):
+                continue
             if ctype_head.startswith('RA'):
                 coord.set_coord_type('longitude', coord_wrap=360 * u.deg)
                 if self.decimal:

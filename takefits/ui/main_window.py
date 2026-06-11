@@ -5,9 +5,6 @@ from takefits.ui.subwindow import SubWindow, SubWindow_control
 from takefits.ui.control_panel import ControlPanel
 from takefits.ui.range_control import RangeControlPanel
 from takefits.ui.magnifier_panel import MagnifierPanel
-from takefits.tools.regrid_panel import RegridPanel
-from takefits.logic.regridder import Regridder
-from takefits.ui.save_fits_dialog import SaveFITS
 from takefits.core.app_state import create_app_state, MarkerSpec, RegionSpec
 from takefits.core.action_session import ActionSession
 from takefits.core.actions import ActionRegistry, register_default_actions
@@ -244,6 +241,7 @@ class MainWindow(FITSViewer):
         self._regrid_panel = None
         self._regrid_thread = None
         self._regrid_worker = None
+        self._regrid_workspace_state = None
         self._is_app_closing = False
         self._shared_view_history = []
         self._shared_view_history_index = -1
@@ -263,6 +261,19 @@ class MainWindow(FITSViewer):
             except Exception:
                 pass
         self._seed_workspace_window_order()
+
+        # Silent PyPI new-version check, a few seconds after startup so it
+        # never competes with first paint.  Gating (opt-out, 24 h throttle,
+        # skip-version, TAKEFITS_DISABLE_UPDATE_CHECK) lives in
+        # logic/update_check; failures are completely silent.
+        self._update_check_thread = None
+        self._update_check_worker = None
+        self._update_check_manual = False
+        self._update_dialog = None
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.setSingleShot(True)
+        self._update_check_timer.timeout.connect(self._start_auto_update_check)
+        self._update_check_timer.start(5000)
 
     def ensure_subwindow1(self):
         """Create the XZ subwindow on first demand."""
@@ -667,6 +678,19 @@ class MainWindow(FITSViewer):
         menu_bar = getattr(self, "menu_bar", None)
         if menu_bar is None:
             return
+        slit_tool = self._active_slit_undo_tool()
+        if slit_tool is not None:
+            # PV diagram open: Undo/Redo (Option+Left/Right) act on the slit only.
+            try:
+                menu_bar.set_undo_redo_enabled(
+                    slit_tool.slit_can_undo(),
+                    slit_tool.slit_can_redo(),
+                    undo_text="Undo Slit",
+                    redo_text="Redo Slit",
+                )
+            except Exception:
+                pass
+            return
         owner = self._active_analysis_owner()
         session = getattr(owner, "action_session", None)
         if session is None:
@@ -691,6 +715,31 @@ class MainWindow(FITSViewer):
             )
         except Exception:
             pass
+
+    def _active_slit_undo_tool(self):
+        """Return the open PV diagram (slit editor), if any, else None.
+
+        The PV slit is edited on the main canvas, so the main window is the
+        active window during editing; the PV window registers itself here on
+        show and clears it on close. While present, Undo/Redo target the slit.
+        """
+        tool = getattr(self, "_pv_slit_undo_tool", None)
+        if tool is None:
+            return None
+        try:
+            if not tool.isVisible():
+                return None
+        except RuntimeError:
+            self._pv_slit_undo_tool = None
+            return None
+        if not (
+            callable(getattr(tool, "undo_slit", None))
+            and callable(getattr(tool, "redo_slit", None))
+            and callable(getattr(tool, "slit_can_undo", None))
+            and callable(getattr(tool, "slit_can_redo", None))
+        ):
+            return None
+        return tool
 
     def _active_analysis_owner(self):
         app = QApplication.instance()
@@ -3400,6 +3449,39 @@ class MainWindow(FITSViewer):
             return None
         return payload if isinstance(payload, dict) else None
 
+    def _capture_regrid_workspace_state(self):
+        # Prefer the live panel's current settings; otherwise fall back to the
+        # last-remembered settings (so they survive closing the panel).
+        panel = getattr(self, "_regrid_panel", None)
+        if panel is not None:
+            exporter = getattr(panel, "export_workspace_state", None)
+            if callable(exporter):
+                try:
+                    payload = exporter()
+                except Exception:
+                    payload = None
+                if isinstance(payload, dict):
+                    return payload
+        stored = getattr(self, "_regrid_workspace_state", None)
+        return stored if isinstance(stored, dict) else None
+
+    def _restore_regrid_workspace_state(self, regrid_state) -> bool:
+        # Remember settings for the next time the panel is opened; never force it
+        # open (it is a one-shot config dialog with no result to restore, so
+        # auto-opening it on workspace load would be intrusive).
+        if not isinstance(regrid_state, dict):
+            return False
+        self._regrid_workspace_state = dict(regrid_state)
+        panel = getattr(self, "_regrid_panel", None)
+        if panel is not None:
+            restore = getattr(panel, "restore_workspace_state", None)
+            if callable(restore):
+                try:
+                    return bool(restore(regrid_state))
+                except Exception:
+                    return False
+        return True
+
     def _restore_pv_workspace_state(self, pv_state) -> bool:
         if not isinstance(pv_state, dict):
             return False
@@ -5598,6 +5680,7 @@ class MainWindow(FITSViewer):
                 "spectrum_state": self._capture_spectrum_workspace_state(),
                 "baseline_state": self._capture_baseline_workspace_state(),
                 "clump_state": self._capture_clump_workspace_state(),
+                "regrid_state": self._capture_regrid_workspace_state(),
                 "ui_state": self._capture_workspace_ui_state(),
                 "window_z_order": self._capture_workspace_window_z_order(),
                 "integration_data_state": self._capture_workspace_integration_data_state(),
@@ -6178,6 +6261,7 @@ class MainWindow(FITSViewer):
             restored_pv = self._restore_pv_workspace_state(workspace_state.get("pv_state"))
             restored_spectrum = self._restore_spectrum_workspace_state(workspace_state.get("spectrum_state"))
             restored_baseline = self._restore_baseline_workspace_state(workspace_state.get("baseline_state"))
+            self._restore_regrid_workspace_state(workspace_state.get("regrid_state"))
             clump_panel_visible = True
             panel_state = workspace_state.get("panel_state")
             if isinstance(panel_state, dict):
@@ -6421,6 +6505,16 @@ class MainWindow(FITSViewer):
         return {"integration": restored_integration, "channel_map": restored_channel_map}
 
     def undo_last_action(self):
+        slit_tool = self._active_slit_undo_tool()
+        if slit_tool is not None:
+            # PV diagram open: undo the slit only (analysis undo is deferred
+            # until the PV window is closed).
+            try:
+                if slit_tool.slit_can_undo():
+                    slit_tool.undo_slit()
+            finally:
+                self._refresh_undo_redo_actions()
+            return
         owner = self._active_analysis_owner()
         if owner is not self:
             try:
@@ -6447,6 +6541,14 @@ class MainWindow(FITSViewer):
             self._refresh_view_navigation_actions()
 
     def redo_last_action(self):
+        slit_tool = self._active_slit_undo_tool()
+        if slit_tool is not None:
+            try:
+                if slit_tool.slit_can_redo():
+                    slit_tool.redo_slit()
+            finally:
+                self._refresh_undo_redo_actions()
+            return
         owner = self._active_analysis_owner()
         if owner is not self:
             try:
@@ -7146,14 +7248,36 @@ class MainWindow(FITSViewer):
 
     def open_regrid_panel(self):
         if self._regrid_panel is None:
+            from takefits.tools.regrid_panel import RegridPanel
+
             self._regrid_panel = RegridPanel(fits_viewer=self)
             self._regrid_panel.regrid_requested.connect(self._start_regrid_job)
             self._regrid_panel.closed.connect(self._clear_regrid_panel)
+            # Re-apply settings remembered from a previous panel / workspace.
+            remembered = getattr(self, "_regrid_workspace_state", None)
+            if isinstance(remembered, dict):
+                try:
+                    self._regrid_panel.restore_workspace_state(remembered)
+                except Exception:
+                    pass
         self._regrid_panel.show()
         self._regrid_panel.raise_()
         self._regrid_panel.activateWindow()
 
     def _clear_regrid_panel(self):
+        # Remember the panel's settings so they persist across close/reopen and
+        # into the saved workspace.  Emitted before the panel is deleted, so the
+        # widgets are still readable here.
+        panel = self._regrid_panel
+        if panel is not None:
+            exporter = getattr(panel, "export_workspace_state", None)
+            if callable(exporter):
+                try:
+                    state = exporter()
+                    if isinstance(state, dict):
+                        self._regrid_workspace_state = state
+                except Exception:
+                    pass
         self._regrid_panel = None
 
     def _start_regrid_job(self, params):
@@ -7168,6 +7292,8 @@ class MainWindow(FITSViewer):
         self._last_regrid_params = dict(params)
         self._regrid_thread = QThread(self)
         header_copy = self.header.copy() if hasattr(self, "header") and self.header is not None else None
+        from takefits.logic.regridder import Regridder
+
         self._regrid_worker = Regridder(
             self.data,
             self.wcs,
@@ -7187,10 +7313,10 @@ class MainWindow(FITSViewer):
         self._regrid_worker.finished.connect(self._regrid_thread.quit)
         self._regrid_worker.error.connect(self._regrid_thread.quit)
         self._regrid_thread.finished.connect(self._cleanup_regrid_thread)
-        self._regrid_thread.start()
 
         if self._regrid_panel:
             self._regrid_panel.on_regrid_started()
+        self._regrid_thread.start()
 
     def _handle_regrid_progress(self, value):
         if self._regrid_panel:
@@ -7209,9 +7335,26 @@ class MainWindow(FITSViewer):
             for entry in history_entries:
                 save_header.add_history(entry)
 
+        from takefits.ui.save_fits_dialog import SaveFITS
+
+        # A very large (out-of-core) regrid returns a temp-file-backed memmap.
+        # Capture its scratch path so we can reclaim it once it has been written
+        # to the chosen FITS (the save streams straight from disk, bounded RAM).
+        import numpy as _np
+        ooc_tempfile = data.filename if isinstance(data, _np.memmap) else None
+
         saver = SaveFITS(data, save_header, self.filename, original_header=self.header)
         suffix = self._resolve_regrid_suffix()
-        saver.save(suffix=suffix)
+        try:
+            saver.save(suffix=suffix)
+        finally:
+            if ooc_tempfile:
+                saver = None
+                data = None
+                try:
+                    os.remove(ooc_tempfile)
+                except OSError:
+                    pass
 
     def _handle_regrid_error(self, message):
         self.clear_recorded_action("panel:regrid")
@@ -7227,6 +7370,103 @@ class MainWindow(FITSViewer):
             self._regrid_worker = None
         thread = self._regrid_thread
         self._regrid_thread = None
+        if thread:
+            thread.deleteLater()
+
+    # ------------------------------------------------------------------
+    # New-version check (PyPI)
+    def _update_check_state_path(self) -> str:
+        from takefits.app_paths import app_config_path
+        from takefits.logic.update_check import STATE_FILENAME
+
+        return app_config_path(STATE_FILENAME)
+
+    def _start_auto_update_check(self):
+        if getattr(self, "_is_app_closing", False):
+            return
+        from takefits.logic import update_check
+
+        try:
+            state = update_check.load_state(self._update_check_state_path())
+        except Exception:
+            return
+        if not update_check.should_auto_check(state):
+            return
+        self._launch_update_check(manual=False)
+
+    def check_for_updates_manual(self):
+        self._launch_update_check(manual=True)
+
+    def _launch_update_check(self, manual: bool):
+        if (
+            self._update_check_thread is not None
+            and self._update_check_thread.isRunning()
+        ):
+            return
+        from takefits.ui.update_dialog import UpdateCheckWorker
+
+        self._update_check_manual = bool(manual)
+        self._update_check_thread = QThread(self)
+        self._update_check_worker = UpdateCheckWorker()
+        self._update_check_worker.moveToThread(self._update_check_thread)
+        self._update_check_thread.started.connect(self._update_check_worker.run)
+        self._update_check_worker.finished.connect(self._on_update_check_finished)
+        self._update_check_worker.finished.connect(self._update_check_thread.quit)
+        self._update_check_thread.finished.connect(self._cleanup_update_check_thread)
+        self._update_check_thread.start()
+
+    def _on_update_check_finished(self, latest):
+        from takefits.core.version import APP_VERSION
+        from takefits.logic import update_check
+        from takefits.ui.update_dialog import UpdateAvailableDialog
+
+        manual = self._update_check_manual
+        state_path = self._update_check_state_path()
+        state = update_check.mark_checked(state_path)
+
+        if manual:
+            from takefits.ui.update_dialog import ManualCheckMessageBox
+
+            if latest is None:
+                ManualCheckMessageBox(
+                    "Check for Updates",
+                    "Could not check for updates.\n"
+                    "Please check your network connection.",
+                    QMessageBox.Icon.Warning,
+                    state_path,
+                    parent=self,
+                ).exec()
+                return
+            if not update_check.is_newer(latest, APP_VERSION):
+                ManualCheckMessageBox(
+                    "Check for Updates",
+                    f"Takefits is up to date (version {APP_VERSION}).",
+                    QMessageBox.Icon.Information,
+                    state_path,
+                    parent=self,
+                ).exec()
+                return
+            # An explicit manual check overrides a previously skipped version.
+        elif not update_check.should_notify(latest, APP_VERSION, state):
+            return
+
+        if self._update_dialog is not None:
+            try:
+                self._update_dialog.close()
+            except Exception:
+                pass
+        dialog = UpdateAvailableDialog(str(latest), state_path, parent=self)
+        dialog.destroyed.connect(lambda *_: setattr(self, "_update_dialog", None))
+        self._update_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+
+    def _cleanup_update_check_thread(self):
+        if self._update_check_worker:
+            self._update_check_worker.deleteLater()
+            self._update_check_worker = None
+        thread = self._update_check_thread
+        self._update_check_thread = None
         if thread:
             thread.deleteLater()
 

@@ -7,20 +7,22 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QGridLayout, QLineEdit,
                              QPushButton, QLabel, QHBoxLayout, QMessageBox,
                              QRadioButton, QGroupBox, QFileDialog, QTabWidget,
                              QComboBox, QButtonGroup, QCheckBox, QApplication,
-                             QProgressDialog, QDoubleSpinBox, QSpinBox)
-from PySide6.QtCore import Qt, QTimer
+                             QProgressBar, QProgressDialog, QDoubleSpinBox, QSpinBox,
+                             QSizePolicy)
+from PySide6.QtCore import Qt, QThread, QTimer
 import numpy as np
 import os
 import csv
 import random
 import base64
 import io
+import textwrap
 import zlib
 from datetime import datetime
 from scipy.ndimage import find_objects
 from scipy import ndimage
 
-from takefits.core.usecases import (
+from takefits.core.usecases.clump import (
     run_clumpfind,
     run_fellwalker,
     run_dendrogram,
@@ -29,6 +31,14 @@ from takefits.core.usecases import (
     generate_catalog,
     export_clump_mask,
 )
+from takefits.logic.clump_worker import ClumpWorker
+from takefits.logic.progress import CancellationToken
+
+
+# Keep orphaned (cancelled / closed-over) clump jobs alive until their worker
+# thread unwinds, so Qt never deletes a still-running QThread.  Each entry is a
+# (QThread, ClumpWorker) tuple removed once the thread finishes.
+_DETACHED_CLUMP_JOBS: set = set()
 from takefits.core.history_provenance import build_processing_history_lines
 from takefits.core.contour_manager import ContourManager, ContourParameters, ContourSegment, ContourItemState, ContourState
 from takefits.tools.base_panel import (
@@ -72,7 +82,10 @@ class ClumpFindingPanel(QWidget):
         self.contour_items = []
         self.mask_overlay = None
         self.catalog = []
+        self._base_catalog = []
         self._last_clump_result = None
+        self._edge_label_flags = {}
+        self._edge_excluded_labels = set()
 
         self._label_view_active = False
         self._baseline_data = None
@@ -84,9 +97,23 @@ class ClumpFindingPanel(QWidget):
         self._contour_update_timer = QTimer(self)
         self._contour_update_timer.setSingleShot(True)
         self._contour_update_timer.timeout.connect(self._update_cloud_contours_for_all_planes)
+        self._invalid_edge_distance_cache = None
+        self._order_state_cache = {}
+        self._quality_refilter_timer = QTimer(self)
+        self._quality_refilter_timer.setSingleShot(True)
+        self._quality_refilter_timer.timeout.connect(self._apply_pending_quality_refilter)
         self._last_update_params = {}
         self._last_run_metadata = {}
         self._action_record_tag = "panel:clump"
+        self._scimes_availability_checked = False
+        self._scimes_available = None
+        self._scimes_error = ""
+
+        # Background worker state (clump finding runs off the UI thread).
+        self._clump_thread = None
+        self._clump_worker = None
+        self._clump_cancel = None
+        self._clump_job = None
 
         self._input_width = 90
         self._rms_input_width = 120
@@ -174,7 +201,37 @@ class ClumpFindingPanel(QWidget):
         display_layout.addLayout(id_order_row)
         main_layout.addWidget(display_group)
 
+        quality_group = QGroupBox("Quality Flags")
+        quality_layout = QVBoxLayout(quality_group)
+        self.edge_exclude_checkbox = QCheckBox("Hide edge-flagged clouds")
+        self.edge_exclude_checkbox.setToolTip(
+            "Hide labels touching the image edge or valid-data/NaN footprint edge. "
+            "Mask and catalog exports follow the current visibility; the original "
+            "detection result is retained."
+        )
+        quality_layout.addWidget(self.edge_exclude_checkbox)
+        edge_row = QHBoxLayout()
+        self.edge_margin_label = QLabel("Spatial edge margin:")
+        edge_row.addWidget(self.edge_margin_label)
+        self.edge_margin_spin = self._make_int_spin(0, minimum=0, maximum=10_000)
+        self.edge_margin_spin.setToolTip(
+            "0 px flags only labels touching the image edge or valid-data footprint. "
+            "Increase to hide labels within N pixels of the spatial edge."
+        )
+        edge_row.addWidget(self.edge_margin_spin)
+        self.edge_margin_unit_label = QLabel("px")
+        edge_row.addWidget(self.edge_margin_unit_label)
+        edge_row.addStretch()
+        quality_layout.addLayout(edge_row)
+        main_layout.addWidget(quality_group)
+
         # Action buttons
+        # NOTE: A "Cancel" button intentionally has no UI here.  Cooperative
+        # cancellation cannot interrupt the uninterruptible heavy calls (notably
+        # astrodendro/SCIMES), so exposing it was misleading.  The cancellation
+        # machinery is kept in the backend (cancel token, _cancel_clump_job,
+        # _detach_running_job, worker cancel support) and is still used to close
+        # the panel mid-run; re-add a button wired to _cancel_clump_job to revive.
         button_layout = QHBoxLayout()
         self.run_button = QPushButton("Run")
         self.export_catalog_button = QPushButton("Export Catalog")
@@ -191,9 +248,20 @@ class ClumpFindingPanel(QWidget):
 
         # Status
         self.status_label = QLabel("Status: Ready")
+        self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.count_label = QLabel("Detected: -- clumps")
         main_layout.addWidget(self.status_label)
         main_layout.addWidget(self.count_label)
+
+        # Progress bar (hidden until a job runs; busy mode for indeterminate steps)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setVisible(False)
+        main_layout.addWidget(self.progress_bar)
 
         # Connect signals
         self.run_button.clicked.connect(self.run_identification)
@@ -202,6 +270,9 @@ class ClumpFindingPanel(QWidget):
         self.clear_button.clicked.connect(self.clear_results)
         self.contour_radio.toggled.connect(self._on_display_mode_changed)
         self.mask_radio.toggled.connect(self._on_display_mode_changed)
+        self.edge_margin_spin.valueChanged.connect(self._on_quality_settings_changed)
+        self.edge_exclude_checkbox.toggled.connect(self._on_quality_settings_changed)
+        self._update_edge_margin_enabled()
 
         # Initially disable export buttons
         self.export_catalog_button.setEnabled(False)
@@ -299,6 +370,388 @@ class ClumpFindingPanel(QWidget):
             return
         self._apply_id_order(refresh=True)
 
+    def _on_quality_settings_changed(self):
+        self._update_edge_margin_enabled()
+        if self._base_result_mask is None:
+            return
+        # Debounce: the margin spin box fires valueChanged on every tick or
+        # keystroke, and each refilter walks the full mask (find_objects,
+        # relabel, copies) on the GUI thread.
+        self._quality_refilter_timer.start(200)
+
+    def _apply_pending_quality_refilter(self):
+        if self._base_result_mask is None:
+            return
+        self._apply_id_order(refresh=True)
+
+    def _update_edge_margin_enabled(self):
+        if not hasattr(self, "edge_exclude_checkbox"):
+            return
+        enabled = bool(self.edge_exclude_checkbox.isChecked())
+        for widget_name in (
+            "edge_margin_label",
+            "edge_margin_spin",
+            "edge_margin_unit_label",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
+
+    def _edge_margin_value(self):
+        if not hasattr(self, "edge_margin_spin"):
+            return 0
+        return max(0, int(self.edge_margin_spin.value()))
+
+    @staticmethod
+    def _finite_mask(values):
+        try:
+            finite = np.isfinite(np.asarray(values))
+        except TypeError:
+            return None
+        if np.ma.isMaskedArray(values):
+            finite = finite & ~np.ma.getmaskarray(values)
+        return np.asarray(finite, dtype=bool)
+
+    @classmethod
+    def _spatial_valid_footprint(cls, data, spatial_shape):
+        if data is None:
+            return None
+        try:
+            data_array = np.asanyarray(data)
+        except Exception:
+            return None
+        if data_array.ndim < 2 or tuple(data_array.shape[-2:]) != tuple(spatial_shape):
+            return None
+
+        if data_array.ndim == 2:
+            return cls._finite_mask(data_array)
+
+        spatial_valid = np.zeros(tuple(spatial_shape), dtype=bool)
+        for leading_index in np.ndindex(tuple(data_array.shape[:-2])):
+            finite_plane = cls._finite_mask(data_array[leading_index])
+            if finite_plane is None:
+                return None
+            spatial_valid |= finite_plane
+            if bool(np.all(spatial_valid)):
+                break
+        return spatial_valid
+
+    @classmethod
+    def _spatial_invalid_edge_distance_map(cls, data, spatial_shape):
+        spatial_valid = cls._spatial_valid_footprint(data, spatial_shape)
+        # The all-valid short-circuit is load-bearing: distance_transform_cdt
+        # returns -1 everywhere when the input has no background (zero) pixel.
+        if spatial_valid is None or not np.any(spatial_valid) or np.all(spatial_valid):
+            return None
+
+        distances = ndimage.distance_transform_cdt(spatial_valid, metric="taxicab")
+        return np.maximum(np.asarray(distances, dtype=np.int32) - 1, 0)
+
+    def _cached_invalid_edge_distance_map(self, spatial_shape):
+        """Memoized _spatial_invalid_edge_distance_map for the current analysis data.
+
+        The map depends only on analysis_data, which is reassigned in
+        run_identification() and on workspace restore; both reset the cache.
+        """
+        spatial_shape = tuple(int(value) for value in spatial_shape)
+        cache = getattr(self, "_invalid_edge_distance_cache", None)
+        if cache is not None and cache[0] == spatial_shape:
+            return cache[1]
+        distance_map = self._spatial_invalid_edge_distance_map(
+            getattr(self, "analysis_data", None), spatial_shape
+        )
+        self._invalid_edge_distance_cache = (spatial_shape, distance_map)
+        return distance_map
+
+    def _invalidate_order_caches(self):
+        """Drop caches derived from the base mask / analysis data.
+
+        Call after every reassignment of ``_base_result_mask`` or
+        ``analysis_data``; the per-order relabel mappings, edge flags and the
+        valid-footprint distance map are all functions of those two.
+        """
+        self._order_state_cache = {}
+        self._invalid_edge_distance_cache = None
+
+    @staticmethod
+    def _edge_flags_from_distances(distances, invalid_distance=None):
+        distance_values = list(distances.values())
+        if invalid_distance is not None:
+            distance_values.append(int(invalid_distance))
+        edge_axes = [
+            axis for axis, distance in distances.items()
+            if distance == 0
+        ]
+        if invalid_distance == 0:
+            edge_axes.append("valid_data")
+        return {
+            "spatial_edge_touch": bool(edge_axes),
+            "spatial_edge_axes": ",".join(edge_axes),
+            "distance_to_spatial_edge_pix": int(min(distance_values)),
+        }
+
+    @classmethod
+    def _spatial_edge_flags_from_xy(cls, y_idx, x_idx, shape, invalid_edge_distance=None):
+        if y_idx.size == 0 or x_idx.size == 0:
+            return {
+                "spatial_edge_touch": False,
+                "spatial_edge_axes": "",
+                "distance_to_spatial_edge_pix": -1,
+            }
+
+        ny = int(shape[-2])
+        nx = int(shape[-1])
+        distances = {
+            "x_min": int(np.min(x_idx)),
+            "x_max": int(nx - 1 - np.max(x_idx)),
+            "y_min": int(np.min(y_idx)),
+            "y_max": int(ny - 1 - np.max(y_idx)),
+        }
+
+        invalid_distance = None
+        if invalid_edge_distance is not None:
+            try:
+                invalid_distance = int(np.min(invalid_edge_distance[y_idx, x_idx]))
+            except IndexError:
+                invalid_distance = None
+        return cls._edge_flags_from_distances(distances, invalid_distance)
+
+    def _compute_spatial_edge_flags(self, mask):
+        """Return per-label spatial edge metadata."""
+        mask = np.asarray(mask)
+        if mask.ndim < 2 or mask.size == 0:
+            return {}
+
+        y_axis = mask.ndim - 2
+        x_axis = mask.ndim - 1
+        ny = int(mask.shape[y_axis])
+        nx = int(mask.shape[x_axis])
+        # A label is present exactly when its find_objects slice is not None,
+        # so the slices double as the label list (no np.unique pass needed).
+        obj_slices = find_objects(mask)
+        if not obj_slices:
+            return {}
+        invalid_edge_distance = self._cached_invalid_edge_distance_map((ny, nx))
+        leading_axes = tuple(range(mask.ndim - 2))
+
+        flags = {}
+        for label_index, obj_slice in enumerate(obj_slices):
+            if obj_slice is None:
+                continue
+            label = label_index + 1
+
+            y_slice = obj_slice[y_axis]
+            x_slice = obj_slice[x_axis]
+            # find_objects boxes are tight, so the slice bounds equal the exact
+            # per-pixel min/max along each spatial axis.
+            distances = {
+                "x_min": int(x_slice.start),
+                "x_max": int(nx - x_slice.stop),
+                "y_min": int(y_slice.start),
+                "y_max": int(ny - y_slice.stop),
+            }
+            invalid_distance = None
+            if invalid_edge_distance is not None:
+                spatial_footprint = mask[obj_slice] == label
+                if leading_axes:
+                    spatial_footprint = spatial_footprint.any(axis=leading_axes)
+                invalid_distance = int(
+                    invalid_edge_distance[y_slice, x_slice][spatial_footprint].min()
+                )
+            flags[label] = self._edge_flags_from_distances(distances, invalid_distance)
+        return flags
+
+    @staticmethod
+    def _remove_labels_from_mask(mask, labels):
+        labels = {int(label) for label in labels if int(label) > 0}
+        if not labels:
+            return np.array(mask, copy=True)
+
+        max_label = int(np.max(mask)) if np.size(mask) else 0
+        if max_label <= 0:
+            return np.array(mask, copy=True)
+
+        mapping = np.arange(max_label + 1, dtype=mask.dtype)
+        for label in labels:
+            if label <= max_label:
+                mapping[label] = 0
+        return mapping[mask]
+
+    def _apply_quality_filter_to_mask(self, mask, flags_cache=None):
+        """Filter ``mask`` by the edge-quality settings.
+
+        ``mask`` must be an array the caller owns (a fresh copy or relabel
+        output): when nothing is excluded it is returned as-is, and it becomes
+        ``self.result_mask``, which must not alias ``self._base_result_mask``.
+
+        ``flags_cache`` is the per-order-key dict owned by _apply_id_order;
+        the edge flags depend only on the mask geometry (not the margin), so
+        margin changes reuse them instead of re-running find_objects.
+        """
+        cached_flags = None if flags_cache is None else flags_cache.get("flags")
+        if cached_flags is None:
+            cached_flags = self._compute_spatial_edge_flags(mask)
+            if flags_cache is not None:
+                flags_cache["flags"] = cached_flags
+        self._edge_label_flags = cached_flags
+        if self.edge_exclude_checkbox.isChecked():
+            margin = self._edge_margin_value()
+            edge_labels = {
+                label for label, flags in self._edge_label_flags.items()
+                if int(flags.get("distance_to_spatial_edge_pix", -1)) <= margin
+                and int(flags.get("distance_to_spatial_edge_pix", -1)) >= 0
+            }
+        else:
+            edge_labels = set()
+
+        if edge_labels:
+            self._edge_excluded_labels = set(edge_labels)
+            return self._remove_labels_from_mask(mask, edge_labels)
+
+        self._edge_excluded_labels = set()
+        return mask
+
+    def _catalog_row_with_quality_flags(self, row):
+        row_out = dict(row)
+        try:
+            label = int(row_out.get("id", 0))
+        except (TypeError, ValueError):
+            label = 0
+        flags = self._edge_label_flags.get(label, {})
+        row_out["spatial_edge_touch"] = bool(flags.get("spatial_edge_touch", False))
+        row_out["spatial_edge_axes"] = str(flags.get("spatial_edge_axes", ""))
+        row_out["distance_to_spatial_edge_pix"] = int(
+            flags.get("distance_to_spatial_edge_pix", -1)
+        )
+        return row_out
+
+    def _catalog_with_quality_flags(self, catalog):
+        if not catalog:
+            return []
+        rows = []
+        for row in catalog:
+            try:
+                label = int(row.get("id", 0))
+            except (AttributeError, TypeError, ValueError):
+                label = 0
+            if label in self._edge_excluded_labels:
+                continue
+            rows.append(self._catalog_row_with_quality_flags(row))
+        return rows
+
+    def _spatial_edge_flags_from_indices(self, indices, shape, invalid_edge_distance=None):
+        if len(indices) < 2 or len(shape) < 2:
+            return {
+                "spatial_edge_touch": False,
+                "spatial_edge_axes": "",
+                "distance_to_spatial_edge_pix": -1,
+            }
+
+        y_idx = np.asarray(indices[-2])
+        x_idx = np.asarray(indices[-1])
+        if y_idx.size == 0 or x_idx.size == 0:
+            return {
+                "spatial_edge_touch": False,
+                "spatial_edge_axes": "",
+                "distance_to_spatial_edge_pix": -1,
+            }
+
+        return self._spatial_edge_flags_from_xy(
+            y_idx.astype(int, copy=False),
+            x_idx.astype(int, copy=False),
+            shape,
+            invalid_edge_distance=invalid_edge_distance,
+        )
+
+    def _native_catalog_with_quality_flags(self, cat):
+        if cat is None or self.dendro_handler is None or "_idx" not in cat.colnames:
+            return cat
+
+        out = cat.copy()
+        data_shape = getattr(self.analysis_data, "shape", None)
+        if data_shape is None and self._base_result_mask is not None:
+            data_shape = self._base_result_mask.shape
+        if data_shape is None:
+            return out
+        invalid_edge_distance = None
+        if len(out) > 0:
+            invalid_edge_distance = self._cached_invalid_edge_distance_map(
+                data_shape[-2:]
+            )
+
+        edge_touch = []
+        edge_axes = []
+        distances = []
+        for row in out:
+            flags = None
+            try:
+                struct = self.dendro_handler.d[int(row["_idx"])]
+                flags = self._spatial_edge_flags_from_indices(
+                    struct.indices(),
+                    data_shape,
+                    invalid_edge_distance=invalid_edge_distance,
+                )
+            except Exception:
+                pass
+            if flags is None:
+                flags = {
+                    "spatial_edge_touch": False,
+                    "spatial_edge_axes": "",
+                    "distance_to_spatial_edge_pix": -1,
+                }
+            edge_touch.append(bool(flags["spatial_edge_touch"]))
+            edge_axes.append(str(flags["spatial_edge_axes"]))
+            distances.append(int(flags["distance_to_spatial_edge_pix"]))
+
+        for name, values in (
+            ("spatial_edge_touch", edge_touch),
+            ("spatial_edge_axes", edge_axes),
+            ("distance_to_spatial_edge_pix", distances),
+        ):
+            out[name] = values
+
+        if self.edge_exclude_checkbox.isChecked() and len(out) > 0:
+            distances = np.asarray(out["distance_to_spatial_edge_pix"], dtype=int)
+            valid_distances = distances >= 0
+            keep = np.logical_not(valid_distances & (distances <= self._edge_margin_value()))
+            out = out[keep]
+        return out
+
+    def _update_result_count_label(self):
+        if self._base_result_mask is None or self.result_mask is None:
+            self.count_label.setText("Detected: -- clumps")
+            return
+
+        if self._edge_label_flags:
+            # _apply_quality_filter_to_mask rebuilds the flags from the full
+            # pre-exclusion mask (one entry per label, identical count to the
+            # base mask since relabeling is a bijection), so the totals come
+            # for free instead of two np.unique passes over the cube.
+            total_count = len(self._edge_label_flags)
+            visible_count = total_count - len(self._edge_excluded_labels)
+        else:
+            total_labels = np.unique(self._base_result_mask)
+            total_count = int(np.count_nonzero(total_labels > 0))
+            visible_labels = np.unique(self.result_mask)
+            visible_count = int(np.count_nonzero(visible_labels > 0))
+        edge_count = sum(
+            1 for flags in self._edge_label_flags.values()
+            if flags.get("spatial_edge_touch")
+        )
+        hidden_count = len(self._edge_excluded_labels)
+
+        if hidden_count:
+            self.count_label.setText(
+                f"Detected: {visible_count}/{total_count} clumps "
+                f"({hidden_count} edge-hidden)"
+            )
+        elif edge_count:
+            self.count_label.setText(
+                f"Detected: {total_count} clumps ({edge_count} edge-flagged)"
+            )
+        else:
+            self.count_label.setText(f"Detected: {total_count} clumps")
+
     def _collect_label_stats(self, mask, data):
         labels = np.unique(mask)
         labels = labels[labels > 0]
@@ -328,10 +781,16 @@ class ClumpFindingPanel(QWidget):
             "centroid": centroids,
         }
 
-    def _relabel_mask_by_order(self, mask, order_key, data):
+    def _order_mapping_for_key(self, mask, order_key, data):
+        """Return the old-label -> new-label mapping array for ``order_key``.
+
+        Returns None when the mask has no labels. The mapping depends only on
+        the mask and data, so callers can cache it and reapply it with
+        ``mapping[mask]`` without recomputing the label statistics.
+        """
         stats = self._collect_label_stats(mask, data)
         if stats is None:
-            return np.array(mask, copy=True)
+            return None
 
         labels = stats["labels"]
         if order_key == "detection":
@@ -363,27 +822,51 @@ class ClumpFindingPanel(QWidget):
         mapping = np.zeros(max_label + 1, dtype=mask.dtype)
         for new_id, old_id in enumerate(sorted_labels, start=1):
             mapping[int(old_id)] = int(new_id)
-        return mapping[mask]
+        return mapping
 
     def _apply_id_order(self, refresh=True):
         if self._base_result_mask is None:
             return
         order_key = self.id_order_combo.currentData() or "detection"
         data = self.analysis_data if self.analysis_data is not None else self.data
+        # Relabel mappings and edge flags depend only on the base mask and
+        # order key, not on the margin/visibility settings, so margin changes
+        # reuse them from _order_state_cache (reset by _invalidate_order_caches).
+        order_cache = self._order_state_cache.setdefault(order_key, {})
         if order_key == "detection":
-            self.result_mask = np.array(self._base_result_mask, copy=True)
+            ordered_mask = np.array(self._base_result_mask, copy=True)
             # Do NOT clear catalog here if we are just reverting to detection order
             # The catalog from the usecase IS in detection order
         else:
-            self.result_mask = self._relabel_mask_by_order(self._base_result_mask, order_key, data)
+            if "mapping" not in order_cache:
+                order_cache["mapping"] = self._order_mapping_for_key(
+                    self._base_result_mask, order_key, data
+                )
+            mapping = order_cache["mapping"]
+            if mapping is None:
+                ordered_mask = np.array(self._base_result_mask, copy=True)
+            else:
+                ordered_mask = mapping[self._base_result_mask]
             # If we reordered, the original catalog (which is detection ordered) is mismatched ID-wise
             self.catalog = []
+        self.result_mask = self._apply_quality_filter_to_mask(
+            ordered_mask, flags_cache=order_cache
+        )
+        if order_key == "detection" and not self._edge_excluded_labels:
+            source_catalog = self._base_catalog if self._base_catalog else self.catalog
+            self.catalog = self._catalog_with_quality_flags(source_catalog)
+        else:
+            self.catalog = []
+        self._update_result_count_label()
         self._label_color_map = {}
         if refresh:
+            self._clear_cloud_overlays()
             if self.mask_radio.isChecked():
                 label_data = self._make_label_view_data()
                 if label_data is not None:
                     self._apply_data_to_all_windows(label_data)
+            else:
+                self._schedule_contour_update()
 
     def _create_clumpfind_tab(self):
         """Create the Clumpfind algorithm parameter tab."""
@@ -462,15 +945,10 @@ class ClumpFindingPanel(QWidget):
 
         # SCIMES options
         self.use_scimes = QCheckBox("Use SCIMES clustering")
-        
-        # Check availability
-        scimes_available, scimes_error = check_scimes_availability()
-
-        if not scimes_available:
-            self.use_scimes.setEnabled(False)
-            self.use_scimes.setToolTip(f"SCIMES module is not installed or available.\nError: {scimes_error}")
-        else:
-            self.use_scimes.setToolTip("Apply SCIMES spectral clustering to group dendrogram leaves")
+        self.use_scimes.setToolTip(
+            "Apply SCIMES spectral clustering to group dendrogram leaves. "
+            "Availability is checked when enabled."
+        )
 
         layout.addWidget(self.use_scimes, 4, 0, 1, 2)
 
@@ -478,10 +956,9 @@ class ClumpFindingPanel(QWidget):
         self.scimes_isol.setChecked(True)
         self.scimes_isol.setEnabled(False) # Default disabled until SCIMES checked
         
-        # Connect usage toggle to isolation enable (always connect)
-        self.use_scimes.toggled.connect(self.scimes_isol.setEnabled)
-        self.use_scimes.toggled.connect(lambda checked: self.output_mode_combo.setDisabled(checked)) 
-        self.use_scimes.toggled.connect(lambda _checked: self._update_projected_availability())
+        # Keep the SCIMES dependency check out of panel construction; it can
+        # import heavy optional packages on first use.
+        self.use_scimes.toggled.connect(self._on_scimes_toggled)
         layout.addWidget(self.scimes_isol, 5, 0, 1, 2)
 
         # SCIMES criteria (3D use-case) - includes User K
@@ -511,13 +988,51 @@ class ClumpFindingPanel(QWidget):
         crit_layout.addWidget(self.user_k_label, 1, 0)
         crit_layout.addWidget(self.user_k_input, 1, 1, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        crit_group.setEnabled(False)
-        self.use_scimes.toggled.connect(crit_group.setEnabled)
-        layout.addWidget(crit_group, 6, 0, 1, 2)
+        self.scimes_options_group = crit_group
+        self.scimes_options_group.setEnabled(False)
+        layout.addWidget(self.scimes_options_group, 6, 0, 1, 2)
 
         layout.setHorizontalSpacing(8)
         layout.setRowStretch(7, 1)
         return tab
+
+    def _ensure_scimes_available(self, show_message=False):
+        if not self._scimes_availability_checked:
+            self._scimes_availability_checked = True
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                available, error = check_scimes_availability()
+            finally:
+                QApplication.restoreOverrideCursor()
+            self._scimes_available = bool(available)
+            self._scimes_error = str(error or "")
+
+        if self._scimes_available:
+            self.use_scimes.setToolTip("Apply SCIMES spectral clustering to group dendrogram leaves")
+            return True
+
+        message = "SCIMES module is not installed or available."
+        if self._scimes_error:
+            message = f"{message}\nError: {self._scimes_error}"
+        self.use_scimes.setToolTip(message)
+        if show_message:
+            QMessageBox.warning(self, "SCIMES Unavailable", message)
+        return False
+
+    def _apply_scimes_ui_state(self, checked):
+        checked = bool(checked)
+        self.scimes_isol.setEnabled(checked)
+        self.output_mode_combo.setDisabled(checked)
+        self.scimes_options_group.setEnabled(checked)
+        self._update_projected_availability()
+
+    def _on_scimes_toggled(self, checked):
+        if checked and not self._ensure_scimes_available(show_message=True):
+            self.use_scimes.blockSignals(True)
+            self.use_scimes.setChecked(False)
+            self.use_scimes.blockSignals(False)
+            checked = False
+        self._apply_scimes_ui_state(checked)
 
     def move_to_default_position(self):
         """Position the panel relative to the main viewer."""
@@ -567,232 +1082,358 @@ class ClumpFindingPanel(QWidget):
         return np.array(cube, copy=False)
 
     def run_identification(self):
-        """Run the selected cloud identification algorithm."""
-        self.status_label.setText("Status: Running...")
-        QApplication.processEvents()
+        """Start the selected clump-finding algorithm on a worker thread."""
+        if self._clump_thread is not None and self._clump_thread.isRunning():
+            return  # already running; ignore a re-entrant Run click
 
         rms = self.get_rms()
         if rms is None:
             self.status_label.setText("Status: Error - invalid RMS")
             return
 
-        # Get the analysis data (2D or 3D)
+        # Snapshot the analysis data (2D image or 3D cube) for display/relabel.
         self.analysis_data = self.get_analysis_data()
+        self._invalidate_order_caches()
         if self.analysis_data is None:
             self.status_label.setText("Status: Error - no data")
             return
 
-        current_tab = self.tabs.currentIndex()
+        state = self.get_app_state()
+        if state is None:
+            QMessageBox.critical(self, "Error", "AppState not available")
+            self.status_label.setText("Status: Error - no AppState")
+            return
 
+        # Validate + collect parameters on the UI thread (may pop dialogs).
+        job = self._collect_clump_job(rms)
+        if job is None:
+            return
+
+        self._start_clump_job(state, job)
+
+    def _start_clump_job(self, state, job):
+        """Spin up the worker thread for a collected clump-finding job."""
+        self._clump_job = job
+        self._clump_cancel = CancellationToken()
+        self._clump_thread = QThread(self)
+        self._clump_worker = ClumpWorker(
+            state,
+            job["algorithm"],
+            job["params"],
+            cancel_token=self._clump_cancel,
+        )
+        self._clump_worker.moveToThread(self._clump_thread)
+
+        self._clump_worker.progress.connect(self._on_clump_progress)
+        self._clump_worker.status.connect(self._on_clump_status)
+        self._clump_worker.finished.connect(self._on_clump_finished)
+        self._clump_worker.error.connect(self._on_clump_error)
+        self._clump_worker.cancelled.connect(self._on_clump_cancelled)
+
+        self._clump_thread.started.connect(self._clump_worker.run)
+        self._clump_worker.finished.connect(self._clump_thread.quit)
+        self._clump_worker.error.connect(self._clump_thread.quit)
+        self._clump_worker.cancelled.connect(self._clump_thread.quit)
+        self._clump_thread.finished.connect(self._cleanup_clump_thread)
+
+        self._set_running_ui(True)
+        self._clump_thread.start()
+
+    # ------------------------------------------------------------------
+    # Worker signal handlers
+    def _on_clump_progress(self, value):
+        if not self.progress_bar.isVisible():
+            self.progress_bar.setVisible(True)
+        if value < 0:
+            # Indeterminate/busy phase (e.g. astrodendro compute).
+            self.progress_bar.setRange(0, 0)
+        else:
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(int(value))
+
+    def _on_clump_status(self, text):
+        self.status_label.setText(f"Status: {text}")
+        self.status_label.setToolTip("")
+
+    @staticmethod
+    def _dialog_error_text(message: str) -> str:
+        return textwrap.fill(str(message), width=96, break_long_words=True)
+
+    def _on_clump_finished(self, result):
+        job = self._clump_job or {}
+        self.result_mask = result.mask
+        self._base_catalog = list(result.catalog or [])
+        self.catalog = list(self._base_catalog)
+        self._last_clump_result = result
+        self._last_run_metadata = {
+            "Algorithm": job.get("algorithm_label", "Clump"),
+            "Parameters": result.parameters,
+        }
+        action_name = job.get("action_name")
+        if action_name:
+            self._record_run_action(action_name, job.get("action_payload", {}))
+
+        self._set_running_ui(False)
+        self._apply_clump_result()
+
+    def _on_clump_error(self, message):
+        self._set_running_ui(False)
+        self.status_label.setText("Status: Error - see details")
+        self.status_label.setToolTip(str(message))
+        QMessageBox.critical(
+            self,
+            "Error",
+            f"Algorithm failed:\n{self._dialog_error_text(message)}",
+        )
+
+    def _on_clump_cancelled(self):
+        self._set_running_ui(False)
+        self.status_label.setText("Status: Cancelled")
+        self.count_label.setText("Detected: -- clumps")
+
+    def _cancel_clump_job(self):
+        """Cancel the running job and return control to the user immediately.
+
+        Cooperative algorithms (Clumpfind/FellWalker) stop at their next
+        checkpoint; an uninterruptible one (astrodendro) keeps running detached
+        in the background with its result discarded.  Either way the panel is
+        usable again at once.
+        """
+        if self._clump_thread is None:
+            return
+        if self._clump_cancel is not None:
+            self._clump_cancel.cancel()
+        self._detach_running_job()
+        self._set_running_ui(False)
+        self.status_label.setText("Status: Cancelled")
+        self.count_label.setText("Detected: -- clumps")
+
+    def _detach_running_job(self):
+        """Orphan the running worker/thread so this panel can move on now.
+
+        The caller has already flipped the cancel token.  We sever the worker's
+        links to this panel (so late signals never touch a closed panel), keep
+        the thread alive in a module-level registry (so Qt does not delete a
+        live QThread), and let it self-clean once it finishes.
+        """
+        thread = self._clump_thread
+        worker = self._clump_worker
+        if thread is None or worker is None:
+            return
+
+        for signal, slot in (
+            (worker.progress, self._on_clump_progress),
+            (worker.status, self._on_clump_status),
+            (worker.finished, self._on_clump_finished),
+            (worker.error, self._on_clump_error),
+            (worker.cancelled, self._on_clump_cancelled),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
         try:
-            if current_tab == 0:
-                # Dendrogram/SCIMES
-                self._run_dendrogram(rms)
-            elif current_tab == 1:
-                # Clumpfind
-                self._run_clumpfind(rms)
-            elif current_tab == 2:
-                # FellWalker
-                self._run_fellwalker(rms)
+            thread.finished.disconnect(self._cleanup_clump_thread)
+        except (TypeError, RuntimeError):
+            pass
 
-            # Display results
-            if self.result_mask is not None:
-                unique = np.unique(self.result_mask)
-                n_clumps = int(np.count_nonzero(unique > 0))
-                if n_clumps > 0:
-                    self.count_label.setText(f"Detected: {n_clumps} clumps")
-                    self.status_label.setText("Status: Complete")
-                    self.export_catalog_button.setEnabled(True)
-                    self.export_mask_button.setEnabled(True)
-                    self._base_result_mask = np.array(self.result_mask, copy=True)
-                    self._configure_id_order_options()
-                    self._apply_id_order(refresh=False)
-                    self._update_projected_availability()
+        # The worker stays wired to thread.quit, so the thread exits when the
+        # worker returns.  Detach from the panel's object tree to survive close.
+        thread.setParent(None)
+        entry = (thread, worker)
+        _DETACHED_CLUMP_JOBS.add(entry)
 
-                    # Catalog is already populated by usecase
-                    # self.catalog is set in _run_* methods
+        def _finalize():
+            if entry not in _DETACHED_CLUMP_JOBS:
+                return
+            _DETACHED_CLUMP_JOBS.discard(entry)
+            worker.deleteLater()
+            thread.deleteLater()
 
-                    # Display results
-                    if self.contour_radio.isChecked():
-                        self.display_as_contours()
-                    else:
-                        self.display_as_label_cube()
+        thread.finished.connect(_finalize)
+        if thread.isFinished():
+            _finalize()
+
+        self._clump_thread = None
+        self._clump_worker = None
+        self._clump_cancel = None
+        self._clump_job = None
+
+    def _cleanup_clump_thread(self):
+        worker = self._clump_worker
+        thread = self._clump_thread
+        self._clump_worker = None
+        self._clump_thread = None
+        self._clump_cancel = None
+        if worker is not None:
+            worker.deleteLater()
+        if thread is not None:
+            thread.deleteLater()
+
+    # ------------------------------------------------------------------
+    # Running-state UI
+    def _set_running_ui(self, running):
+        self.run_button.setEnabled(not running)
+        self.clear_button.setEnabled(not running)
+        # Disable the tab *bar* (not individual tabs): disabling the currently
+        # selected tab makes QTabWidget jump to the next enabled tab, which left
+        # the selection on FellWalker after a Dendrogram run.  Disabling the bar
+        # blocks switching while preserving the current page.
+        self.tabs.tabBar().setEnabled(not running)
+        if running:
+            self.export_catalog_button.setEnabled(False)
+            self.export_mask_button.setEnabled(False)
+            self.status_label.setText("Status: Running...")
+            self.progress_bar.setRange(0, 0)  # busy until first concrete update
+            self.progress_bar.setValue(0)
+            self.progress_bar.setVisible(True)
+        else:
+            self.progress_bar.setVisible(False)
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
+
+    def _apply_clump_result(self):
+        """Update displays from self.result_mask after a successful run."""
+        try:
+            if self.result_mask is None:
+                return
+            # max() is a single pass; the exact count comes from the edge flags
+            # via _update_result_count_label inside _apply_id_order below.
+            has_clumps = self.result_mask.size > 0 and int(np.max(self.result_mask)) > 0
+            if has_clumps:
+                self.status_label.setText("Status: Complete")
+                self.export_catalog_button.setEnabled(True)
+                self.export_mask_button.setEnabled(True)
+                self._base_result_mask = np.array(self.result_mask, copy=True)
+                self._invalidate_order_caches()
+                self._configure_id_order_options()
+                self._apply_id_order(refresh=False)
+                self._update_projected_availability()
+                if self.contour_radio.isChecked():
+                    self.display_as_contours()
                 else:
-                    self.count_label.setText("Detected: 0 clumps")
-                    self.status_label.setText("Status: No clumps detected. Try adjusting parameters.")
-                    self._base_result_mask = None
-                    self.catalog = []
-                    self.id_order_combo.setEnabled(False)
-
+                    self.display_as_label_cube()
+            else:
+                self.count_label.setText("Detected: 0 clumps")
+                self.status_label.setText("Status: No clumps detected. Try adjusting parameters.")
+                self._base_result_mask = None
+                self._invalidate_order_caches()
+                self.catalog = []
+                self._base_catalog = []
+                self._edge_label_flags = {}
+                self._edge_excluded_labels = set()
+                self.id_order_combo.setEnabled(False)
         except Exception as e:
             self.status_label.setText(f"Status: Error - {str(e)}")
-            QMessageBox.critical(self, "Error", f"Algorithm failed:\n{str(e)}")
+            QMessageBox.critical(self, "Error", f"Display failed:\n{str(e)}")
 
-    def _run_clumpfind(self, rms):
-        """Run Clumpfind algorithm via usecase."""
-        state = self.get_app_state()
-        if state is None:
-            raise ValueError("AppState not available")
+    def _collect_clump_job(self, rms):
+        """Validate inputs and build a worker job for the active algorithm tab.
 
-        min_threshold_sigma = self.cf_min_threshold.value()
-        step_sigma = self.cf_step.value()
-        min_pixels = int(self.cf_min_pixels.value())
+        Runs on the UI thread (may show dialogs). Returns a job dict consumed by
+        :meth:`_start_clump_job`, or ``None`` when validation fails / is aborted.
+        """
+        current_tab = self.tabs.currentIndex()
 
-        result: ClumpResult = run_clumpfind(
-            state,
-            rms=rms,
-            min_threshold_sigma=min_threshold_sigma,
-            step_sigma=step_sigma,
-            min_pixels=min_pixels
-        )
-
-        self.result_mask = result.mask
-        self.catalog = result.catalog
-        self._last_clump_result = result
-        
-        self._last_run_metadata = {
-            "Algorithm": "ClumpFind",
-            "Parameters": result.parameters
-        }
-        self._record_run_action(
-            "run_clumpfind",
-            {
+        if current_tab == 1:
+            # Clumpfind
+            params = {
                 "rms": float(rms),
-                "min_threshold_sigma": float(min_threshold_sigma),
-                "step_sigma": float(step_sigma),
-                "min_pixels": int(min_pixels),
-            },
-        )
+                "min_threshold_sigma": float(self.cf_min_threshold.value()),
+                "step_sigma": float(self.cf_step.value()),
+                "min_pixels": int(self.cf_min_pixels.value()),
+            }
+            return {
+                "algorithm": "clumpfind",
+                "algorithm_label": "ClumpFind",
+                "action_name": "run_clumpfind",
+                "action_payload": dict(params),
+                "params": params,
+            }
 
-    def _run_fellwalker(self, rms):
-        """Run FellWalker algorithm via usecase."""
-        state = self.get_app_state()
-        if state is None:
-            raise ValueError("AppState not available")
-
-        min_threshold_sigma = self.fw_min_threshold.value()
-        min_dip_sigma = self.fw_min_dip.value()
-        min_pixels = int(self.fw_min_pixels.value())
-
-        result: ClumpResult = run_fellwalker(
-            state,
-            rms=rms,
-            min_threshold_sigma=min_threshold_sigma,
-            min_dip_sigma=min_dip_sigma,
-            min_pixels=min_pixels
-        )
-
-        self.result_mask = result.mask
-        self.catalog = result.catalog
-        self._last_clump_result = result
-        
-        self._last_run_metadata = {
-            "Algorithm": "FellWalker",
-            "Parameters": result.parameters
-        }
-        self._record_run_action(
-            "run_fellwalker",
-            {
+        if current_tab == 2:
+            # FellWalker
+            params = {
                 "rms": float(rms),
-                "min_threshold_sigma": float(min_threshold_sigma),
-                "min_dip_sigma": float(min_dip_sigma),
-                "min_pixels": int(min_pixels),
-            },
-        )
+                "min_threshold_sigma": float(self.fw_min_threshold.value()),
+                "min_dip_sigma": float(self.fw_min_dip.value()),
+                "min_pixels": int(self.fw_min_pixels.value()),
+            }
+            return {
+                "algorithm": "fellwalker",
+                "algorithm_label": "FellWalker",
+                "action_name": "run_fellwalker",
+                "action_payload": dict(params),
+                "params": params,
+            }
 
-    def _run_dendrogram(self, rms):
-        """Run Dendrogram (and optionally SCIMES) algorithm via usecase."""
-        state = self.get_app_state()
-        if state is None:
-            raise ValueError("AppState not available")
-
-        min_value_sigma = self.dend_min_value.value()
-        min_delta_sigma = self.dend_min_delta.value()
+        # current_tab == 0 -> Dendrogram / SCIMES
+        min_value_sigma = float(self.dend_min_value.value())
+        min_delta_sigma = float(self.dend_min_delta.value())
         min_npix = int(self.dend_min_npix.value())
 
-        # Output Mode
         mode_text = self.output_mode_combo.currentText()
         output_mode = 'leaves'
         if 'Roots' in mode_text:
             output_mode = 'roots'
         elif 'All' in mode_text:
             output_mode = 'all'
-        
-        # SCIMES setup
+
         use_scimes = self.use_scimes.isChecked()
         scimes_criteria = []
         scimes_user_k = 0
 
         if use_scimes:
-            output_mode = 'clusters'  # Override output mode for SCIMES
-            if hasattr(self, "scimes_lum_check") and self.scimes_lum_check.isChecked():
+            if not self._ensure_scimes_available(show_message=True):
+                # _ensure_scimes_available already surfaced the reason.
+                return None
+            output_mode = 'clusters'
+            if self.scimes_lum_check.isChecked():
                 scimes_criteria.append("luminosity")
-            if hasattr(self, "scimes_vol_check") and self.scimes_vol_check.isChecked():
-                # Correctly determine if it's area or volume based on dimension is tricky without data here
-                # But usecases can handle the default name if we just say "volume" or let it be flexible.
-                # The usage in the GUI was dynamic. Let's send both or specific one.
-                # Actually, run_dendrogram logic inside usecases handles dendro_data.ndim logic implicitly?
-                # No, run_dendrogram receives AppState.
-                # Let's just pass "volume" and let logic handle it, or pass specific strings if needed.
-                # The GUI logic used: crit_name = "volume" if getattr(dendro_data, "ndim", 0) == 3 else "area_exact"
-                # We can replicate this check if we access state.data
-                is_3d = False
-                if state.data.ndim >= 3:
-                     is_3d = True
-                crit_name = "volume" if is_3d else "area_exact"
-                scimes_criteria.append(crit_name)
-
+            if self.scimes_vol_check.isChecked():
+                is_3d = self.analysis_data is not None and self.analysis_data.ndim >= 3
+                scimes_criteria.append("volume" if is_3d else "area_exact")
             if not scimes_criteria:
                 QMessageBox.warning(self, "SCIMES", "Select at least one criterion.")
-                # We could abort or fall back. 
-                # run_dendrogram doesn't have an abort mechanism for this param check.
-                # We should check here.
-                # Fallback to standard dendrogram?
                 use_scimes = False
+                output_mode = 'leaves'
+            scimes_user_k = int(self.user_k_input.value())
 
-            if hasattr(self, "user_k_input"):
-                scimes_user_k = int(self.user_k_input.value())
+        # The usecase layer re-runs every time; drop any stale cached handler.
+        self.dendro_handler = None
 
-        result: ClumpResult = run_dendrogram(
-            state,
-            rms=rms,
-            min_value_sigma=min_value_sigma,
-            min_delta_sigma=min_delta_sigma,
-            min_npix=min_npix,
-            output_mode=output_mode,
-            use_scimes=use_scimes,
-            scimes_criteria=scimes_criteria,
-            scimes_user_k=scimes_user_k,
-            scimes_save_isol=self.scimes_isol.isChecked()
-        )
-
-        self.result_mask = result.mask
-        self.catalog = result.catalog
-        self._last_clump_result = result
-        
-        self.dendro_handler = None # Using usecase, we don't hold the handler reference anymore (unless we wanted to cache for re-runs)
-        # Caching logic is moved to usecase or lost?
-        # The GUI had caching logic: "Reuse existing handler if valid"
-        # The usecase layer currently re-runs every time.
-        # Ideally, we should add caching to AppState or usecase, but for now we accept the re-run cost (consistent with other usecases).
-        
-        self._last_run_metadata = {
-            "Algorithm": "Dendrogram" + (" (SCIMES)" if use_scimes else ""),
-            "Parameters": result.parameters
-        }
-        dendro_payload = {
+        params = {
             "rms": float(rms),
-            "min_value_sigma": float(min_value_sigma),
-            "min_delta_sigma": float(min_delta_sigma),
-            "min_npix": int(min_npix),
+            "min_value_sigma": min_value_sigma,
+            "min_delta_sigma": min_delta_sigma,
+            "min_npix": min_npix,
+            "output_mode": output_mode,
+            "use_scimes": bool(use_scimes),
+            "scimes_criteria": list(scimes_criteria),
+            "scimes_user_k": int(scimes_user_k),
+            "scimes_save_isol": bool(self.scimes_isol.isChecked()),
+        }
+        payload = {
+            "rms": float(rms),
+            "min_value_sigma": min_value_sigma,
+            "min_delta_sigma": min_delta_sigma,
+            "min_npix": min_npix,
             "output_mode": output_mode,
             "use_scimes": bool(use_scimes),
         }
         if use_scimes:
-            dendro_payload["scimes_criteria"] = list(scimes_criteria)
-            dendro_payload["scimes_user_k"] = int(scimes_user_k)
-            dendro_payload["scimes_save_isol"] = bool(self.scimes_isol.isChecked())
-        self._record_run_action("run_dendrogram", dendro_payload)
+            payload["scimes_criteria"] = list(scimes_criteria)
+            payload["scimes_user_k"] = int(scimes_user_k)
+            payload["scimes_save_isol"] = bool(self.scimes_isol.isChecked())
+
+        return {
+            "algorithm": "dendrogram",
+            "algorithm_label": "Dendrogram" + (" (SCIMES)" if use_scimes else ""),
+            "action_name": "run_dendrogram",
+            "action_payload": payload,
+            "params": params,
+        }
 
     def _record_run_action(self, action_name: str, payload: dict) -> None:
         record_action_preview(
@@ -821,9 +1462,13 @@ class ClumpFindingPanel(QWidget):
         self.clear_display()
         self.result_mask = None
         self._base_result_mask = None
+        self._invalidate_order_caches()
         self.catalog = []
+        self._base_catalog = []
         self._last_clump_result = None
         self._label_color_map = {}
+        self._edge_label_flags = {}
+        self._edge_excluded_labels = set()
         self.count_label.setText("Detected: -- clumps")
         self.status_label.setText("Status: Ready")
         self.export_catalog_button.setEnabled(False)
@@ -1093,14 +1738,17 @@ class ClumpFindingPanel(QWidget):
         )
         return state
 
-    def _build_projected_overlay_state_all(self, viewer, mask3d: np.ndarray, plane: str, overlay_id: str) -> ContourState:
+    def _build_projected_overlay_state_all(self, viewer, mask3d: np.ndarray, plane: str, overlay_id: str, obj_slices=None) -> ContourState:
         try:
             from skimage.measure import find_contours
         except Exception:
             return None
 
-        mask_int = mask3d.astype(int, copy=False)
-        obj_slices = find_objects(mask_int)
+        mask_int = np.asarray(mask3d)
+        if mask_int.dtype.kind not in "iu":
+            mask_int = mask_int.astype(np.int32)
+        if obj_slices is None:
+            obj_slices = find_objects(mask_int)
         if not obj_slices:
             return None
 
@@ -1239,6 +1887,9 @@ class ClumpFindingPanel(QWidget):
         manager = ContourManager.instance()
         is_projected = self.projection_mode_checkbox.isChecked()
         projection_mode = self._projected_mode()
+        # The 3D label bounding boxes are identical for all three plane
+        # viewers; compute them once for the projected-"all" builds below.
+        projected_all_slices = None
 
         for viewer in self._plane_windows():
             plane = getattr(viewer, "plane", None)
@@ -1292,7 +1943,15 @@ class ClumpFindingPanel(QWidget):
                 continue
             
             if is_projected and projection_mode == "all":
-                state = self._build_projected_overlay_state_all(viewer, np.asarray(mask), plane, overlay_id)
+                if projected_all_slices is None:
+                    projected_all_slices = find_objects(np.asarray(mask))
+                state = self._build_projected_overlay_state_all(
+                    viewer,
+                    np.asarray(mask),
+                    plane,
+                    overlay_id,
+                    obj_slices=projected_all_slices,
+                )
             else:
                 state = self._build_overlay_state(viewer, np.asarray(slice2d), overlay_id)
             
@@ -1346,7 +2005,9 @@ class ClumpFindingPanel(QWidget):
              
              state = self.get_app_state()
              if state:
-                 self.catalog = generate_catalog(state, self.result_mask)
+                 self.catalog = self._catalog_with_quality_flags(
+                     generate_catalog(state, self.result_mask)
+                 )
                  self.status_label.setText("Status: Catalog generated.")
              
         if not self.catalog:
@@ -1424,6 +2085,7 @@ class ClumpFindingPanel(QWidget):
                             # Fallback if column missing (shouldn't happen with new logic)
                             pass
 
+                    cat = self._native_catalog_with_quality_flags(cat)
                     # Astropy Table write
                     # format='ascii.csv' handles header and delimiters
                     cat.write(path, format='ascii.csv', overwrite=True)
@@ -1471,27 +2133,39 @@ class ClumpFindingPanel(QWidget):
             if state is None:
                 raise ValueError("AppState not available")
 
-            result = self._last_clump_result
-            if result is None:
-                parameters = dict(self._last_run_metadata.get("Parameters") or {})
-                algorithm_label = str(self._last_run_metadata.get("Algorithm") or "unknown")
-                algorithm_map = {
-                    "ClumpFind": "clumpfind",
-                    "FellWalker": "fellwalker",
-                    "Dendrogram": "dendrogram",
-                    "SCIMES": "scimes",
-                }
-                base_mask = self._base_result_mask if self._base_result_mask is not None else self.result_mask
-                mask = np.asarray(base_mask, dtype=np.int32)
-                labels = np.unique(mask)
-                n_clumps = int(np.count_nonzero(labels > 0))
-                result = ClumpResult(
-                    mask=mask,
-                    n_clumps=n_clumps,
-                    catalog=list(self.catalog or []),
-                    algorithm=algorithm_map.get(algorithm_label, algorithm_label.lower()),
-                    parameters=parameters,
-                )
+            previous_result = self._last_clump_result
+            parameters = dict(
+                previous_result.parameters
+                if previous_result is not None
+                else self._last_run_metadata.get("Parameters") or {}
+            )
+            parameters.update({
+                "spatial_edge_margin_pix": int(self._edge_margin_value()),
+                "exclude_spatial_edge_labels": bool(self.edge_exclude_checkbox.isChecked()),
+                "excluded_spatial_edge_labels": int(len(self._edge_excluded_labels)),
+            })
+            algorithm_label = str(self._last_run_metadata.get("Algorithm") or "unknown")
+            algorithm_map = {
+                "ClumpFind": "clumpfind",
+                "FellWalker": "fellwalker",
+                "Dendrogram": "dendrogram",
+                "SCIMES": "scimes",
+            }
+            algorithm = (
+                previous_result.algorithm
+                if previous_result is not None
+                else algorithm_map.get(algorithm_label, algorithm_label.lower())
+            )
+            mask = np.asarray(self.result_mask, dtype=np.int32)
+            labels = np.unique(mask)
+            n_clumps = int(np.count_nonzero(labels > 0))
+            result = ClumpResult(
+                mask=mask,
+                n_clumps=n_clumps,
+                catalog=list(self.catalog or []),
+                algorithm=algorithm,
+                parameters=parameters,
+            )
 
             export_clump_mask(
                 state,
@@ -1569,6 +2243,10 @@ class ClumpFindingPanel(QWidget):
                 "id_order_key": self.id_order_combo.currentData(),
                 "label_view_active": bool(self._label_view_active),
             },
+            "quality_flags": {
+                "spatial_edge_margin_pix": int(self._edge_margin_value()),
+                "exclude_spatial_edge_labels": bool(self.edge_exclude_checkbox.isChecked()),
+            },
             "last_run_metadata": dict(self._last_run_metadata or {}),
         }
 
@@ -1637,7 +2315,11 @@ class ClumpFindingPanel(QWidget):
             except Exception:
                 pass
             try:
-                self.use_scimes.setChecked(bool(dendrogram.get("use_scimes", self.use_scimes.isChecked())))
+                use_scimes = bool(dendrogram.get("use_scimes", self.use_scimes.isChecked()))
+                self.use_scimes.blockSignals(True)
+                self.use_scimes.setChecked(use_scimes)
+                self.use_scimes.blockSignals(False)
+                self._apply_scimes_ui_state(use_scimes)
             except Exception:
                 pass
             try:
@@ -1654,14 +2336,35 @@ class ClumpFindingPanel(QWidget):
                 pass
             _set_spin_value(self.user_k_input, dendrogram.get("scimes_user_k"), integer=True)
 
+        quality_flags = state.get("quality_flags")
+        if isinstance(quality_flags, dict):
+            _set_spin_value(
+                self.edge_margin_spin,
+                quality_flags.get("spatial_edge_margin_pix"),
+                integer=True,
+            )
+            try:
+                self.edge_exclude_checkbox.setChecked(
+                    bool(quality_flags.get(
+                        "exclude_spatial_edge_labels",
+                        self.edge_exclude_checkbox.isChecked(),
+                    ))
+                )
+            except Exception:
+                pass
+
         self._last_run_metadata = dict(state.get("last_run_metadata") or {})
         self._clear_cloud_overlays()
         self._baseline_data = None
         self._label_view_active = False
         self.result_mask = None
         self._base_result_mask = None
+        self._invalidate_order_caches()
         self.catalog = []
+        self._base_catalog = []
         self._label_color_map = {}
+        self._edge_label_flags = {}
+        self._edge_excluded_labels = set()
 
         restored_mask = self._deserialize_workspace_array_payload(state.get("result_mask"))
         if restored_mask is None:
@@ -1676,6 +2379,7 @@ class ClumpFindingPanel(QWidget):
         self.result_mask = np.asarray(restored_mask)
         self._base_result_mask = np.array(self.result_mask, copy=True)
         self.analysis_data = self.get_analysis_data()
+        self._invalidate_order_caches()
         self._configure_id_order_options()
 
         display = state.get("display")
@@ -1697,11 +2401,12 @@ class ClumpFindingPanel(QWidget):
                 if self.id_order_combo.itemData(idx) == id_order_key:
                     self.id_order_combo.setCurrentIndex(idx)
                     break
+        # Restoring the quality widgets above may have queued a debounced
+        # refilter; the explicit apply below supersedes it.
+        self._quality_refilter_timer.stop()
         self._apply_id_order(refresh=False)
 
-        unique = np.unique(self.result_mask)
-        n_clumps = int(np.count_nonzero(unique > 0))
-        self.count_label.setText(f"Detected: {n_clumps} clumps")
+        self._update_result_count_label()
         self.status_label.setText("Status: Complete")
         self.export_catalog_button.setEnabled(True)
         self.export_mask_button.setEnabled(True)
@@ -1733,6 +2438,14 @@ class ClumpFindingPanel(QWidget):
 
     def closeEvent(self, event):
         """Handle panel close event."""
+        # A clump-finding job is still running: cancel + detach it so the window
+        # closes immediately.  The orphaned worker keeps a cancelled token and
+        # self-cleans once its thread unwinds (it is no longer parented here).
+        if self._clump_thread is not None and self._clump_thread.isRunning():
+            if self._clump_cancel is not None:
+                self._clump_cancel.cancel()
+            self._detach_running_job()
+
         has_pending = (
             self.result_mask is not None
             or self._label_view_active

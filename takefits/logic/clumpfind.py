@@ -2,6 +2,9 @@ import numpy as np
 from scipy import ndimage
 import sys
 
+from takefits.logic.progress import ProgressReporter
+
+
 class ClumpFind:
     """
     Custom implementation of Clumpfind (Williams et al. 1994).
@@ -9,10 +12,10 @@ class ClumpFind:
     def __init__(self, data, wcs=None):
         self.data = data
         self.wcs = wcs
-        self.clump_mask = np.zeros_like(self.data, dtype=int)
+        self.clump_mask = np.zeros_like(self.data, dtype=np.int32)
         self.clump_id_counter = 0
 
-    def run(self, min_val, step, min_pix=5):
+    def run(self, min_val, step, min_pix=5, reporter=None):
         """
         Run the Clumpfind algorithm.
 
@@ -24,13 +27,16 @@ class ClumpFind:
         Returns:
             np.ndarray: Label mask where each clump has a unique integer ID.
         """
+        reporter = reporter or ProgressReporter()
+        reporter.update(2, "ClumpFind: scanning data range...")
+
         # 1. Define Contour Levels
         # Generate levels from max down to min_val
         max_val = np.nanmax(self.data)
 
         if np.isnan(max_val) or max_val < min_val:
             print(f"Invalid max_val: {max_val}. Lower than min_val {min_val} or NaN.")
-            return np.zeros_like(self.data, dtype=int)
+            return np.zeros_like(self.data, dtype=np.int32)
 
         # Safety Check for array size
         # If step is too small, levels array explodes
@@ -43,19 +49,27 @@ class ClumpFind:
         levels = np.arange(min_val, max_val + step, step)
         levels = levels[::-1] # Check from highest to lowest
 
-        self.clump_mask = np.zeros_like(self.data, dtype=int)
+        self.clump_mask = np.zeros_like(self.data, dtype=np.int32)
         self.clump_id_counter = 0
-        
+
         n_levels = len(levels)
         print(f"ClumpFind: Processing {n_levels} contour levels...")
 
         # 2. Iterate through levels
         for i, level in enumerate(levels):
-            # Progress update
+            # Progress update + cooperative cancellation checkpoint.
+            # Map the level sweep onto 5-90% so post-processing has headroom.
             if i % 5 == 0 or i == n_levels - 1:
-                progress = (i + 1) / n_levels * 100
+                frac = (i + 1) / n_levels
+                progress = frac * 100
                 sys.stdout.write(f"\rClumpFind Progress: {progress:.1f}% (Level {i+1}/{n_levels})")
                 sys.stdout.flush()
+                reporter.update(
+                    5 + int(85 * frac),
+                    f"ClumpFind: level {i + 1}/{n_levels}",
+                )
+            else:
+                reporter.check_cancel()
 
             # Create a binary mask for the current level
             binary_mask = self.data > level
@@ -187,6 +201,7 @@ class ClumpFind:
 
         # 3. Post-processing
         # Remove small clumps (min_pix)
+        reporter.update(92, "ClumpFind: filtering small clumps...")
         if min_pix > 0:
             print(f"ClumpFind: Filtering small clumps (<{min_pix} pix)...")
             # Vectorized size filtering
@@ -206,6 +221,7 @@ class ClumpFind:
             # 3. Apply mapping
             self.clump_mask = map_array[self.clump_mask]
 
+        reporter.update(95, "ClumpFind: finished detection.")
         print("\nClumpFind: Finished.")
         return self.clump_mask
 
@@ -217,15 +233,6 @@ class ClumpFind:
         if self.clump_mask is None:
             return []
 
-        labels = np.unique(self.clump_mask)
-        labels = labels[labels > 0]
+        from takefits.logic.cloud_catalog_utils import build_catalog
 
-        from takefits.logic.cloud_catalog_utils import calculate_moments_and_props
-
-        catalog = []
-        for l in labels:
-            props = calculate_moments_and_props(self.data, self.clump_mask, l, self.wcs)
-            if props:
-                catalog.append(props)
-
-        return catalog
+        return build_catalog(self.data, self.clump_mask, wcs=self.wcs)

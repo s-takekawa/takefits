@@ -104,6 +104,74 @@ class ViewerBlitMixin:
                 except Exception:
                     continue
 
+    def _pv_overlay_artists_for_background(self, state):
+        if state is None or getattr(state, "plane", None) != "xy":
+            return []
+        viewer = getattr(state, "viewer", None) or self
+        owners = []
+        for candidate in (
+            viewer,
+            getattr(viewer, "parent", None),
+            self,
+            getattr(self, "parent", None),
+        ):
+            if candidate is not None and all(candidate is not owner for owner in owners):
+                owners.append(candidate)
+
+        for owner in owners:
+            panel = getattr(owner, "control_panel", None)
+            pvd = getattr(panel, "pvd_panel", None) if panel is not None else None
+            if pvd is None:
+                continue
+            if hasattr(pvd, "main_overlay_artists"):
+                try:
+                    return list(pvd.main_overlay_artists() or [])
+                except Exception:
+                    return []
+            return [
+                artist for artist in (
+                    getattr(pvd, "arrow_artist", None),
+                    *list(getattr(pvd, "width_indicators", []) or []),
+                    getattr(pvd, "pos_indicator_on_arrow", None),
+                )
+                if artist is not None
+            ]
+        return []
+
+    def _pv_inactive_artists_for_overlay(self, state):
+        """Inactive PV-slit artists to repaint above the image during a fast blit.
+
+        Unlike the active slit (kept in the dynamic overlay list), inactive slits
+        are normally baked into the cached background. The fast channel-change blit
+        repaints the image over that background, so without repainting them here
+        the inactive slits would vanish until the next full draw."""
+        if state is None or getattr(state, "plane", None) != "xy":
+            return []
+        viewer = getattr(state, "viewer", None) or self
+        owners = []
+        for candidate in (
+            viewer,
+            getattr(viewer, "parent", None),
+            self,
+            getattr(self, "parent", None),
+        ):
+            if candidate is not None and all(candidate is not owner for owner in owners):
+                owners.append(candidate)
+
+        for owner in owners:
+            panel = getattr(owner, "control_panel", None)
+            pvd = getattr(panel, "pvd_panel", None) if panel is not None else None
+            if pvd is None:
+                continue
+            getter = getattr(pvd, "inactive_overlay_artists", None)
+            if callable(getter):
+                try:
+                    return list(getter() or [])
+                except Exception:
+                    return []
+            return []
+        return []
+
     def _capture_overlay_background_quick(self, state):
         """
         Lightweight overlay background capture used during drag updates.
@@ -151,6 +219,13 @@ class ViewerBlitMixin:
                     hidden_artists.append(hpbw_artist)
             except Exception:
                 pass
+        for artist in self._pv_overlay_artists_for_background(state):
+            try:
+                if artist is not None and artist.get_visible():
+                    artist.set_visible(False)
+                    hidden_artists.append(artist)
+            except Exception:
+                continue
 
         try:
             background = state.canvas.copy_from_bbox(state.overlay_ax.bbox)
@@ -247,6 +322,15 @@ class ViewerBlitMixin:
                             artist.axes.draw_artist(artist)
             except Exception:
                 pass
+        # Repaint inactive PV slits on top of the freshly drawn image; they live
+        # in the cached background, which the image above has just covered.
+        for artist in self._pv_inactive_artists_for_overlay(state):
+            try:
+                ax = getattr(artist, "axes", None)
+                if ax is not None and artist.get_visible():
+                    ax.draw_artist(artist)
+            except Exception:
+                continue
         self._draw_axis_foreground(state, include_ticks=include_ticks)
         try:
             state.canvas.blit(state.ax.bbox)
@@ -408,6 +492,13 @@ class ViewerBlitMixin:
                     hidden_artists.append(hpbw_artist)
             except Exception:
                 pass
+        for artist in self._pv_overlay_artists_for_background(state):
+            try:
+                if artist is not None and artist.get_visible():
+                    artist.set_visible(False)
+                    hidden_artists.append(artist)
+            except Exception:
+                continue
 
         im = getattr(state, "im", None)
         prev_anim = None

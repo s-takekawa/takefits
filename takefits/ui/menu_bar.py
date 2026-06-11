@@ -282,6 +282,12 @@ class MenuBar:
         about_action.triggered.connect(self.show_about)
         file_menu.addAction(about_action)
 
+        # Manual update check (lands next to About in the macOS app menu).
+        update_action = QAction("Check for Updates...", self.parent)
+        update_action.setMenuRole(QAction.MenuRole.ApplicationSpecificRole)
+        update_action.triggered.connect(self.check_for_updates)
+        file_menu.addAction(update_action)
+
     def enable_plane_menu(self, enabled):
         available = bool(enabled)
         self.sub1_action.setEnabled(available)
@@ -294,18 +300,20 @@ class MenuBar:
         *,
         undo_label: str | None = None,
         redo_label: str | None = None,
+        undo_text: str = "Undo Analysis",
+        redo_text: str = "Redo Analysis",
     ):
         if hasattr(self, "undo_action") and self.undo_action is not None:
             self.undo_action.setEnabled(bool(can_undo))
-            text = "Undo Analysis"
+            text = undo_text
             if can_undo and undo_label:
-                text = f"Undo Analysis ({undo_label})"
+                text = f"{undo_text} ({undo_label})"
             self.undo_action.setText(text)
         if hasattr(self, "redo_action") and self.redo_action is not None:
             self.redo_action.setEnabled(bool(can_redo))
-            text = "Redo Analysis"
+            text = redo_text
             if can_redo and redo_label:
-                text = f"Redo Analysis ({redo_label})"
+                text = f"{redo_text} ({redo_label})"
             self.redo_action.setText(text)
 
     def set_view_navigation_enabled(self, can_back: bool, can_forward: bool):
@@ -525,6 +533,11 @@ class MenuBar:
             f'</table>'
         )
         dlg.exec()
+
+    def check_for_updates(self):
+        handler = getattr(self.parent, "check_for_updates_manual", None)
+        if callable(handler):
+            handler()
 
     def open_arithmetic_panel(self):
         self._open_control_panel_child("arithmetic_panel", "open_arithmetic_panel")

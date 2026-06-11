@@ -265,16 +265,61 @@ def calculate_props_from_indices_values(indices, values, wcs=None, ndim=3, label
         'r_eff_deg': r_eff_deg
     }
 
-def calculate_moments_and_props(data, mask, label, wcs=None):
+def calculate_moments_and_props(data, mask, label, wcs=None, obj_slice=None):
     """
     Calculate properties for a specific label in the mask.
     Wrapper around calculate_props_from_indices_values.
-    """
-    obj_mask = (mask == label)
-    if not np.any(obj_mask):
-        return None
 
-    indices = np.where(obj_mask)
-    values = data[indices]
+    When ``obj_slice`` (the label's bounding box, e.g. from
+    ``scipy.ndimage.find_objects``) is supplied, only that sub-volume is scanned
+    instead of the whole cube.  Pixel indices are offset back to global
+    coordinates, so the moments are identical to the full-scan path (moment sums
+    are order-independent) but the cost drops from O(cube) to O(bbox) per label.
+    """
+    if obj_slice is not None:
+        sub_mask = mask[obj_slice] == label
+        if not np.any(sub_mask):
+            return None
+        local = np.where(sub_mask)
+        values = data[obj_slice][local]
+        indices = tuple(local[i] + obj_slice[i].start for i in range(len(obj_slice)))
+    else:
+        obj_mask = (mask == label)
+        if not np.any(obj_mask):
+            return None
+        indices = np.where(obj_mask)
+        values = data[indices]
 
     return calculate_props_from_indices_values(indices, values, wcs=wcs, ndim=data.ndim, label_id=label)
+
+
+def build_catalog(data, mask, wcs=None, labels=None, reporter=None):
+    """Build a per-label property catalog efficiently.
+
+    Computes each label's bounding box once via ``scipy.ndimage.find_objects``
+    and restricts the per-label moment scan to that box, turning the old
+    O(n_labels x cube) cost into roughly O(cube).  Results are identical to
+    calling :func:`calculate_moments_and_props` per label on the full cube.
+    """
+    from scipy.ndimage import find_objects
+
+    if labels is None:
+        labels = np.unique(mask)
+        labels = labels[labels > 0]
+
+    # find_objects returns a list where entry i is the bounding box of label i+1
+    # (None when that label is absent).  One pass over the cube for all labels.
+    slices = find_objects(mask)
+    n_slices = len(slices)
+
+    catalog = []
+    total = len(labels)
+    for n, l in enumerate(labels):
+        l = int(l)
+        obj_slice = slices[l - 1] if 0 < l <= n_slices else None
+        props = calculate_moments_and_props(data, mask, l, wcs=wcs, obj_slice=obj_slice)
+        if props:
+            catalog.append(props)
+        if reporter is not None and (n % 32 == 0 or n == total - 1):
+            reporter.update(None, f"Building catalog {n + 1}/{total}...")
+    return catalog

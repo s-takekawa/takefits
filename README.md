@@ -61,9 +61,9 @@ Calculate moment maps (Integrated Intensity, Velocity Field, Velocity Dispersion
 
 ### 3. Interactive P-V Diagram
 
-Interactively draw slice lines on the map to generate Position-Velocity (P-V) diagrams instantly.
+Interactively draw extraction paths — straight lines, polylines, smooth spline curves, and elliptical arcs — to generate Position-Velocity (P-V) diagrams instantly.
 
-![PV Diagram](https://raw.githubusercontent.com/s-takekawa/takefits/main/docs/images/pv_diagram.png)
+![PV Diagram](https://raw.githubusercontent.com/s-takekawa/takefits/main/docs/images/pv_diagram2.png)
 
 ### 4. Spectrum Analysis
 

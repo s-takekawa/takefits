@@ -3,13 +3,16 @@ from skimage.segmentation import watershed
 from skimage.morphology import h_maxima
 from skimage.measure import label
 
+from takefits.logic.progress import ProgressReporter
+
+
 class FellWalker:
     def __init__(self, data, wcs=None):
         self.data = data
         self.wcs = wcs
         self.mask = None
 
-    def run(self, min_val, min_dip, min_pix):
+    def run(self, min_val, min_dip, min_pix, reporter=None):
         """
         Run the FellWalker-like (Watershed) algorithm.
 
@@ -28,8 +31,11 @@ class FellWalker:
         mask : np.ndarray
             Integer mask where each clump has a unique ID.
         """
+        reporter = reporter or ProgressReporter()
+
         # 1. Thresholding
         print("FellWalker: Starting...")
+        reporter.update(5, "FellWalker: thresholding...")
         # We only care about regions > min_val
         valid_mask = self.data > min_val
 
@@ -46,7 +52,8 @@ class FellWalker:
         # 3. Find Markers (H-Maxima)
         # We want to identify peaks that are significant.
         print("FellWalker: Finding peaks (h_maxima)...")
-        
+        reporter.update(30, "FellWalker: finding peaks...")
+
         # IMPORTANT: h_maxima works on the original (non-inverted) data to find peaks.
         # Replace NaNs with min_val or lower to avoid issues?
         data_clean = np.nan_to_num(self.data, nan=np.nanmin(self.data))
@@ -71,11 +78,13 @@ class FellWalker:
         # 4. Run Watershed
         # mask argument restricts the filling to valid_mask
         print(f"FellWalker: Found {num_markers} markers. Running watershed...")
+        reporter.update(55, f"FellWalker: watershed over {num_markers} markers...")
         labels = watershed(inverted, markers, mask=valid_mask)
 
         # 5. Filter by Size (min_pix)
         # Remove small clumps
         print(f"FellWalker: Filtering clumps smaller than {min_pix} pixels...")
+        reporter.update(90, "FellWalker: filtering small clumps...")
         # Vectorized size filtering and re-labeling
         # 1. Count pixels per label
         counts = np.bincount(labels.ravel())
@@ -109,18 +118,6 @@ class FellWalker:
         if self.mask is None:
             return []
 
-        from takefits.logic.cloud_catalog_utils import calculate_moments_and_props
+        from takefits.logic.cloud_catalog_utils import build_catalog
 
-        # Get all unique labels
-        labels = np.unique(self.mask)
-        # Remove background (0)
-        labels = labels[labels > 0]
-
-        catalog = []
-
-        for l in labels:
-            props = calculate_moments_and_props(self.data, self.mask, l, self.wcs)
-            if props:
-                catalog.append(props)
-
-        return catalog
+        return build_catalog(self.data, self.mask, wcs=self.wcs)

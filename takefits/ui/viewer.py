@@ -1441,6 +1441,14 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.hline.set_visible(False)
             if getattr(self, "cpoint", None) is not None:
                 self.cpoint.set_visible(False)
+            pvd_hidden_artists = []
+            for artist in self._pv_overlay_artists_for_background(self.state):
+                try:
+                    if artist is not None and artist.get_visible():
+                        artist.set_visible(False)
+                        pvd_hidden_artists.append(artist)
+                except Exception:
+                    continue
             background = self.canvas.copy_from_bbox(self.overlay_ax.bbox)
             self._background = background
             self._background_initialized = True
@@ -1449,6 +1457,11 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             
             self.vline.set_visible(vline_visible)
             self.hline.set_visible(hline_visible)
+            for artist in pvd_hidden_artists:
+                try:
+                    artist.set_visible(True)
+                except Exception:
+                    pass
             cursor_x = getattr(self.state, "cursor_x", None) if hasattr(self, "state") else None
             cursor_y = getattr(self.state, "cursor_y", None) if hasattr(self, "state") else None
             if self.plane == 'xy':
@@ -2294,6 +2307,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             try:
                 ax = state.ax
                 for i in range(ax.wcs.naxis):
+                    if self._is_pv_scalar_axis_index(i):
+                        continue
                     coord = ax.coords[i]
                     axis_type = str(self.wcs.world_axis_physical_types[i] or "").lower()
                     ctype = str(ctype_list[i] or "").upper() if i < len(ctype_list) else ""
@@ -2328,6 +2343,22 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self._register_contour_layer()
         if self._is_colorbar_auto_layout_enabled():
             self._schedule_colorbar_auto_layout_if_anchor_changed(force=True)
+
+    def _is_pv_scalar_axis_index(self, axis_index: int) -> bool:
+        header = getattr(self, "header", None)
+        if header is None:
+            return False
+        if not (
+            str(header.get("PVXAXIS", "") or "").strip()
+            or str(header.get("PVPATH", "") or "").strip()
+        ):
+            return False
+        try:
+            axis_no = int(axis_index) + 1
+        except Exception:
+            return False
+        ctype = str(header.get(f"CTYPE{axis_no}", "") or "").strip().upper().split("-")[0]
+        return ctype in {"PHI", "OFFSET"}
 
     def _apply_config_to_state(self, state, config, xtick_label_position, ytick_label_position, plane):
         """Apply configuration settings to a single ViewerState."""
@@ -4358,12 +4389,16 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             if xy_state.chlabel:
                 xy_state.overlay_ax.draw_artist(xy_state.chlabel)
             if getattr(self, 'control_panel', None) is not None:
-                if self.control_panel.pvd_panel is not None and self.control_panel.pvd_panel.arrow_artist is not None:
-                    xy_state.overlay_ax.draw_artist(self.control_panel.pvd_panel.arrow_artist)
-                    for indicator in self.control_panel.pvd_panel.width_indicators:
-                        xy_state.overlay_ax.draw_artist(indicator)
-                    if self.control_panel.pvd_panel.pos_indicator_on_arrow is not None:
-                        xy_state.overlay_ax.draw_artist(self.control_panel.pvd_panel.pos_indicator_on_arrow)
+                pvd = self.control_panel.pvd_panel
+                if pvd is not None:
+                    artists = (
+                        pvd.main_overlay_artists()
+                        if hasattr(pvd, "main_overlay_artists")
+                        else [pvd.arrow_artist, *pvd.width_indicators, pvd.pos_indicator_on_arrow]
+                    )
+                    for artist in artists:
+                        if artist is not None:
+                            xy_state.overlay_ax.draw_artist(artist)
 
             if hasattr(self, 'region_manager'):
                 self.region_manager.draw_regions_for_blit()
@@ -5437,11 +5472,14 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             main_window = getattr(self, 'parent', self)
             if hasattr(main_window, 'control_panel') and main_window.control_panel and main_window.control_panel.pvd_panel:
                 pvd = main_window.control_panel.pvd_panel
-                if pvd.arrow_artist:
-                    artists_to_hide.append(pvd.arrow_artist)
-                artists_to_hide.extend(pvd.width_indicators)
-                if pvd.pos_indicator_on_arrow:
-                    artists_to_hide.append(pvd.pos_indicator_on_arrow)
+                if hasattr(pvd, "main_overlay_artists"):
+                    artists_to_hide.extend(pvd.main_overlay_artists())
+                else:
+                    if pvd.arrow_artist:
+                        artists_to_hide.append(pvd.arrow_artist)
+                    artists_to_hide.extend(pvd.width_indicators)
+                    if pvd.pos_indicator_on_arrow:
+                        artists_to_hide.append(pvd.pos_indicator_on_arrow)
 
         hidden_regions: List[object] = []
         if hasattr(self, 'region_manager'):

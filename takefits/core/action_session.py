@@ -305,7 +305,7 @@ class ActionSession:
 
 def _handler_accepts_state(handler: Any) -> bool:
     try:
-        sig = inspect.signature(handler)
+        sig = _handler_signature(handler)
     except (TypeError, ValueError):
         return False
     return "state" in sig.parameters
@@ -313,7 +313,7 @@ def _handler_accepts_state(handler: Any) -> bool:
 
 def _handler_accepts_result(handler: Any) -> bool:
     try:
-        sig = inspect.signature(handler)
+        sig = _handler_signature(handler)
     except (TypeError, ValueError):
         return False
     return "result" in sig.parameters
@@ -328,7 +328,7 @@ def _filter_handler_kwargs(handler: Any, params: Dict[str, Any]) -> Dict[str, An
     if not isinstance(params, dict):
         return {}
     try:
-        sig = inspect.signature(handler)
+        sig = _handler_signature(handler)
     except (TypeError, ValueError):
         return dict(params)
 
@@ -343,6 +343,16 @@ def _filter_handler_kwargs(handler: Any, params: Dict[str, Any]) -> Dict[str, An
         if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
             allowed.add(param.name)
     return {key: value for key, value in params.items() if key in allowed}
+
+
+def _handler_signature(handler: Any) -> inspect.Signature:
+    lazy_name = getattr(handler, "_lazy_usecase_name", None)
+    if lazy_name:
+        from takefits.core import usecases
+
+        target = getattr(usecases, str(lazy_name))
+        return inspect.signature(target)
+    return inspect.signature(handler)
 
 
 def _should_preserve_last_result(name: str, result: Any, previous_result: Any) -> bool:

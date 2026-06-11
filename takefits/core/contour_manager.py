@@ -10,6 +10,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TY
 import numpy as np
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
+from matplotlib.collections import LineCollection
 from PySide6.QtCore import QObject, Signal as pyqtSignal
 
 from astropy.coordinates import SkyCoord
@@ -605,6 +606,8 @@ class ContourLayer:
                 derived_world_frame = _normalize_frame_name(state.world_frame)
 
             new_segments_for_this_item: List[ContourSegment] = []
+            chunk_records = []  # [segment, pix_chunk, world_chunk]
+            pending_world = []  # indices into chunk_records needing pixel->world
             # Apply every loaded segment to the current panel.
             for segment in all_segments_to_load:
                 pixel_coords = None
@@ -622,8 +625,6 @@ class ContourLayer:
                     pixel_coords = _world_coords_to_pixel(world_coords, wcs, _frame_name_from_frame(target_frame))
                 if pixel_coords is None and segment.pixels is not None and np.asarray(segment.pixels).size:
                     pixel_coords = np.asarray(segment.pixels, dtype=float)
-                if wcs is not None and world_coords is None and pixel_coords is not None:
-                    world_coords = _pixel_coords_to_world(pixel_coords, wcs)
 
                 if pixel_coords is None or pixel_coords.ndim != 2 or pixel_coords.shape[0] < 2:
                     continue
@@ -639,22 +640,38 @@ class ContourLayer:
 
                 for pix_chunk, world_chunk in self._split_polyline(pixel_coords, world_coords):
                     if world_chunk is None and wcs is not None:
-                        world_chunk = _pixel_coords_to_world(pix_chunk, wcs)
-                    color_copy = None
-                    if segment.color is not None:
-                        try:
-                            color_copy = np.asarray(segment.color, dtype=float).copy()
-                        except Exception:
-                            color_copy = segment.color
-                    new_segments_for_this_item.append(
-                        ContourSegment(
-                            level=segment.level,
-                            world=world_chunk,
-                            pixels=pix_chunk,
-                            color=color_copy,
-                            linestyle=segment.linestyle,
-                        )
+                        pending_world.append(len(chunk_records))
+                    chunk_records.append([segment, pix_chunk, world_chunk])
+
+            # One vectorized pixel->world conversion for every chunk that
+            # needs it; per-chunk astropy calls dominate the import time when
+            # there are hundreds of segments.
+            if pending_world:
+                stacked = np.vstack([chunk_records[i][1] for i in pending_world])
+                world_all = _pixel_coords_to_world(stacked, wcs)
+                if world_all is not None:
+                    offsets = np.cumsum(
+                        [len(chunk_records[i][1]) for i in pending_world]
+                    )[:-1]
+                    for i, world_chunk in zip(pending_world, np.split(world_all, offsets)):
+                        chunk_records[i][2] = world_chunk
+
+            for segment, pix_chunk, world_chunk in chunk_records:
+                color_copy = None
+                if segment.color is not None:
+                    try:
+                        color_copy = np.asarray(segment.color, dtype=float).copy()
+                    except Exception:
+                        color_copy = segment.color
+                new_segments_for_this_item.append(
+                    ContourSegment(
+                        level=segment.level,
+                        world=world_chunk,
+                        pixels=pix_chunk,
+                        color=color_copy,
+                        linestyle=segment.linestyle,
                     )
+                )
 
             if new_segments_for_this_item:
                 canonical_items.append(
@@ -696,7 +713,9 @@ class ContourLayer:
                     canvases.add(artist.axes.figure.canvas)
         for canvas in canvases:
             try:
-                canvas.draw()
+                # draw_idle coalesces with other pending redraws (e.g. the data
+                # view refresh issued in the same GUI event) into one render.
+                canvas.draw_idle()
             except Exception:
                 pass
         self._active = True
@@ -762,9 +781,36 @@ class ContourLayer:
             ax = target_item.ax
             wcs = getattr(ax, "wcs", None)
 
-            for segment in item_state.segments:
-                coords = None
-                if segment.world is not None and wcs is not None:
+            # Batch the world->pixel reprojection: one astropy call for all
+            # segments instead of one per segment (the dominant cost when an
+            # overlay carries hundreds of clump contours).
+            segment_list = list(item_state.segments)
+            world_pixels = [None] * len(segment_list)
+            if wcs is not None:
+                pending = []
+                world_arrays = []
+                for i, segment in enumerate(segment_list):
+                    if segment.world is None:
+                        continue
+                    arr = np.asarray(segment.world, dtype=float)
+                    if arr.ndim == 2 and arr.shape[0] > 0 and arr.shape[1] == 2:
+                        pending.append(i)
+                        world_arrays.append(arr)
+                if pending:
+                    converted = _world_coords_to_pixel(
+                        np.vstack(world_arrays), wcs, state.world_frame
+                    )
+                    if converted is not None:
+                        offsets = np.cumsum([len(arr) for arr in world_arrays])[:-1]
+                        for i, chunk in zip(pending, np.split(converted, offsets)):
+                            world_pixels[i] = chunk
+
+            seg_paths = []
+            seg_colors = []
+            seg_styles = []
+            for seg_idx, segment in enumerate(segment_list):
+                coords = world_pixels[seg_idx]
+                if coords is None and segment.world is not None and wcs is not None:
                     coords = _world_coords_to_pixel(segment.world, wcs, state.world_frame)
                 if coords is None and segment.pixels is not None and np.asarray(segment.pixels).size:
                     coords = np.asarray(segment.pixels, dtype=float)
@@ -774,14 +820,6 @@ class ContourLayer:
                 if np.count_nonzero(finite_mask) < 2:
                     continue
                 coords = coords[finite_mask]
-                
-                # Check if we need to update transformed pixels back to segment for cache? 
-                # The original code did: segment.pixels = coords
-                # And also back-calculated world. We should probably preserve that behavior 
-                # if it's needed for canonicalization, but here we are just drawing.
-                # Strictly speaking _draw_overlay_state shouldn't mutate state permanently ideally, 
-                # but let's keep it consistent if needed. 
-                # Actually, skipping mutation for drawing optimization is safer.
 
                 color = None
                 if segment.color is not None:
@@ -798,21 +836,33 @@ class ContourLayer:
                     color_to_apply = tuple(color.tolist())
                 else:
                     color_to_apply = color
-
-                linewidth = overlay_params.linewidth or 1.0
-                linestyle = getattr(segment, "linestyle", None) or ("dashed" if segment.level < 0 else "solid")
                 if isinstance(color_to_apply, str) and color_to_apply.lower() == "original":
                     color_to_apply = "white"
 
-                line, = ax.plot(
-                    coords[:, 0],
-                    coords[:, 1],
-                    color=color_to_apply,
-                    linewidth=linewidth,
-                    linestyle=linestyle,
+                seg_paths.append(coords)
+                seg_colors.append(color_to_apply)
+                seg_styles.append(
+                    getattr(segment, "linestyle", None)
+                    or ("dashed" if segment.level < 0 else "solid")
                 )
-                self._mark_contour_artist_for_export(line)
-                new_artists.append(line)
+
+            if not seg_paths:
+                continue
+
+            # One LineCollection per item instead of one Line2D per segment:
+            # with hundreds of clumps the per-artist overhead dominates both
+            # creation and every subsequent canvas draw. zorder=2 matches the
+            # Line2D default that ax.plot used.
+            collection = LineCollection(
+                seg_paths,
+                colors=seg_colors,
+                linewidths=overlay_params.linewidth or 1.0,
+                linestyles=seg_styles,
+                zorder=2,
+            )
+            ax.add_collection(collection)
+            self._mark_contour_artist_for_export(collection)
+            new_artists.append(collection)
 
         if new_artists:
             self._overlay_artists[overlay_id] = new_artists

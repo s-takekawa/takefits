@@ -1,9 +1,11 @@
 import copy
 import math
 import os
+import tempfile
 import threading
+import weakref
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed,  ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ProcessPoolExecutor
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, NamedTuple
 
@@ -22,6 +24,7 @@ _os_for_threads.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 _os_for_threads.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from reproject import reproject_interp
+from takefits.logic.data_tools import LazyScaledArray
 
 _SPLINE_ORDER_MAP = {
     "nearest": 0,
@@ -31,6 +34,70 @@ _SPLINE_ORDER_MAP = {
     "bicubic": 3,
 }
 _MASK_DIVIDE_EPS = 1e-6
+
+# Out-of-core output: when the regridded cube would not comfortably fit in RAM,
+# stream it to a disk-backed memmap instead of allocating it all in memory.
+_OUT_OF_CORE_RAM_FRACTION = 0.5          # disk-stream if output >= this * total RAM
+_OUT_OF_CORE_FALLBACK_BYTES = 6 * 1024 ** 3   # used when total RAM is undetectable
+_CHUNKED_EXTREMA_BYTES = 1 * 1024 ** 3   # compute extrema plane-by-plane above this
+
+# While streaming planes into a disk-backed (memmap) output, flush dirty pages to
+# disk roughly every this many bytes written.  Without periodic flushing the OS
+# page cache accumulates the whole cube's dirty pages (looking like a memory
+# leak) and can exhaust RAM / swap on very large reprojections.  Flushing is a
+# numerical no-op -- it only persists already-written data -- so results are
+# unchanged; it merely bounds peak memory.
+_STREAM_FLUSH_BYTES = 4 * 1024 ** 3
+
+# Below this total reprojection work (n_planes * output-plane pixels), a thread
+# pool beats a process pool: ProcessPoolExecutor's per-worker "spawn" startup
+# (re-importing numpy/astropy/reproject) and per-plane pickling outweigh the
+# parallel speedup on small jobs.  Larger jobs keep the process pool.
+_THREADPOOL_VOXEL_THRESHOLD = 30_000_000
+
+
+def _detect_total_ram_bytes() -> Optional[int]:
+    """Best-effort total physical RAM in bytes, or None if undetectable."""
+    try:  # Linux and most Unix
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return int(pages) * int(page_size)
+    except (ValueError, OSError, AttributeError):
+        pass
+    try:  # macOS
+        import subprocess
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2
+        )
+        value = int(out.stdout.strip())
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return None
+
+
+def _quiet_remove(path):
+    """Remove a file, ignoring errors (used as a memmap GC finalizer)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _take_plane(arr, idx, axis):
+    """Extract a single ``idx`` along ``axis`` via ``__getitem__``.
+
+    ``np.take`` first calls ``np.asarray`` on the whole array, which fully
+    materialises a memmap-backed ``LazyScaledArray`` as one float64 cube (e.g.
+    a 138 GB float32 cube balloons to 276 GB and the process is OOM-killed).
+    Slicing goes through ``__getitem__``, which reads/scales only the requested
+    plane.  For plain ndarrays/memmaps this is an ordinary (cheap) slice.
+    """
+    slicer = [slice(None)] * arr.ndim
+    slicer[int(axis)] = int(idx)
+    return np.asarray(arr[tuple(slicer)])
 
 
 def _normalize_interpolation_label(order: str | None) -> Optional[str]:
@@ -242,9 +309,10 @@ from scipy.interpolate import interp1d
 from reproject import reproject_interp
 
 try:  # pragma: no cover - optional dependency
-    from scipy.ndimage import map_coordinates
+    from scipy.ndimage import map_coordinates, spline_filter
 except Exception:  # pragma: no cover - scipy.ndimage unavailable
     map_coordinates = None
+    spline_filter = None
 
 try:  # pragma: no cover - optional dependency
     import dask.array as da
@@ -286,21 +354,11 @@ class RegridEngine:
         self._nan_high_order_fallback_used = False
         self._nan_high_order_downgraded = False
 
-        # Sanitize the incoming WCS object, which may be inconsistent from fits_loader.py
+        # Keep the incoming WCS numeric convention intact.  load_fits() may have
+        # already converted velocity crval/cdelt values to km/s while wcslib still
+        # reports cunit as m/s; changing only cunit here causes Astropy to rescale
+        # those values by 1000 during later WCS initialization.
         wcs_sanitized = copy.deepcopy(original_wcs)
-        try:
-            # Heuristic to detect if cunit is m/s while cdelt/crval are in km/s
-            if wcs_sanitized.wcs.naxis >= 3:
-                cunit = wcs_sanitized.wcs.cunit[2]
-                cdelt = wcs_sanitized.wcs.cdelt[2]
-                ctype = wcs_sanitized.wcs.ctype[2]
-                is_velocity = any(token in ctype.upper() for token in ("VRAD", "VELO", "VOPT"))
-
-                if is_velocity and cunit.is_equivalent(u.m / u.s) and abs(cdelt) < 100:
-                    wcs_sanitized.wcs.cunit[2] = "km/s"
-        except Exception as e:
-            # Non-critical warning, can be logged if a logging system is available
-            pass
 
         self.original_wcs = wcs_sanitized
         self.original_header = original_header.copy() if original_header is not None else None
@@ -317,6 +375,17 @@ class RegridEngine:
             self.original_wcs.array_shape = tuple(int(dim) for dim in np.shape(self.original_data))
         except Exception:
             self.original_wcs.array_shape = None
+
+        # Out-of-core output control:
+        #   None  -> auto (decide from output size vs. total RAM)
+        #   True  -> always stream output to a disk-backed memmap
+        #   False -> always allocate output in RAM
+        self.out_of_core: Optional[bool] = None
+        self._output_tempfiles: List[str] = []
+
+        # Plane-reprojection executor override: None = auto (size-based choice
+        # between thread and process pools), or an executor class to force one.
+        self._force_plane_executor = None
 
     def _emit_progress(self, value: int) -> None:
         if self._progress_callback is not None:
@@ -368,7 +437,11 @@ class RegridEngine:
             else:
                 raise ValueError(f"Unknown regrid mode: {mode}")
 
-            if should_trim_nan_edges:
+            # NaN-edge trimming materialises a full-size boolean mask, so skip it
+            # for disk-backed (out-of-core) outputs -- the cube simply keeps its
+            # NaN border, which is harmless.
+            streamed_output = isinstance(data, np.memmap)
+            if should_trim_nan_edges and not streamed_output:
                 data, header = self._trim_nan_edges(data, header)
             self._update_data_extrema(header, data)
             self._finalize_header(
@@ -377,17 +450,26 @@ class RegridEngine:
                 preserve_existing_units=(mode == "template_fits"),
             )
 
-                    
+
             # Preserve beam metadata for non-manual modes by default
             preserve_opt = params.get("preserve_beam_metadata") if mode == "manual" else True
             beam_preserved = self._apply_beam_metadata(header, preserve_opt, new_wcs=new_wcs)
             self._annotate_history(header, mode, params, beam_preserved=beam_preserved)
+
+            # Flush a disk-backed output so every plane is on disk before the
+            # caller reads it back to save the final FITS.
+            if streamed_output:
+                try:
+                    data.flush()
+                except Exception:
+                    pass
 
             self._emit_progress(95)
             self._emit_finished(data, header)
             self._emit_progress(100)
             return data, header
         except Exception as exc:  # pragma: no cover - error path propagated to UI
+            self._cleanup_output_tempfiles()
             self._emit_error(str(exc), exc)
 
     # ------------------------------------------------------------------
@@ -826,90 +908,97 @@ class RegridEngine:
         intermediate_shape[numpy_celestial_axes[1]] = spatial_shape_out[1]
         
         work_dtype = self._reproject_float_dtype()
-        data_spatial_regridded = np.empty(tuple(intermediate_shape), dtype=work_dtype)
+        intermediate_shape = tuple(intermediate_shape)
+
+        # For very large cubes stream the spatially-reprojected intermediate to a
+        # scratch memmap instead of holding it (and the spectral-interpolation
+        # result) entirely in RAM.
+        stream_to_disk = self._should_stream_output_to_disk(intermediate_shape, work_dtype)
+        inter_path = None
+        if stream_to_disk:
+            inter_fd, inter_path = tempfile.mkstemp(suffix=".regrid_inter.dat")
+            os.close(inter_fd)
+            data_spatial_regridded = np.memmap(
+                inter_path, dtype=work_dtype, mode="w+", shape=intermediate_shape
+            )
+        else:
+            data_spatial_regridded = np.empty(intermediate_shape, dtype=work_dtype)
 
         src_hdr_2d = source_wcs_2d.to_header()
         tgt_hdr_2d = target_wcs_2d.to_header()
 
-        cpu_count = os.cpu_count() or 1
-        max_workers = min(8, max(1, cpu_count))
-        
-        regridded_planes = [None] * n_spec_orig
-        
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
-            for i in range(n_spec_orig):
-                slicer = [slice(None)] * self.original_data.ndim
-                slicer[np_spectral_axis] = i
-                plane_data = self.original_data[tuple(slicer)]
-                plane_array = np.asarray(plane_data)
+        try:
+            # Stream plane reprojection straight into the intermediate with a
+            # bounded number of in-flight tasks.
+            self._reproject_planes_streaming(
+                data_spatial_regridded,
+                n_spec_orig,
+                np_spectral_axis,
+                src_hdr_2d,
+                tgt_hdr_2d,
+                tuple(spatial_shape_out),
+                method,
+                0.5,
+                progress_start=20,
+                progress_end=60,
+            )
 
-                fut = executor.submit(
-                    _reproject_plane_worker,
-                    plane_array,
-                    src_hdr_2d,
-                    tgt_hdr_2d,
-                    tuple(spatial_shape_out),
-                    method,
-                    0.5,
+            self._emit_progress(60)
+
+            # Get spectral coordinates in the same velocity unit. Astropy
+            # normalizes km/s FITS velocity axes to m/s inside WCS, so prefer
+            # normalized header values here to avoid unit-mismatched interpolation.
+            orig_spec_coords = self._spectral_axis_coordinates(
+                n_spec_orig, spectral_wcs_idx,
+                header=self.original_header, wcs_obj=self.original_wcs,
+            )
+            n_spec_new = shape_out[np_spectral_axis]
+            new_spec_coords = self._spectral_axis_coordinates(
+                n_spec_new, spectral_wcs_idx,
+                header=template_header, wcs_obj=target_wcs,
+            )
+            kind = method if method in ("nearest", "linear") else "linear"
+            preferred_dtype = self._preferred_float_dtype()
+
+            final_shape = list(intermediate_shape)
+            final_shape[np_spectral_axis] = n_spec_new
+            final_shape = tuple(final_shape)
+
+            if stream_to_disk:
+                # Out-of-core: spectral-interpolate tile-by-tile into a memmap.
+                final_data = self._allocate_output(final_shape, preferred_dtype)
+                self._spectral_interp_tiled(
+                    data_spatial_regridded, orig_spec_coords, new_spec_coords,
+                    np_spectral_axis, final_data, kind,
                 )
-                futures[fut] = i
+                try:
+                    final_data.flush()
+                except Exception:
+                    pass
+            else:
+                data_reshaped = np.moveaxis(data_spatial_regridded, np_spectral_axis, 0)
+                original_shape = data_reshaped.shape
+                data_reshaped = data_reshaped.reshape(n_spec_orig, -1)
+                interpolator = interp1d(
+                    orig_spec_coords, data_reshaped, axis=0, bounds_error=False,
+                    fill_value=np.nan, kind=kind,
+                )
+                regridded_spec_data = interpolator(new_spec_coords)
+                final_data_reshaped = regridded_spec_data.reshape((n_spec_new,) + original_shape[1:])
+                final_data = np.moveaxis(final_data_reshaped, 0, np_spectral_axis)
+                if final_data.dtype != preferred_dtype:
+                    final_data = final_data.astype(preferred_dtype, copy=False)
+        finally:
+            # Reclaim the intermediate scratch memmap (the final output is separate).
+            if inter_path is not None:
+                data_spatial_regridded = None
+                try:
+                    os.remove(inter_path)
+                except OSError:
+                    pass
 
-            completed_count = 0
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                reprojected_plane, used_fix, downgraded = fut.result()
-                
-                if used_fix:
-                    self._nan_high_order_fallback_used = True
-                if downgraded:
-                    self._nan_high_order_downgraded = True
-                
-                slicer = [slice(None)] * data_spatial_regridded.ndim
-                slicer[np_spectral_axis] = idx
-                data_spatial_regridded[tuple(slicer)] = reprojected_plane
-                
-                completed_count += 1
-                self._emit_progress(20 + int(40 * (completed_count / n_spec_orig)))
-
-        self._emit_progress(60)
-        
-        # Get spectral coordinates in the same velocity unit. Astropy normalizes
-        # km/s FITS velocity axes to m/s inside WCS, so prefer normalized header
-        # values here to avoid unit-mismatched interpolation.
-        orig_spec_coords = self._spectral_axis_coordinates(
-            n_spec_orig,
-            spectral_wcs_idx,
-            header=self.original_header,
-            wcs_obj=self.original_wcs,
-        )
-
-        n_spec_new = shape_out[np_spectral_axis]
-        new_spec_coords = self._spectral_axis_coordinates(
-            n_spec_new,
-            spectral_wcs_idx,
-            header=template_header,
-            wcs_obj=target_wcs,
-        )
-        
-        data_reshaped = np.moveaxis(data_spatial_regridded, np_spectral_axis, 0)
-        original_shape = data_reshaped.shape
-        data_reshaped = data_reshaped.reshape(n_spec_orig, -1)
-
-        interpolator = interp1d(
-            orig_spec_coords, data_reshaped, axis=0, bounds_error=False,
-            fill_value=np.nan, kind=method if method in ("nearest", "linear") else "linear"
-        )
-        regridded_spec_data = interpolator(new_spec_coords)
-        
-        final_data_reshaped = regridded_spec_data.reshape((n_spec_new,) + original_shape[1:])
-        final_data = np.moveaxis(final_data_reshaped, 0, np_spectral_axis)
-        preferred_dtype = self._preferred_float_dtype()
-        if final_data.dtype != preferred_dtype:
-            final_data = final_data.astype(preferred_dtype, copy=False)
-        
         self._emit_progress(90)
-        
+
         return final_data, template_header, target_wcs
 
 
@@ -927,7 +1016,6 @@ class RegridEngine:
             if not header.get("NAXIS"):
                 raise ValueError("Template FITS header is missing NAXIS information.")
 
-            # This is the new line that fixes the unit scaling issue.
             self._normalize_template_velocity_axis(header)
             
             shape = tuple(int(dim) for dim in np.shape(image_hdu.data))
@@ -987,6 +1075,176 @@ class RegridEngine:
             self._set_axis_unit(header, axis, "km/s")
 
 
+    def _choose_plane_executor(self, n_planes, shape_out_2d):
+        """Pick a thread- vs. process-pool class for plane reprojection.
+
+        ProcessPoolExecutor gives true (GIL-free) parallelism, but on macOS /
+        Windows each worker is *spawned* fresh -- re-importing numpy / astropy /
+        reproject -- costing ~1 s of fixed startup plus per-plane pickling.  For
+        small jobs that overhead dominates, so a ThreadPoolExecutor (no spawn, no
+        pickling; reproject's heavy C code releases the GIL) is markedly faster.
+        Large jobs keep the process pool, where the parallel speedup wins.
+        Results are numerically identical either way.
+        """
+        if self._force_plane_executor is not None:
+            return self._force_plane_executor
+        plane_px = 1
+        for dim in shape_out_2d:
+            plane_px *= int(dim)
+        total_voxels = int(n_planes) * plane_px
+        if total_voxels < _THREADPOOL_VOXEL_THRESHOLD:
+            return ThreadPoolExecutor
+        return ProcessPoolExecutor
+
+    @staticmethod
+    def _memmap_flush_every(out_array, np_spectral_axis: int) -> int:
+        """Return plane interval for periodic memmap flush, or 0 for ndarrays."""
+        if not isinstance(out_array, np.memmap):
+            return 0
+        try:
+            plane_count = max(1, int(out_array.shape[int(np_spectral_axis)]))
+            plane_voxels = max(1, int(out_array.size) // plane_count)
+            plane_nbytes = max(1, plane_voxels * np.dtype(out_array.dtype).itemsize)
+        except Exception:
+            return 1
+        return max(1, _STREAM_FLUSH_BYTES // plane_nbytes)
+
+    @staticmethod
+    def _flush_memmap_quietly(out_array) -> None:
+        try:
+            out_array.flush()
+        except Exception:
+            pass
+
+    def _reproject_planes_streaming(
+        self,
+        out_array,
+        n_planes,
+        np_spectral_axis,
+        src_hdr_2d,
+        tgt_hdr_2d,
+        shape_out_2d,
+        method,
+        footprint_thresh,
+        progress_start,
+        progress_end,
+        max_workers=None,
+    ):
+        """Reproject each spectral plane with bounded peak memory.
+
+        At most ``~2*max_workers`` planes are in flight at once, and every worker
+        result is written straight into ``out_array`` at its spectral index
+        (converting to ``out_array``'s dtype on assignment).  This avoids
+        buffering every reprojected plane in a list plus a final ``np.stack``
+        copy, which previously pushed peak memory to several times the cube size.
+        Results are identical to the old collect-then-stack path.
+        """
+        if max_workers is None:
+            cpu_count = os.cpu_count() or 1
+            max_workers = min(8, max(1, cpu_count))
+        span = max(0, progress_end - progress_start)
+
+        def _submit(executor, i):
+            slicer = [slice(None)] * self.original_data.ndim
+            slicer[np_spectral_axis] = i
+            plane = np.asarray(self.original_data[tuple(slicer)])
+            return executor.submit(
+                _reproject_plane_worker,
+                plane,
+                src_hdr_2d,
+                tgt_hdr_2d,
+                shape_out_2d,
+                method,
+                footprint_thresh,
+            )
+
+        executor_cls = self._choose_plane_executor(n_planes, shape_out_2d)
+
+        # Periodically flush disk-backed outputs so the OS can reclaim already
+        # written pages instead of holding the whole cube's dirty pages in RAM.
+        flush_every = self._memmap_flush_every(out_array, np_spectral_axis)
+
+        with executor_cls(max_workers=max_workers) as executor:
+            self._drain_bounded_futures(
+                executor,
+                range(n_planes),
+                submit=lambda item: _submit(executor, item),
+                handle_result=lambda idx, fut: self._handle_reproject_plane_result(
+                    out_array, np_spectral_axis, idx, fut.result()
+                ),
+                total=n_planes,
+                progress_start=progress_start,
+                progress_span=span,
+                flush_every=flush_every,
+                flush_array=out_array,
+                max_workers=max_workers,
+            )
+        return out_array
+
+    def _handle_reproject_plane_result(
+        self,
+        out_array,
+        np_spectral_axis,
+        idx,
+        result,
+    ) -> None:
+        plane_result, used_fix, downgraded = result
+        slicer = [slice(None)] * out_array.ndim
+        slicer[np_spectral_axis] = idx
+        out_array[tuple(slicer)] = plane_result  # dtype-convert on assign
+        if used_fix:
+            self._nan_high_order_fallback_used = True
+        if downgraded:
+            self._nan_high_order_downgraded = True
+
+    def _drain_bounded_futures(
+        self,
+        executor,
+        items,
+        *,
+        submit,
+        handle_result,
+        total: int,
+        progress_start: int,
+        progress_span: int,
+        flush_every: int = 0,
+        flush_array=None,
+        max_workers: int = 1,
+    ) -> int:
+        """Submit worker items with a bounded in-flight queue."""
+        if total <= 0:
+            return 0
+
+        in_flight_limit = max(2, int(max_workers) * 2)
+        iterator = iter(items)
+        in_flight = {}
+        completed = 0
+
+        def _top_up():
+            while len(in_flight) < in_flight_limit:
+                try:
+                    item = next(iterator)
+                except StopIteration:
+                    return
+                in_flight[submit(item)] = item
+
+        _top_up()
+        while in_flight:
+            done, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+            for future in done:
+                item = in_flight.pop(future)
+                handle_result(item, future)
+                completed += 1
+                if progress_span:
+                    self._emit_progress(
+                        int(progress_start + progress_span * (completed / total))
+                    )
+                if flush_every and flush_array is not None and completed % flush_every == 0:
+                    self._flush_memmap_quietly(flush_array)
+                _top_up()
+
+        return completed
+
     def _reproject_to_system(self, params: Dict, method: str) -> Tuple[np.ndarray, fits.Header, WCS]:
 
         target_system = params.get("target_system", "ICRS")
@@ -998,22 +1256,9 @@ class RegridEngine:
                 "Celestial reprojection requires exactly two celestial axes (e.g., RA/Dec)."
             )
 
-        # Instead of manually dropping axes, we use the .celestial property, which is
-        # the recommended way to get a 2D celestial-only WCS from a higher-dimensional one.
-        # We pair it with the shape of the celestial axes.
-        celestial_wcs = self.original_wcs.celestial
-        celestial_shape = celestial_wcs.array_shape
-        
-        if celestial_shape is None or len(celestial_shape) != 2:
-             # Fallback if celestial shape is not available from WCS object
-            numpy_celestial_axes = sorted([self.original_data.ndim - 1 - i for i in celestial_indices])
-            celestial_shape = (self.original_data.shape[numpy_celestial_axes[0]], self.original_data.shape[numpy_celestial_axes[1]])
-
-        input_for_wcs_determination = [(celestial_shape, celestial_wcs)]
-        
-        target_wcs_celestial, shape_celestial = self._determine_target_wcs(
-            input_for_wcs_determination, frame_option
-        )
+        # The optimal target WCS is determined just below from a (shape, wcs)
+        # pair, which never touches the pixel data.  (A previous version computed
+        # it once here and again below; the first result was discarded.)
         spectral_wcs_idx = self._spectral_axis_index()
         is_3d_cube = self.original_data.ndim > 2 and spectral_wcs_idx is not None
 
@@ -1073,49 +1318,25 @@ class RegridEngine:
             src_hdr_2d = source_wcs_2d.to_header()
             tgt_hdr_2d = target_wcs_2d.to_header()
 
-            cpu_count = os.cpu_count() or 1
-            max_workers = min(8, max(1, cpu_count))
-            progress_start, progress_end = 30, 90
-            regridded_planes = [None] * n_planes
-
-            # Submit jobs per plane (no shared WCS objects; headers only)
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {}
-                for i in range(n_planes):
-                    slicer = [slice(None)] * self.original_data.ndim
-                    slicer[np_spectral_axis] = i
-                    plane_data = self.original_data[tuple(slicer)]
-                    plane_array = np.asarray(plane_data)
-
-                    fut = executor.submit(
-                        _reproject_plane_worker,
-                        plane_array,  # copied into worker; stable
-                        src_hdr_2d,
-                        tgt_hdr_2d,
-                        shape_out_2d,
-                        method,
-                        0.5,                     # footprint threshold (tunable)
-                    )
-                    futures[fut] = i
-
-                completed_count = 0
-                for fut in as_completed(futures):
-                    idx = futures[fut]
-                    plane_result, used_fix, downgraded = fut.result()
-                    regridded_planes[idx] = plane_result
-                    if used_fix:
-                        self._nan_high_order_fallback_used = True
-                    if downgraded:
-                        self._nan_high_order_downgraded = True
-                    completed_count += 1
-                    ratio = completed_count / n_planes
-                    self._emit_progress(int(progress_start + (progress_end - progress_start) * ratio))
-
-            # Stack planes back along the spectral axis
-            regridded_data = np.stack(regridded_planes, axis=np_spectral_axis)
+            # Pre-allocate the output in the preferred (often float32) dtype and
+            # stream worker results straight into it -- no list-of-planes, no
+            # np.stack, no full float64 retention.  Each float64 plane is
+            # downcast on assignment, giving values identical to the previous
+            # stack + astype(preferred_dtype) path but at a fraction of the peak.
             preferred_dtype = self._preferred_float_dtype()
-            if regridded_data.dtype != preferred_dtype:
-                regridded_data = regridded_data.astype(preferred_dtype, copy=False)
+            regridded_data = self._allocate_output(shape_out, preferred_dtype)
+            self._reproject_planes_streaming(
+                regridded_data,
+                n_planes,
+                np_spectral_axis,
+                src_hdr_2d,
+                tgt_hdr_2d,
+                shape_out_2d,
+                method,
+                0.5,                     # footprint threshold (tunable)
+                progress_start=30,
+                progress_end=90,
+            )
             self._emit_progress(90)
 
         header = self._base_header_copy()
@@ -1416,16 +1637,8 @@ class RegridEngine:
         if not isinstance(data, np.ndarray) or data.size == 0:
             return
 
-        finite_mask = np.isfinite(data)
-        if not np.any(finite_mask):
-            if update_min:
-                self._remove_header_key(header, "DATAMIN")
-            if update_max:
-                self._remove_header_key(header, "DATAMAX")
-            return
-
-        finite_values = np.asarray(data[finite_mask], dtype=float)
-        if finite_values.size == 0:
+        dmin, dmax, any_finite = self._finite_extrema(data)
+        if not any_finite:
             if update_min:
                 self._remove_header_key(header, "DATAMIN")
             if update_max:
@@ -1433,9 +1646,45 @@ class RegridEngine:
             return
 
         if update_min:
-            header["DATAMIN"] = float(np.min(finite_values))
+            header["DATAMIN"] = float(dmin)
         if update_max:
-            header["DATAMAX"] = float(np.max(finite_values))
+            header["DATAMAX"] = float(dmax)
+
+    @staticmethod
+    def _finite_extrema(data: np.ndarray) -> Tuple[float, float, bool]:
+        """Return (min, max, any_finite) over finite values with bounded RAM.
+
+        For disk-backed (memmap) or very large arrays the cube is scanned one
+        plane at a time, so a full-size boolean mask is never materialised.
+        """
+        chunked = isinstance(data, np.memmap) or data.nbytes > _CHUNKED_EXTREMA_BYTES
+        if not chunked:
+            finite_mask = np.isfinite(data)
+            if not np.any(finite_mask):
+                return 0.0, 0.0, False
+            finite_values = np.asarray(data[finite_mask], dtype=float)
+            if finite_values.size == 0:
+                return 0.0, 0.0, False
+            return float(np.min(finite_values)), float(np.max(finite_values)), True
+
+        dmin, dmax, any_finite = np.inf, -np.inf, False
+        outer = data.shape[0] if data.ndim >= 1 else 0
+        for i in range(outer):
+            plane = np.asarray(data[i])
+            mask = np.isfinite(plane)
+            if not mask.any():
+                continue
+            values = plane[mask]
+            any_finite = True
+            pmin = float(values.min())
+            pmax = float(values.max())
+            if pmin < dmin:
+                dmin = pmin
+            if pmax > dmax:
+                dmax = pmax
+        if not any_finite:
+            return 0.0, 0.0, False
+        return dmin, dmax, True
 
     @staticmethod
     def _remove_header_key(header: fits.Header, key: str):
@@ -1572,9 +1821,9 @@ class RegridEngine:
             try:
                 slice_data = np.asarray(self._dask_data.take(index, axis=np_axis).compute())
             except Exception:
-                slice_data = np.take(self.original_data, index, axis=np_axis)
+                slice_data = _take_plane(self.original_data, index, np_axis)
         else:
-            slice_data = np.take(self.original_data, index, axis=np_axis)
+            slice_data = _take_plane(self.original_data, index, np_axis)
 
         slice_data = np.asarray(slice_data, dtype=self._preferred_float_dtype())
 
@@ -1982,6 +2231,45 @@ class RegridEngine:
             return 1.0
         return 1.0
 
+    def _manual_axis_unit_context(self, axis_index: int) -> Tuple[str, str, float]:
+        ctype = self.original_wcs.wcs.ctype[axis_index]
+        is_velocity = self._is_velocity_axis(ctype)
+
+        wcs_unit_value = (
+            self.original_wcs.wcs.cunit[axis_index]
+            if axis_index < len(self.original_wcs.wcs.cunit)
+            else ""
+        )
+        wcs_unit = self._sanitize_unit_value(wcs_unit_value, is_velocity=is_velocity)
+
+        header_unit = ""
+        if self.original_header is not None:
+            key = f"CUNIT{axis_index + 1}"
+            if key in self.original_header:
+                header_unit = self._sanitize_unit_value(
+                    self.original_header.get(key),
+                    is_velocity=is_velocity,
+                )
+
+        display_unit = header_unit or wcs_unit
+        if is_velocity and not display_unit:
+            display_unit = "km/s"
+
+        world_to_display_scale = 1.0
+        if is_velocity and display_unit == "km/s":
+            try:
+                cdelt_orig = float(self.original_wcs.wcs.cdelt[axis_index])
+            except (TypeError, ValueError):
+                cdelt_orig = 0.0
+            if self._velocity_values_need_kms_scaling(
+                wcs_unit_value,
+                cdelt_orig,
+                assume_missing_unit=(not bool(header_unit)),
+            ):
+                world_to_display_scale = 1e-3
+
+        return wcs_unit, display_unit, world_to_display_scale
+
 
     def _harmonize_spectral_axis(self, template_header: fits.Header):
         original_ctypes = list(self.original_wcs.wcs.ctype)
@@ -1998,13 +2286,20 @@ class RegridEngine:
             if self._is_velocity_axis(original_type) and self._is_velocity_axis(template_type):
                 template_header[f"CTYPE{idx + 1}"] = original_type
                 orig_unit = ""
-                if idx < len(self.original_wcs.wcs.cunit):
+                axis_number = idx + 1
+                unit_key = f"CUNIT{axis_number}"
+                if self.original_header is not None and unit_key in self.original_header:
+                    orig_unit = self._sanitize_unit_value(
+                        self.original_header.get(unit_key),
+                        is_velocity=True,
+                    )
+                elif unit_key not in template_header and idx < len(self.original_wcs.wcs.cunit):
                     orig_unit = self._sanitize_unit_value(
                         self.original_wcs.wcs.cunit[idx],
                         is_velocity=True,
                     )
                 if orig_unit:
-                    self._set_axis_unit(template_header, idx + 1, orig_unit)
+                    self._set_axis_unit(template_header, axis_number, orig_unit)
 
         self._synchronize_rest_metadata(template_header)
 
@@ -2474,6 +2769,15 @@ class RegridEngine:
 
     def _preferred_float_dtype(self) -> np.dtype:
         data = self.original_data
+        if isinstance(data, LazyScaledArray):
+            raw_dtype = getattr(getattr(data, "_raw", None), "dtype", None)
+            if raw_dtype is not None:
+                raw_dtype = np.dtype(raw_dtype)
+                if np.issubdtype(raw_dtype, np.floating):
+                    return np.dtype("float32") if raw_dtype.itemsize <= 4 else np.dtype("float64")
+                if np.issubdtype(raw_dtype, np.integer):
+                    return np.dtype("float32")
+
         dtype = getattr(data, "dtype", None)
         if dtype is not None:
             if np.issubdtype(dtype, np.floating):
@@ -2486,6 +2790,123 @@ class RegridEngine:
     def _reproject_float_dtype() -> np.dtype:
         """Data type expected by reproject (maps to np.float64)."""
         return np.dtype("float64")
+
+    # ------------------------------------------------------------------
+    # Out-of-core output allocation
+    @staticmethod
+    def _shape_nbytes(shape, dtype) -> int:
+        count = 1
+        for dim in shape:
+            count *= int(dim)
+        return count * np.dtype(dtype).itemsize
+
+    def _should_stream_output_to_disk(self, shape, dtype) -> bool:
+        if self.out_of_core is True:
+            return True
+        if self.out_of_core is False:
+            return False
+        nbytes = self._shape_nbytes(shape, dtype)
+        total_ram = _detect_total_ram_bytes()
+        if total_ram:
+            threshold = int(total_ram * _OUT_OF_CORE_RAM_FRACTION)
+        else:
+            threshold = _OUT_OF_CORE_FALLBACK_BYTES
+        return nbytes >= threshold
+
+    def _materialized_input_is_large(self) -> bool:
+        """True if fully materialising the input as float64 would be large.
+
+        Used by the coupled-axis fail-fast guard: a coupled WCS forces a full 3D
+        interpolation that expands a lazily-scaled cube to one float64 array.
+        """
+        nbytes = self._shape_nbytes(np.shape(self.original_data), np.float64)
+        total_ram = _detect_total_ram_bytes()
+        limit = (
+            int(total_ram * _OUT_OF_CORE_RAM_FRACTION)
+            if total_ram
+            else _OUT_OF_CORE_FALLBACK_BYTES
+        )
+        return nbytes >= limit
+
+    def _allocate_output(self, shape, dtype) -> np.ndarray:
+        """Allocate the regrid output in RAM, or as a disk-backed memmap.
+
+        For very large outputs a ``numpy.memmap`` backed by a temp file is
+        returned so the cube streams to disk instead of being held entirely in
+        memory.  The plane-by-plane writes every regrid mode performs work
+        identically on a memmap (random-access writes are fine), so callers need
+        no special handling.  Temp files are tracked for cleanup on error; on
+        success the caller removes the file once it has been saved.
+        """
+        shape = tuple(int(dim) for dim in shape)
+        if not self._should_stream_output_to_disk(shape, dtype):
+            return np.empty(shape, dtype=dtype)
+        fd, path = tempfile.mkstemp(suffix=".regrid.dat")
+        os.close(fd)
+        self._output_tempfiles.append(path)
+        memmap = np.memmap(path, dtype=dtype, mode="w+", shape=shape)
+        # Safety net: reclaim the scratch file once the memmap is
+        # garbage-collected, so headless/CLI runs (which don't eagerly delete it
+        # like the GUI does after saving) never leave the temp behind.
+        weakref.finalize(memmap, _quiet_remove, path)
+        return memmap
+
+    def _cleanup_output_tempfiles(self) -> None:
+        for path in self._output_tempfiles:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self._output_tempfiles = []
+
+    def _spectral_interp_tiled(
+        self, source, orig_coords, new_coords, spectral_axis, out, kind,
+        tile_bytes: int = 256 * 1024 ** 2,
+    ) -> None:
+        """Resample ``source`` along ``spectral_axis`` into ``out`` tile-by-tile.
+
+        Numerically equivalent to a single ``interp1d`` over the whole reshaped
+        cube, but it processes a slab of spatial rows at a time so neither the
+        source cube nor the interpolation result is ever fully held in RAM --
+        enabling out-of-core template regridding where both arrays are memmaps.
+        """
+        ndim = source.ndim
+        spatial_axes = [a for a in range(ndim) if a != spectral_axis]
+        if not spatial_axes:
+            interp = interp1d(
+                orig_coords, np.asarray(source), axis=spectral_axis,
+                bounds_error=False, fill_value=np.nan, kind=kind,
+            )
+            out[...] = interp(new_coords)
+            return
+
+        tile_axis = spatial_axes[0]
+        n_spec = int(source.shape[spectral_axis])
+        other = 1
+        for axis in spatial_axes[1:]:
+            other *= int(source.shape[axis])
+        bytes_per = np.dtype(np.float64).itemsize
+        rows = max(1, int(tile_bytes / max(1, bytes_per * n_spec * max(1, other))))
+
+        n_tile = int(source.shape[tile_axis])
+        flush_bytes = 0
+        for start in range(0, n_tile, rows):
+            end = min(start + rows, n_tile)
+            slicer = [slice(None)] * ndim
+            slicer[tile_axis] = slice(start, end)
+            block = np.asarray(source[tuple(slicer)])
+            interp = interp1d(
+                orig_coords, block, axis=spectral_axis,
+                bounds_error=False, fill_value=np.nan, kind=kind,
+            )
+            out[tuple(slicer)] = interp(new_coords)
+            if isinstance(out, np.memmap):
+                out_shape = list(out.shape)
+                out_shape[tile_axis] = end - start
+                flush_bytes += self._shape_nbytes(tuple(out_shape), out.dtype)
+                if flush_bytes >= _STREAM_FLUSH_BYTES:
+                    self._flush_memmap_quietly(out)
+                    flush_bytes = 0
 
     @staticmethod
     def _almost_equal(a: float, b: float, tol: float = 1e-9) -> bool:
@@ -2775,12 +3196,29 @@ class RegridEngine:
         target_header, target_wcs = self._calculate_manual_target_wcs(params)
         shape_out = tuple(int(target_header[f"NAXIS{i+1}"]) for i in reversed(range(target_header["NAXIS"])))
 
-        # Handle NaNs for high-order spline interpolation
-        order = self._interpolation_to_spline_order(method) or 1
+        # Handle NaNs for high-order spline interpolation.
+        # NB: ``... or 1`` would turn nearest-neighbour (order 0) into bilinear
+        # because ``0 or 1 == 1`` -- only fall back to 1 when the order is None.
+        order = self._interpolation_to_spline_order(method)
+        if order is None:
+            order = 1
         prefilter = order > 1
         
         # Prepare data: fill NaNs if necessary for pre-filtering
         input_data = self.original_data
+        if (
+            prefilter
+            and getattr(input_data, "ndim", 0) >= 3
+            and (
+                isinstance(input_data, LazyScaledArray)
+                or self._materialized_input_is_large()
+            )
+        ):
+            raise RuntimeError(
+                "Bicubic/Biquadratic manual regrid of a large FITS cube "
+                "requires materializing the full input cube. Use Bilinear or Nearest "
+                "for bounded-memory regridding."
+            )
         nan_mask = None
         filled_data = input_data
         has_nans = False
@@ -2827,7 +3265,7 @@ class RegridEngine:
         else:
             # 3D case
             self._emit_progress(30)
-            regridded_data = np.empty(shape_out, dtype=self._preferred_float_dtype())
+            regridded_data = self._allocate_output(shape_out, self._preferred_float_dtype())
             
             spectral_wcs_idx = self._spectral_axis_index()
             if spectral_wcs_idx is None:
@@ -2840,209 +3278,153 @@ class RegridEngine:
             del spatial_shape[numpy_spectral_axis]
             spatial_grids = np.indices(spatial_shape, dtype=np.float32)
 
-            # 3D case optimization:
-            # Check if spectral axis is coupled to spatial axes.
-            spectral_coupled = False
-            for ax_idx in range(self.original_wcs.wcs.naxis):
-                if ax_idx == spectral_wcs_idx:
-                    continue
-                if self._is_axis_coupled(self.original_wcs, spectral_wcs_idx, tol=1e-6):
-                    spectral_coupled = True
-                    break
-            
-            # If target WCS has coupling, we might also need to be careful, 
-            # but usually for 'manual' we are building a separable grid. 
-            # We assume target Grid is separable by construction in _calculate_manual_target_wcs.
+            spectral_coupled = self._is_axis_coupled(
+                self.original_wcs, spectral_wcs_idx, tol=1e-6
+            )
 
-            # Pre-calculate spatial coordinates if uncoupled
+            # Fail-fast: coupled spectral/spatial WCS axes (off-diagonal PC
+            # terms) force a true 3D interpolation that materialises a
+            # lazily-scaled cube entirely in RAM (as float64), which would
+            # OOM-kill the app on a large cube.  Refuse loudly with an actionable
+            # message instead.  Separable cubes (the usual case) are unaffected.
+            if (
+                spectral_coupled
+                and isinstance(self.original_data, LazyScaledArray)
+                and (self.out_of_core is True or self._materialized_input_is_large())
+            ):
+                raise RuntimeError(
+                    "This FITS cube has coupled spectral/spatial WCS axes "
+                    "(off-diagonal PC terms), so manual regrid needs the entire "
+                    "cube in memory at once and cannot stream it to disk. The cube "
+                    "is too large for that -- reduce the input size or use a "
+                    "machine with more RAM."
+                )
+
             precomputed_spatial_coords_scipy = None
             
             if not spectral_coupled:
-                # Calculate spatial coordinates for a single plane (z=0)
-                # The spatial part of the grid is constant for all z if uncoupled.
-                
-                # Create a grid for z=0
+                # For separable 3D WCS, spatial sample coordinates are identical
+                # for every spectral plane. Compute them once on target z=0.
                 coords_for_wcs_axes = [None] * target_wcs.wcs.naxis
-                # Set spectral pixel to 0 (arbitrary, as it shouldn't affect spatial lookups if uncoupled)
                 coords_for_wcs_axes[spectral_wcs_idx] = np.zeros(spatial_shape, dtype=np.float32)
                 
                 spatial_wcs_indices = [i for i in range(target_wcs.wcs.naxis) if i != spectral_wcs_idx]
-                coords_for_wcs_axes[spatial_wcs_indices[0]] = spatial_grids[1] 
+                coords_for_wcs_axes[spatial_wcs_indices[0]] = spatial_grids[1]
                 coords_for_wcs_axes[spatial_wcs_indices[1]] = spatial_grids[0]
-                
+
                 pixel_coords_out = np.vstack([c.ravel() for c in coords_for_wcs_axes]).T
                 world_coords = target_wcs.wcs_pix2world(pixel_coords_out, 0)
-                
-                # We need full world2pix to get all pixel coordinates
                 source_pixel_coords_flat = self.original_wcs.wcs_world2pix(world_coords, 0)
-                
-                # Extract spatial components (scipy uses [z, y, x] order, so we need y, x here)
-                # The source_pixel_coords_flat is (N, 3) with [x, y, z] order in WCS convention
-                # We want [y, x] for the spatial part of map_coordinates input.
-                # Recall: map_coordinates input is (ndim, n_points). 
-                # For 3D it expects [z, y, x] coords.
-                
-                # Let's verify standard numpy/scipy ordering: 
-                # data[z, y, x] -> coordinates should be [z_coords, y_coords, x_coords]
-                # data axis 0: spectral (numpy_spectral_axis)
-                # data axis 1: y
-                # data axis 2: x
-                
-                # source_pixel_coords_flat column mapping:
-                # col 0: source X (data axis 2)
-                # col 1: source Y (data axis 1)
-                # col 2: source Z (spectral)
-                
-                # So for map_coordinates we need rows: [col 2, col 1, col 0]
-                # We pre-calculate col 1 and col 0. col 2 will be calculated per plane.
-                
-                # Note: The 'spectral_wcs_idx' might not correspond to 'col 2' if the WCS axis order is permuted.
-                # But _is_axis_coupled check above logic should hold.
-                # For safety, let's map WCS axes to Numpy axes.
-                
-                # We can't easily decouple the WCS mapping entirely if PC matrix mixes them, 
-                # but _is_axis_coupled checks PC matrix.
-                
-                # So we extract the columns corresponding to spatial numpy axes.
-                
-                # We'll just store the full (3, N) array and update the spectral row per plane?
-                # No, source_pixel_coords_flat calculation is the expensive part (wcs_world2pix).
-                # If uncoupled, the spatial output pixels (col 0, col 1...) only depend on spatial input pixels.
-                
-                # ...Wait, wcs_world2pix takes (N, 3) world coords.
-                # If spectral axis is uncoupled, changing world_z shouldn't change pixel_x, pixel_y.
-                # Changing pixel_z_target -> world_z_target -> (uncoupled) -> world_x, world_y unchaged -> pixel_x_source, pixel_y_source unchanged.
-                
-                # So yes, source X and Y pixels are constant.
-                # Source Z pixel depends primarily on World Z.
-                
-                # We can pre-calculate the spatial columns of 'source_pixel_coords_flat'.
-                precomputed_spatial_coords_scipy = source_pixel_coords_flat.T[::-1] # Now (3, N) in [z, y, x] order
-                
-                # However, the Z row of this precomputed array is for target z=0. 
-                # We will need to replace it with the correct source Z for each target plane.
-                
-                # Optimization for Source Z:
-                # If uncoupled, Source Z only depends on Target Z.
-                # We can compute the 1D mapping: Target Z index -> Source Z index.
-                # But wcs_world2pix might be non-linear.
-                # We can basically map the Z-axis 1D array.
-                
-                target_z_indices = np.arange(shape_out[numpy_spectral_axis])
-                
-                # Create a probe vector for Z
-                # We fix spatial pixel to 0,0 (or center) for this probe
-                probe_coords = np.zeros((len(target_z_indices), target_wcs.wcs.naxis))
-                # Set spatial to crpix or 0
-                
-                # Actually, simpler:
-                # For each plane, we know the World Z.
-                # We can map World Z -> Source Pixel Z directly if 1D.
-                # But we have the full machinery. 
-                
-                # Let's keep it robust:
-                # We rely on the fact that `map_coordinates` needs (3, N) coordinates.
-                # We have precomputed [Z0, Y, X].
-                # We just need to calculate [Z_new, Y, X].
-                # Since spatial is constant, Y and X are effectively cached.
-                # We only need to compute Z_new.
-            
+
+                # map_coordinates expects numpy-axis order, the reverse of WCS axis order.
+                precomputed_spatial_coords_scipy = source_pixel_coords_flat.T[::-1]
+
+                # FAST 2D PATH: when axes are uncoupled the spatial sample positions are
+                # identical for every output plane. Precompute the 2D (y, x) sample coords
+                # so each plane resamples only a 2D source slice instead of handing the
+                # whole 3D cube to map_coordinates (which upcasts/processes the entire cube
+                # on every call -- the dominant cost in the manual regrid).
+                _numpy_z_row_idx = target_wcs.wcs.naxis - 1 - spectral_wcs_idx
+                _spatial_coords_2d = np.delete(
+                    precomputed_spatial_coords_scipy, _numpy_z_row_idx, axis=0
+                )
+                _src_spec_np = self.original_data.ndim - 1 - spectral_wcs_idx
+                _src_nz = filled_data.shape[_src_spec_np]
+                # order <= 1 is separable across z and xy, so the 2D fast path is
+                # numerically identical to the full 3D resample. Higher orders keep
+                # the original 3D path.
+                _use_fast_2d = (order <= 1)
+
+                # Vectorized source-Z mapping: map every target plane's centre pixel to a
+                # source pixel-Z coordinate in a SINGLE pix2world/world2pix round-trip,
+                # instead of one round-trip per plane. The per-plane probe dominated
+                # runtime on slow projections (e.g. GLON-GLS): ~28 ms/call x N planes.
+                _nz_out = shape_out[numpy_spectral_axis]
+                _spatial_wcs_idx = [i for i in range(target_wcs.wcs.naxis) if i != spectral_wcs_idx]
+                _probe_all = np.zeros((_nz_out, target_wcs.wcs.naxis))
+                _probe_all[:, spectral_wcs_idx] = np.arange(_nz_out)
+                _probe_all[:, _spatial_wcs_idx[0]] = spatial_shape[1] // 2
+                _probe_all[:, _spatial_wcs_idx[1]] = spatial_shape[0] // 2
+                _src_z_all = self.original_wcs.wcs_world2pix(
+                    target_wcs.wcs_pix2world(_probe_all, 0), 0
+                )[:, spectral_wcs_idx]
+
+            # High-order splines (bicubic/biquadratic): pre-filter the whole cube
+            # ONCE here instead of letting map_coordinates(prefilter=True) re-run
+            # the spline filter over the entire cube on every plane -- that made
+            # bicubic ~100x slower than bilinear.  scipy's prefilter for
+            # mode='nearest' edge-pads by 12 px first, so we replicate that pad
+            # (and offset the sample coords by it); results stay numerically
+            # identical (max diff ~1e-7).  Falls back to per-plane prefilter on
+            # any error.
+            resample_source = filled_data
+            resample_npad = 0
+            resample_prefilter = prefilter
+            nan_mask_float = (
+                np.asarray(nan_mask, dtype=np.float32)
+                if (has_nans and nan_mask is not None)
+                else None
+            )
+            if prefilter and spline_filter is not None:
+                try:
+                    _NPAD = 12
+                    _padded = np.pad(np.asarray(filled_data), _NPAD, mode="edge")
+                    resample_source = spline_filter(
+                        _padded, order=order, output=np.float32, mode="nearest"
+                    )
+                    del _padded
+                    resample_npad = _NPAD
+                    resample_prefilter = False
+                    # filled_data is no longer needed for the high-order path
+                    # (the fast 2D branch below only runs for order <= 1).
+                    filled_data = None
+                except Exception:
+                    resample_source = filled_data
+                    resample_npad = 0
+                    resample_prefilter = prefilter
+
             def _process_plane(z_idx: int):
-                # Optimize: If uncoupled, reconstruct source coordinates efficiently
                 if not spectral_coupled and precomputed_spatial_coords_scipy is not None:
-                     # 1. Calculate the Z-coordinate for this plane. 
-                     # Since we established uncoupling, we can just calculate the center pixel's Z transformation
-                     # and assume it's constant for the whole plane (if separable).
-                     # OR, more safely, allow for spectral variation across the field?
-                     # If uncoupled, spectral coordinate shouldn't vary with spatial position.
-                     
-                     # Let's perform a lightweight WCS transform for just the spectral axis to get the Z-plane value.
-                     # We pick the center pixel of the plane to represent the Z-shift.
-                     
-                     # Construct a single pixel coordinate for the current plane center
-                     # center_spatial = [s//2 for s in spatial_shape]
-                     # pixel_probe = [ ... ]
-                     # This feels risky if there's any tilt.
-                     
-                     # Safe approach using the fact that we confirmed uncoupled:
-                     # The source Z index should be constant for the entire plane 
-                     # ONLY IF the spectral axis allows it (e.g. constant frequency plane).
-                     # But _is_axis_coupled only checks cross-terms. 
-                     # It doesn't guarantee that World Z is constant across the pixel plane?
-                     # In a standard datacube, target grid Z=k corresponds to a single spectral value.
-                     
-                     # Let's recalculate specific Z-coordinates for the generated grid 
-                     # but reuse X and Y.
-                     
-                     # Actually, if we just want to avoid `wcs_world2pix` for all points:
-                     # If uncoupled, `world_coords` spatial parts are constant. 
-                     # `world_coords` spectral part is constant for the plane (since we fill z_idx).
-                     
-                     # So `world_coords` = [const_x, const_y, const_z] for the whole plane?
-                     # NO, `world_coords` varies spatially.
-                     # But `world_z` is constant for the whole plane (because pixel_z is constant).
-                     
-                     # So Source Pixels:
-                     # pix_x = f(world_x, world_y)  <-- constant per plane
-                     # pix_y = g(world_x, world_y)  <-- constant per plane
-                     # pix_z = h(world_z)           <-- constant per plane (if uncoupled)
-                     
-                     # So `source_pixel_coords_flat` columns:
-                     # Col X: reused from cache
-                     # Col Y: reused from cache
-                     # Col Z: calculated once per plane?
-                     
-                     # Yes! If uncoupled, the source Z pixel index is essentially constant for the entire target plane 
-                     # (ignoring small numerical variations or higher order distortions which we assume negligible if 'uncoupled').
-                     # Wait, if there is velocity variation across the field this assumption fails.
-                     # But `_is_axis_coupled` checks PC matrix off-diagonals.
-                     
-                     # If PC matrix is diagonal, then:
-                     # pix = CD_inv * (world - ref)
-                     # if CD_inv is diagonal (or block diagonal), then Z_pix only depends on Z_world.
-                     
-                     # So, we need to determine the single `source_z_value` for this plane.
-                     # We can do this by transforming one point (e.g. center) and using that Z for the whole array.
-                     
-                     # Let's do that.
-                     cx = spatial_shape[1] // 2
-                     cy = spatial_shape[0] // 2
-                     
-                     # Target Pixel
-                     pix_probe = np.zeros((1, target_wcs.wcs.naxis))
-                     pix_probe[0, spectral_wcs_idx] = z_idx
-                     spatial_indices = [i for i in range(target_wcs.wcs.naxis) if i != spectral_wcs_idx]
-                     pix_probe[0, spatial_indices[0]] = cx
-                     pix_probe[0, spatial_indices[1]] = cy
-                     
-                     # To World
-                     world_probe = target_wcs.wcs_pix2world(pix_probe, 0)
-                     # To Source Pixel
-                     src_pix_probe = self.original_wcs.wcs_world2pix(world_probe, 0)
-                     
-                     source_z_val = src_pix_probe[0, spectral_wcs_idx]
-                     
-                     # Copy precomputed cached coords
-                     # We only need to update the Z-row (which is row 0 in [z, y, x] order if spectral is axis 0)
-                     # Wait, we need to know which row in 'source_pixel_coords_for_scipy' corresponds to spectral.
-                     
-                     # source_pixel_coords_for_scipy is (3, N).
-                     # It's constructed as source_pixel_coords_flat.T[::-1].
-                     # source_pixel_coords_flat is (N, 3) ordered by WCS axis index (usually RA, DEC, VELO or similar).
-                     # T makes it (3, N).
-                     # [::-1] reverses the axes to match numpy order (usually VELO, DEC, RA).
-                     
-                     # So if spectral axis is WCS axis 2 (last), it becomes Numpy axis 0 (first).
-                     # So row 0 is spectral.
-                     
-                     coords_for_interp = precomputed_spatial_coords_scipy.copy()
-                     
-                     # Identify which row corresponds to spectral axis
-                     # spectral_wcs_idx is the WCS index.
-                     # In the reversed list (numpy order), the index is: naxis - 1 - spectral_wcs_idx
-                     numpy_z_row_idx =  target_wcs.wcs.naxis - 1 - spectral_wcs_idx
-                     
-                     coords_for_interp[numpy_z_row_idx, :] = source_z_val
+                    source_z_val = float(_src_z_all[z_idx])
+
+                    if _use_fast_2d:
+                        if order <= 0:
+                            zc = min(max(int(round(source_z_val)), 0), _src_nz - 1)
+                            src_plane = _take_plane(filled_data, zc, _src_spec_np)
+                        else:
+                            z0 = int(np.floor(source_z_val))
+                            frac = float(source_z_val - z0)
+                            z0c = min(max(z0, 0), _src_nz - 1)
+                            z1c = min(max(z0 + 1, 0), _src_nz - 1)
+                            p0 = _take_plane(filled_data, z0c, _src_spec_np)
+                            if frac <= 0.0 or z1c == z0c:
+                                src_plane = p0
+                            else:
+                                p1 = _take_plane(filled_data, z1c, _src_spec_np)
+                                src_plane = p0 * (1.0 - frac) + p1 * frac
+
+                        resampled_plane_flat = map_coordinates(
+                            src_plane,
+                            _spatial_coords_2d,
+                            order=order,
+                            mode='nearest',
+                            prefilter=prefilter,
+                        )
+                        if has_nans and nan_mask is not None:
+                            zc = min(max(int(round(source_z_val)), 0), _src_nz - 1)
+                            mask_plane = _take_plane(nan_mask, zc, _src_spec_np).astype(float)
+                            regridded_mask_flat = map_coordinates(
+                                mask_plane,
+                                _spatial_coords_2d,
+                                order=0,
+                                mode='nearest',
+                            )
+                            resampled_plane_flat[regridded_mask_flat > 0.5] = np.nan
+                        return z_idx, resampled_plane_flat.reshape(spatial_shape)
+
+                    coords_for_interp = precomputed_spatial_coords_scipy.copy()
+                    numpy_z_row_idx = target_wcs.wcs.naxis - 1 - spectral_wcs_idx
+                    coords_for_interp[numpy_z_row_idx, :] = source_z_val
                      
                 else:
                     # Fallback to full recalculation
@@ -3060,20 +3442,27 @@ class RegridEngine:
                     source_pixel_coords_flat = self.original_wcs.wcs_world2pix(world_coords, 0)
                     coords_for_interp = source_pixel_coords_flat.T[::-1]
                 
-                # Use filled_data for interpolation
-                resampled_plane_flat = map_coordinates(
-                    filled_data, coords_for_interp,
-                    order=order, mode='nearest', prefilter=prefilter
+                # Resample from the (once-)pre-filtered source.  When we
+                # pre-filtered above, the source is edge-padded by resample_npad
+                # and prefilter is already applied, so offset the sample coords
+                # and pass prefilter=False; otherwise this is the original call.
+                coords_data = (
+                    coords_for_interp + resample_npad if resample_npad else coords_for_interp
                 )
-                
-                # Remap the NaN mask if we had NaNs
-                if has_nans and nan_mask is not None:
+                resampled_plane_flat = map_coordinates(
+                    resample_source, coords_data,
+                    order=order, mode='nearest', prefilter=resample_prefilter
+                )
+
+                # Remap the NaN mask if we had NaNs (mask stays unpadded, so it
+                # uses the original, un-offset coordinates).
+                if has_nans and nan_mask_float is not None:
                     regridded_mask_flat = map_coordinates(
-                        nan_mask.astype(float), coords_for_interp,
+                        nan_mask_float, coords_for_interp,
                         order=0, mode='nearest'
                     )
                     resampled_plane_flat[regridded_mask_flat > 0.5] = np.nan
-                
+
                 return z_idx, resampled_plane_flat.reshape(spatial_shape)
 
             n_planes = shape_out[numpy_spectral_axis]
@@ -3081,23 +3470,32 @@ class RegridEngine:
             progress_end = 90
             cpu_count = os.cpu_count() or 1
             max_workers = min(8, max(cpu_count, 1)) if cpu_count > 1 else 1
+            flush_every = self._memmap_flush_every(regridded_data, numpy_spectral_axis)
             
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = [executor.submit(_process_plane, i) for i in range(n_planes)]
-                completed = 0
-                for future in as_completed(futures):
+                def _write_plane(_item, future):
                     z_idx, plane_data = future.result()
                     slicer = [slice(None)] * len(shape_out)
                     slicer[numpy_spectral_axis] = z_idx
                     regridded_data[tuple(slicer)] = plane_data
-                    
-                    completed += 1
-                    ratio = completed / n_planes
-                    self._emit_progress(int(progress_start + (progress_end - progress_start) * ratio))
+
+                self._drain_bounded_futures(
+                    executor,
+                    range(n_planes),
+                    submit=lambda item: executor.submit(_process_plane, item),
+                    handle_result=_write_plane,
+                    total=n_planes,
+                    progress_start=progress_start,
+                    progress_span=progress_end - progress_start,
+                    flush_every=flush_every,
+                    flush_array=regridded_data,
+                    max_workers=max_workers,
+                )
 
         self._emit_progress(90)
         final_header = self._base_header_copy()
         self._apply_wcs_to_header(final_header, target_wcs)
+        self._apply_manual_display_axis_cards(final_header, target_header)
 
         return regridded_data, final_header, target_wcs
 
@@ -3112,21 +3510,34 @@ class RegridEngine:
         naxis = self.original_wcs.wcs.naxis
         data_shape = self._data_shape_for_wcs(naxis)
         new_header = fits.Header()
+        wcs_header = fits.Header()
         new_cdelt_arr = np.array(grid_cdelt, dtype=float)
         anchor_arr = np.array(anchor_world, dtype=float)
         new_header["NAXIS"] = naxis
+        wcs_header["NAXIS"] = naxis
+        world_to_display_scales = np.ones(naxis, dtype=float)
         for i in range(naxis):
             ctype = self.original_wcs.wcs.ctype[i]
-            unit = self.original_wcs.wcs.cunit[i]
             is_velocity = self._is_velocity_axis(ctype)
-            sanitized_unit = self._sanitize_unit_value(unit, is_velocity=is_velocity)
+            wcs_unit, display_unit, world_to_display_scale = self._manual_axis_unit_context(i)
+            world_to_display_scales[i] = world_to_display_scale
+            wcs_scale = world_to_display_scale if world_to_display_scale != 0 else 1.0
+
             new_header[f"CTYPE{i + 1}"] = ctype
-            self._set_axis_unit(new_header, i + 1, sanitized_unit)
+            self._set_axis_unit(new_header, i + 1, display_unit)
             new_header[f"CRVAL{i + 1}"] = anchor_arr[i]
             new_header[f"CDELT{i + 1}"] = new_cdelt_arr[i]
 
+            wcs_header[f"CTYPE{i + 1}"] = ctype
+            self._set_axis_unit(wcs_header, i + 1, wcs_unit)
+            wcs_header[f"CRVAL{i + 1}"] = anchor_arr[i] / wcs_scale
+            wcs_header[f"CDELT{i + 1}"] = new_cdelt_arr[i] / wcs_scale
+
         for axis in range(naxis):
-            world_corners = self._world_corners_for_axis(axis, data_shape)
+            world_corners = (
+                self._world_corners_for_axis(axis, data_shape)
+                * world_to_display_scales[axis]
+            )
             world_min, world_max = np.min(world_corners), np.max(world_corners)
             
             ctype = self.original_wcs.wcs.ctype[axis].upper()
@@ -3162,11 +3573,40 @@ class RegridEngine:
             
             new_header[f"NAXIS{axis + 1}"] = new_size
             new_header[f"CRPIX{axis + 1}"] = new_crpix
+            wcs_header[f"NAXIS{axis + 1}"] = new_size
+            wcs_header[f"CRPIX{axis + 1}"] = new_crpix
 
         self._ensure_header_pc(new_header)
-        target_wcs = self._create_wcs_safely(new_header)
+        self._ensure_header_pc(wcs_header)
+        target_wcs = self._create_wcs_safely(wcs_header)
 
         return new_header, target_wcs
+
+    def _apply_manual_display_axis_cards(self, header: fits.Header, target_header: fits.Header):
+        axes = target_header.get("WCSAXES", target_header.get("NAXIS", 0))
+        try:
+            axes = int(axes)
+        except (TypeError, ValueError):
+            return
+
+        for axis_number in range(1, axes + 1):
+            for prefix in ("CTYPE", "CRVAL", "CDELT", "CUNIT"):
+                key = f"{prefix}{axis_number}"
+                if key not in target_header:
+                    continue
+                comment = target_header.comments[key]
+                if prefix in ("CRVAL", "CDELT") and not comment:
+                    unit = str(target_header.get(f"CUNIT{axis_number}", "") or "").strip()
+                    if unit:
+                        quantity = "value" if prefix == "CRVAL" else "increment"
+                        comment = f"[{unit}] Coordinate {quantity} at reference point"
+                self._set_header_value_before_commentary(
+                    header,
+                    key,
+                    target_header[key],
+                    comment=comment,
+                    after=None,
+                )
 
 
     def _regrid_manual_reproject(self, params: Dict, method: str) -> Tuple[np.ndarray, fits.Header, WCS]:
@@ -3437,16 +3877,20 @@ class RegridEngine:
 
             if enable_parallel and total_planes > 1 and max_workers > 1:
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = [executor.submit(_process_plane, item) for item in worker_items]
-                    completed = 0
-                    for future in as_completed(futures):
+                    def _write_plane(_item, future):
                         idx, plane = future.result()
                         final_data[idx] = plane
-                        completed += 1
-                        ratio = completed / total_planes
-                        self._emit_progress(
-                            int(progress_start + (progress_end - progress_start) * ratio)
-                        )
+
+                    self._drain_bounded_futures(
+                        executor,
+                        worker_items,
+                        submit=lambda item: executor.submit(_process_plane, item),
+                        handle_result=_write_plane,
+                        total=total_planes,
+                        progress_start=progress_start,
+                        progress_span=progress_end - progress_start,
+                        max_workers=max_workers,
+                    )
             else:
                 for completed, item in enumerate(worker_items, start=1):
                     idx, plane = _process_plane(item)

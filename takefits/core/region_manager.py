@@ -350,42 +350,47 @@ class RegionManager(QObject):
             return
 
         elif isinstance(self.selected_region, EllipseRegion):
-            # (EllipseRegion logic remains unchanged)
+            # Outline drag (placement-style): the outline point diametrically
+            # opposite the grabbed one stays pinned while the grabbed point (at
+            # parametric angle ``phi``) follows the cursor, so the centre slides
+            # to the midpoint exactly like drawing a fresh ellipse. Near an axis
+            # tip the perpendicular semi-axis is frozen, recovering a clean
+            # single-axis drag.
             state = self.resize_initial_state
-            if state is None: return
-            edges = self.resize_handle.get('edges', set())
-            if not edges: return
+            if state is None:
+                return
+            phi = self.resize_handle.get('phi')
+            if phi is None:
+                return
 
-            center = state.get('center')
+            c0 = state.get('center')
             angle = getattr(self.selected_region, 'angle', state.get('angle', 0.0))
             rad = math.radians(angle)
             cos_a, sin_a = math.cos(rad), math.sin(rad)
-
-            dx, dy = xdata - center[0], ydata - center[1]
-            x_local = cos_a * dx + sin_a * dy
-            y_local = -sin_a * dx + cos_a * dy
-            
+            a0, b0 = state['width'] / 2.0, state['height'] / 2.0
+            cos_p, sin_p = math.cos(phi), math.sin(phi)
             min_size = 1e-3
-            half_w, half_h = state['width'] / 2.0, state['height'] / 2.0
-            new_left, new_right = -half_w, half_w
-            new_bottom, new_top = -half_h, half_h
+            freeze = 0.15
 
-            if 'left' in edges: new_left = min(x_local, new_right - min_size)
-            if 'right' in edges: new_right = max(x_local, new_left + min_size)
-            if 'bottom' in edges: new_bottom = min(y_local, new_top - min_size)
-            if 'top' in edges: new_top = max(y_local, new_bottom + min_size)
+            # Pinned anchor = the opposite outline point of the initial ellipse.
+            anchor_x = c0[0] + cos_a * (-a0 * cos_p) - sin_a * (-b0 * sin_p)
+            anchor_y = c0[1] + sin_a * (-a0 * cos_p) + cos_a * (-b0 * sin_p)
 
-            new_width = max(new_right - new_left, min_size)
-            new_height = max(new_top - new_bottom, min_size)
+            # Half the anchor->cursor vector, expressed in the ellipse frame.
+            wx, wy = xdata - anchor_x, ydata - anchor_y
+            u = (cos_a * wx + sin_a * wy) / 2.0
+            v = (-sin_a * wx + cos_a * wy) / 2.0
 
-            center_local_x = (new_right + new_left) / 2.0
-            center_local_y = (new_top + new_bottom) / 2.0
-            cx_new = center[0] + cos_a * center_local_x - sin_a * center_local_y
-            cy_new = center[1] + sin_a * center_local_x + cos_a * center_local_y
+            new_a = a0 if abs(cos_p) < freeze else max(u / cos_p, min_size)
+            new_b = b0 if abs(sin_p) < freeze else max(v / sin_p, min_size)
+
+            # Centre that keeps the anchor pinned on the resized ellipse.
+            cx_new = anchor_x + cos_a * (new_a * cos_p) - sin_a * (new_b * sin_p)
+            cy_new = anchor_y + sin_a * (new_a * cos_p) + cos_a * (new_b * sin_p)
 
             self.selected_region.center = (cx_new, cy_new)
-            self.selected_region.width = new_width
-            self.selected_region.height = new_height
+            self.selected_region.width = max(2.0 * new_a, min_size)
+            self.selected_region.height = max(2.0 * new_b, min_size)
             self.selected_region.set_angle(angle)
             self.selected_region.update_visual()
             self._request_overlay_redraw()

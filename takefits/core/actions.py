@@ -1,4 +1,5 @@
 import inspect
+import importlib
 from dataclasses import dataclass, field
 from typing import Callable, Any, Dict, List, Optional, get_type_hints
 
@@ -92,8 +93,20 @@ class ActionRegistry:
 
 # --- Action Implementation & Registration ---
 
-from takefits.core import usecases
 from takefits.core.app_state import AppState
+
+
+def _usecases():
+    return importlib.import_module("takefits.core.usecases")
+
+
+def _usecase_handler(name: str) -> Callable[..., Any]:
+    def handler(**kwargs):
+        return getattr(_usecases(), name)(**kwargs)
+
+    handler.__name__ = name
+    handler._lazy_usecase_name = name  # type: ignore[attr-defined]
+    return handler
 
 
 def _build_threshold_mask(state: AppState, threshold: float, condition: str) -> np.ndarray:
@@ -129,7 +142,7 @@ def _export_mask_from_threshold(
     nan_for_mask: bool = False,
 ) -> str:
     mask = _build_threshold_mask(state, threshold, condition)
-    return usecases.export_mask_fits(
+    return _usecases().export_mask_fits(
         state,
         mask,
         output_path,
@@ -142,7 +155,7 @@ def _export_mask_from_threshold(
 
 
 def _apply_regrid(state: AppState, params: Dict[str, Any]) -> AppState:
-    result = usecases.compute_regrid(state, params)
+    result = _usecases().compute_regrid(state, params)
     state.data = result.data
     state.header = result.header
     state.wcs = result.wcs
@@ -159,6 +172,13 @@ def _export_pv_from_result(
     y1: Optional[float] = None,
     is_swapped: bool = False,
     history_entries: Optional[List[str]] = None,
+    position_origin: str = "start",
+    path_type: str = "straight",
+    path_length_px: Optional[float] = None,
+    x_axis_mode: str = "position",
+    phi_start_deg: Optional[float] = None,
+    phi_end_deg: Optional[float] = None,
+    position_unit: str = "deg",
 ) -> str:
     if x0 is None:
         x0 = getattr(state, "pv_x0", None)
@@ -169,8 +189,10 @@ def _export_pv_from_result(
     if y1 is None:
         y1 = getattr(state, "pv_y1", None)
     if any(value is None for value in (x0, y0, x1, y1)):
-        raise ValueError("PV export requires slice endpoints or a prior compute_pv action.")
-    return usecases.export_pv_fits(
+        if path_length_px is None:
+            raise ValueError("PV export requires slice endpoints or a prior compute_pv action.")
+        x0 = y0 = x1 = y1 = 0.0
+    return _usecases().export_pv_fits(
         state,
         result,
         output_path,
@@ -180,6 +202,13 @@ def _export_pv_from_result(
         y1=float(y1),
         is_swapped=is_swapped,
         history_entries=history_entries,
+        position_origin=position_origin,
+        path_type=path_type,
+        path_length_px=path_length_px,
+        x_axis_mode=x_axis_mode,
+        phi_start_deg=phi_start_deg,
+        phi_end_deg=phi_end_deg,
+        position_unit=position_unit,
     )
 
 
@@ -189,7 +218,7 @@ def _apply_baseline_subtraction_with_result(
     order: int = 1,
     reference_pixel: Optional[List[float]] = None,
 ):
-    result = usecases.compute_polynomial_baseline_subtraction(
+    result = _usecases().compute_polynomial_baseline_subtraction(
         state,
         world_ranges=world_ranges,
         order=order,
@@ -219,7 +248,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="load_fits",
         description="Load a FITS file.",
-        handler=usecases.load_fits_data,
+        handler=_usecase_handler("load_fits_data"),
         params_schema={
             "type": "object",
             "properties": {
@@ -235,7 +264,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="set_slice",
         description="Set the current Z/S slice indices.",
-        handler=usecases.set_slice,
+        handler=_usecase_handler("set_slice"),
         params_schema={
             "type": "object",
             "properties": {
@@ -250,7 +279,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="set_cursor",
         description="Set the current cursor position (pixel coordinates).",
-        handler=usecases.set_cursor,
+        handler=_usecase_handler("set_cursor"),
         params_schema={
             "type": "object",
             "properties": {
@@ -267,7 +296,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="compute_moment",
         description="Calculate a moment map.",
-        handler=usecases.compute_moment,
+        handler=_usecase_handler("compute_moment"),
         params_schema={
             "type": "object",
             "properties": {
@@ -295,16 +324,30 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="compute_pv",
         description="Compute a PV diagram.",
-        handler=usecases.compute_pv,
+        handler=_usecase_handler("compute_pv"),
         params_schema={
             "type": "object",
             "properties": {
                 "x0": {"type": "number"}, "y0": {"type": "number"},
                 "x1": {"type": "number"}, "y1": {"type": "number"},
                 "width": {"type": "number"},
-                "num_samples": {"type": "integer"}
+                "num_samples": {"type": "integer"},
+                "sample_spacing_pix": {"type": "number"},
+                "weight_mode": {"type": "integer"},
+                "path_type": {"type": "string", "enum": ["straight", "polyline", "ellipse", "ellipse_arc"]},
+                "center": {"type": "array", "items": {"type": "number"}, "minItems": 2},
+                "semi_major_px": {"type": "number"},
+                "semi_minor_px": {"type": "number"},
+                "pa_rad": {"type": "number"},
+                "start_phi_rad": {"type": "number"},
+                "end_phi_rad": {"type": "number"},
+                "vertices": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2}},
+                "vertices_world": {"type": "array", "items": {"type": "array", "minItems": 2}},
+                "spline_type": {"type": "string", "enum": ["none", "catmull_rom", "bspline"], "description": "Polyline curve: 'catmull_rom' curves through the nodes, 'bspline' approximates (smooths) them, 'none' keeps straight segments."},
+                "smoothness": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Spline roundness 0..1 for a curve spline_type (1=full curve, 0=straight)."},
+                "sample_axis": {"type": "string", "enum": ["position", "phi"]}
             },
-            "required": ["x0", "y0", "x1", "y1"]
+            "required": []
         }
     )
 
@@ -321,6 +364,13 @@ def register_default_actions(registry: ActionRegistry):
                 "x1": {"type": "number"}, "y1": {"type": "number"},
                 "is_swapped": {"type": "boolean"},
                 "history_entries": {"type": "array", "items": {"type": "string"}},
+                "position_origin": {"type": "string", "enum": ["start", "center"]},
+                "path_type": {"type": "string", "enum": ["straight", "polyline", "ellipse", "ellipse_arc"]},
+                "path_length_px": {"type": "number"},
+                "x_axis_mode": {"type": "string", "enum": ["position", "phi"]},
+                "phi_start_deg": {"type": "number"},
+                "phi_end_deg": {"type": "number"},
+                "position_unit": {"type": "string", "enum": ["pixel", "pix", "arcsec", "arcmin", "deg"]},
             },
             "required": ["output_path"]
         }
@@ -329,7 +379,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_spectrum",
         description="Export spectrum to text file.",
-        handler=usecases.export_spectrum,
+        handler=_usecase_handler("export_spectrum"),
         params_schema={
             "type": "object",
             "properties": {
@@ -345,7 +395,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_figure",
         description="Export a matplotlib figure to file.",
-        handler=usecases.export_figure,
+        handler=_usecase_handler("export_figure"),
          params_schema={
             "type": "object",
             "properties": {
@@ -360,7 +410,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_data_fits",
         description="Export the current data cube to FITS.",
-        handler=usecases.export_data_fits,
+        handler=_usecase_handler("export_data_fits"),
         params_schema={
             "type": "object",
             "properties": {
@@ -392,7 +442,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="get_spectrum",
         description="Get spectrum at a specific pixel coordinate.",
-        handler=usecases.get_spectrum,
+        handler=_usecase_handler("get_spectrum"),
         params_schema={
             "type": "object",
             "properties": {
@@ -409,7 +459,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="set_color_settings",
         description="Update color/display settings for a view plane.",
-        handler=usecases.set_color_settings,
+        handler=_usecase_handler("set_color_settings"),
         params_schema={
             "type": "object",
             "properties": {
@@ -429,7 +479,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="set_view_range",
         description="Set view range for a plane (pixel coordinates).",
-        handler=usecases.set_view_range,
+        handler=_usecase_handler("set_view_range"),
         params_schema={
             "type": "object",
             "properties": {
@@ -445,7 +495,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="apply_smoothing",
         description="Apply smoothing to the data.",
-        handler=usecases.apply_smoothing,
+        handler=_usecase_handler("apply_smoothing"),
         params_schema={
             "type": "object",
             "properties": {
@@ -461,7 +511,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="apply_smoothing_to_resolution",
         description="Apply Gaussian smoothing to target beam resolution.",
-        handler=usecases.apply_smoothing_to_resolution,
+        handler=_usecase_handler("apply_smoothing_to_resolution"),
         params_schema={
             "type": "object",
             "properties": {
@@ -480,7 +530,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="apply_scaling",
         description="Multiply the current cube by a scalar factor.",
-        handler=usecases.apply_scaling,
+        handler=_usecase_handler("apply_scaling"),
         params_schema={
             "type": "object",
             "properties": {
@@ -526,7 +576,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_baseline_model_fits",
         description="Export the most recent baseline model to FITS.",
-        handler=usecases.export_baseline_model_fits,
+        handler=_usecase_handler("export_baseline_model_fits"),
         params_schema={
             "type": "object",
             "properties": {
@@ -541,7 +591,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="apply_mask_threshold",
         description="Apply threshold mask to data.",
-        handler=usecases.apply_mask_threshold,
+        handler=_usecase_handler("apply_mask_threshold"),
         params_schema={
             "type": "object",
             "properties": {
@@ -555,7 +605,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="apply_mask_external",
         description="Apply external FITS mask to data.",
-        handler=usecases.apply_mask_external,
+        handler=_usecase_handler("apply_mask_external"),
         params_schema={
             "type": "object",
             "properties": {
@@ -569,7 +619,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="apply_mask_moment_recipe",
         description="Apply automatic moment-analysis mask recipe to data.",
-        handler=usecases.apply_mask_moment_recipe,
+        handler=_usecase_handler("apply_mask_moment_recipe"),
         params_schema={
             "type": "object",
             "properties": {
@@ -616,7 +666,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="run_clumpfind",
         description="Run ClumpFind algorithm.",
-        handler=usecases.run_clumpfind,
+        handler=_usecase_handler("run_clumpfind"),
         params_schema={
             "type": "object",
             "properties": {
@@ -632,7 +682,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="run_fellwalker",
         description="Run FellWalker (watershed) algorithm.",
-        handler=usecases.run_fellwalker,
+        handler=_usecase_handler("run_fellwalker"),
         params_schema={
             "type": "object",
             "properties": {
@@ -648,7 +698,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="run_dendrogram",
         description="Run Dendrogram algorithm.",
-        handler=usecases.run_dendrogram,
+        handler=_usecase_handler("run_dendrogram"),
         params_schema={
             "type": "object",
             "properties": {
@@ -666,7 +716,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_clump_mask",
         description="Export clump mask to FITS.",
-        handler=usecases.export_clump_mask,
+        handler=_usecase_handler("export_clump_mask"),
         params_schema={
             "type": "object",
             "properties": {
@@ -680,7 +730,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_clump_catalog",
         description="Export clump catalog to CSV or FITS.",
-        handler=usecases.export_clump_catalog,
+        handler=_usecase_handler("export_clump_catalog"),
         params_schema={
             "type": "object",
             "properties": {
@@ -697,7 +747,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="compute_cutout",
         description="Extract a cutout from the data cube.",
-        handler=usecases.compute_cutout,
+        handler=_usecase_handler("compute_cutout"),
         params_schema={
             "type": "object",
             "properties": {
@@ -729,7 +779,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_cutout_fits",
         description="Export cutout result to FITS file.",
-        handler=usecases.export_cutout_fits,
+        handler=_usecase_handler("export_cutout_fits"),
         params_schema={
             "type": "object",
             "properties": {
@@ -745,7 +795,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="compute_arithmetic",
         description="Perform arithmetic operation on data arrays.",
-        handler=usecases.apply_arithmetic,
+        handler=_usecase_handler("apply_arithmetic"),
         params_schema={
             "type": "object",
             "properties": {
@@ -766,7 +816,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="compute_channel_map",
         description="Generate channel map images from a data cube.",
-        handler=usecases.compute_channel_map,
+        handler=_usecase_handler("compute_channel_map"),
         params_schema={
             "type": "object",
             "properties": {
@@ -802,7 +852,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="convert_intensity_unit",
         description="Convert intensity units (Jy/beam, K, Jy/pixel).",
-        handler=usecases.apply_unit_conversion,
+        handler=_usecase_handler("apply_unit_conversion"),
         params_schema={
             "type": "object",
             "properties": {
@@ -831,7 +881,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_moment_image",
         description="Compute and export moment map as PNG image.",
-        handler=usecases.export_moment_image,
+        handler=_usecase_handler("export_moment_image"),
         params_schema={
             "type": "object",
             "properties": {
@@ -853,7 +903,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_moment_fits",
         description="Compute and export moment map as FITS file.",
-        handler=usecases.export_moment_map_fits,
+        handler=_usecase_handler("export_moment_map_fits"),
         params_schema={
             "type": "object",
             "properties": {
@@ -887,7 +937,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="export_channel_map_image",
         description="Compute and export channel map grid as PNG image.",
-        handler=usecases.export_channel_map_image,
+        handler=_usecase_handler("export_channel_map_image"),
         params_schema={
             "type": "object",
             "properties": {
@@ -908,7 +958,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="set_regions",
         description="Replace the current region list (small snapshot).",
-        handler=usecases.set_regions,
+        handler=_usecase_handler("set_regions"),
         params_schema={
             "type": "object",
             "properties": {
@@ -925,14 +975,14 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="clear_regions",
         description="Remove all regions from state.",
-        handler=usecases.clear_regions,
+        handler=_usecase_handler("clear_regions"),
         params_schema={"type": "object", "properties": {}, "required": []},
     )
 
     registry.register(
         name="add_region",
         description="Add a single region to state.",
-        handler=usecases.add_region,
+        handler=_usecase_handler("add_region"),
         params_schema={
             "type": "object",
             "properties": {
@@ -945,7 +995,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="update_region",
         description="Update an existing region in state.",
-        handler=usecases.update_region,
+        handler=_usecase_handler("update_region"),
         params_schema={
             "type": "object",
             "properties": {
@@ -959,7 +1009,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="delete_region",
         description="Delete an existing region from state.",
-        handler=usecases.delete_region,
+        handler=_usecase_handler("delete_region"),
         params_schema={
             "type": "object",
             "properties": {
@@ -972,7 +1022,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="set_markers",
         description="Replace the current marker list (small snapshot).",
-        handler=usecases.set_markers,
+        handler=_usecase_handler("set_markers"),
         params_schema={
             "type": "object",
             "properties": {
@@ -989,14 +1039,14 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="clear_markers",
         description="Remove all markers from state.",
-        handler=usecases.clear_markers,
+        handler=_usecase_handler("clear_markers"),
         params_schema={"type": "object", "properties": {}, "required": []},
     )
 
     registry.register(
         name="add_marker",
         description="Add a single marker to state (upsert by id).",
-        handler=usecases.add_marker,
+        handler=_usecase_handler("add_marker"),
         params_schema={
             "type": "object",
             "properties": {
@@ -1009,7 +1059,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="update_marker",
         description="Update an existing marker in state.",
-        handler=usecases.update_marker,
+        handler=_usecase_handler("update_marker"),
         params_schema={
             "type": "object",
             "properties": {
@@ -1023,7 +1073,7 @@ def register_default_actions(registry: ActionRegistry):
     registry.register(
         name="delete_marker",
         description="Delete an existing marker from state.",
-        handler=usecases.delete_marker,
+        handler=_usecase_handler("delete_marker"),
         params_schema={
             "type": "object",
             "properties": {

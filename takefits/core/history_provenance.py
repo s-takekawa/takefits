@@ -1,6 +1,7 @@
 """Common FITS HISTORY helpers for human-readable provenance lines."""
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional
@@ -58,7 +59,14 @@ _ACTION_PARAM_KEYS: Dict[str, List[str]] = {
     "compute_regrid": ["mode", "target_system", "template_path", "interpolation"],
     "compute_moment": ["moment_type", "axis", "clip_threshold", "pixel_range", "world_range"],
     "export_moment_fits": ["moment_type", "axis", "pixel_range", "world_range"],
-    "compute_pv": ["x0", "y0", "x1", "y1", "start_world", "end_world", "width", "weight_mode"],
+    "compute_pv": [
+        "x0", "y0", "x1", "y1", "start_world", "end_world", "width",
+        "sample_spacing_pix", "weight_mode", "position_origin", "position_unit", "path_type",
+        "center", "center_pix", "center_world", "semi_major_px", "semi_minor_px",
+        "pa_rad", "pa_deg", "start_phi_rad", "end_phi_rad", "phi0_deg", "phi1_deg",
+        "vertices", "vertices_world", "spline_type", "smoothness",
+        "x_axis_mode", "sample_axis",
+    ],
     "compute_cutout": ["pixel_bounds", "world_bounds"],
     "compute_channel_map": ["axis", "start_channel", "channel_width", "num_channels"],
     "run_clumpfind": ["rms", "min_threshold_sigma", "step_sigma", "min_pixels"],
@@ -324,6 +332,54 @@ def _resolve_pv_endpoint_values(
         return "?", "?", "?", "?", world0[0], world0[1], world1[0], world1[1]
 
 
+def _coerce_point_pair(value: Any) -> Optional[tuple[Any, Any]]:
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return value[0], value[1]
+    return None
+
+
+def _format_deg_param(
+    params: Dict[str, Any],
+    *,
+    deg_key: str,
+    rad_key: str,
+) -> Optional[Any]:
+    if params.get(deg_key) is not None:
+        return params.get(deg_key)
+    value = params.get(rad_key)
+    if value is None:
+        return None
+    try:
+        return f"{math.degrees(float(value)):.6g}"
+    except Exception:
+        return None
+
+
+def _append_polyline_vertices_history(
+    lines: List[str],
+    params: Dict[str, Any],
+    *,
+    pv_world_labels: str,
+) -> None:
+    vertices = params.get("vertices")
+    if isinstance(vertices, (list, tuple)) and vertices:
+        lines.append(f"Polyline Vertices (pix): {len(vertices)}")
+        for index, vertex in enumerate(vertices, start=1):
+            point = _coerce_point_pair(vertex)
+            if point is not None:
+                lines.append(f"Polyline Vertex {index} (pix): ({point[0]}, {point[1]})")
+
+    vertices_world = params.get("vertices_world")
+    if isinstance(vertices_world, (list, tuple)) and vertices_world:
+        lines.append(f"Polyline Vertices (world {pv_world_labels}): {len(vertices_world)}")
+        for index, vertex in enumerate(vertices_world, start=1):
+            point = _coerce_point_pair(vertex)
+            if point is not None:
+                lines.append(
+                    f"Polyline Vertex {index} (world {pv_world_labels}): ({point[0]}, {point[1]})"
+                )
+
+
 def _build_verbose_history(action_name: str, params: Dict[str, Any], timestamp: Optional[str], target: Any) -> List[str]:
     """Build verbose history lines matching the historical GUI output formats."""
     lines: List[str] = []
@@ -475,36 +531,92 @@ def _build_verbose_history(action_name: str, params: Dict[str, Any], timestamp: 
     elif action_name == "compute_pv":
         lines.append(f"PV Diagram created by takefits on {time_str}")
         lines.append(f"Source file: {filename}")
-        x0, y0, x1, y1, w0x, w0y, w1x, w1y = _resolve_pv_endpoint_values(params, target)
         pv_world_labels = _pv_world_axis_labels(target)
-        lines.append(f"Slice Start (pix): ({x0}, {y0})")
-        lines.append(f"Slice End (pix): ({x1}, {y1})")
-        if None not in (w0x, w0y, w1x, w1y):
-            lines.append(f"Slice Start (world {pv_world_labels}): ({w0x}, {w0y})")
-            lines.append(f"Slice End (world {pv_world_labels}): ({w1x}, {w1y})")
-        else:
-            # Emit world-coordinate endpoints if WCS is available on target
-            wcs = getattr(target, "wcs", None)
-            if wcs is not None:
+        path_type = str(params.get("path_type") or "straight").strip().lower()
+        if path_type in ("ellipse", "ellipse_arc"):
+            lines.append("Path Type: ellipse arc" if path_type == "ellipse_arc" else "Path Type: ellipse")
+            center_pix = params.get("center_pix") or params.get("center")
+            if isinstance(center_pix, (list, tuple)) and len(center_pix) >= 2:
+                lines.append(f"Ellipse Center (pix): ({center_pix[0]}, {center_pix[1]})")
+            center_world = params.get("center_world")
+            if isinstance(center_world, (list, tuple)) and len(center_world) >= 2:
+                lines.append(f"Ellipse Center (world {pv_world_labels}): ({center_world[0]}, {center_world[1]})")
+            for key, label in (
+                ("semi_major_px", "Ellipse Semi-major (pix)"),
+                ("semi_minor_px", "Ellipse Semi-minor (pix)"),
+            ):
+                value = params.get(key)
+                if value is not None:
+                    lines.append(f"{label}: {value}")
+            for value, label in (
+                (_format_deg_param(params, deg_key="pa_deg", rad_key="pa_rad"), "Ellipse PA (deg)"),
+                (_format_deg_param(params, deg_key="phi0_deg", rad_key="start_phi_rad"), "Ellipse Phi0 (deg)"),
+                (_format_deg_param(params, deg_key="phi1_deg", rad_key="end_phi_rad"), "Ellipse Phi1 (deg)"),
+            ):
+                if value is not None:
+                    lines.append(f"{label}: {value}")
+        elif path_type == "polyline":
+            spline_type = str(params.get("spline_type") or "none").strip().lower()
+            # Backward-compatible alias for the original boolean flag.
+            if spline_type in ("", "none") and params.get("smooth"):
+                spline_type = "catmull_rom"
+            spline_labels = {"catmull_rom": "catmull-rom", "bspline": "b-spline"}
+            if spline_type in spline_labels:
                 try:
-                    _x0 = float(x0) if x0 != "?" else None
-                    _y0 = float(y0) if y0 != "?" else None
-                    _x1 = float(x1) if x1 != "?" else None
-                    _y1 = float(y1) if y1 != "?" else None
-                    if None not in (_x0, _y0, _x1, _y1):
-                        npad = max(0, wcs.naxis - 2)
-                        w0 = wcs.wcs_pix2world([[_x0, _y0] + [0] * npad], 0)[0]
-                        w1 = wcs.wcs_pix2world([[_x1, _y1] + [0] * npad], 0)[0]
-                        lines.append(f"Slice Start (world {pv_world_labels}): ({w0[0]}, {w0[1]})")
-                        lines.append(f"Slice End (world {pv_world_labels}): ({w1[0]}, {w1[1]})")
-                except Exception:
-                    pass
+                    pct = int(round(float(params.get("smoothness", 1.0)) * 100))
+                except (TypeError, ValueError):
+                    pct = 100
+                lines.append(
+                    f"Path Type: polyline (spline: {spline_labels[spline_type]}, smoothness {pct}%)"
+                )
+            else:
+                lines.append("Path Type: polyline")
+            _append_polyline_vertices_history(lines, params, pv_world_labels=pv_world_labels)
+        else:
+            x0, y0, x1, y1, w0x, w0y, w1x, w1y = _resolve_pv_endpoint_values(params, target)
+            lines.append(f"Slice Start (pix): ({x0}, {y0})")
+            lines.append(f"Slice End (pix): ({x1}, {y1})")
+            if None not in (w0x, w0y, w1x, w1y):
+                lines.append(f"Slice Start (world {pv_world_labels}): ({w0x}, {w0y})")
+                lines.append(f"Slice End (world {pv_world_labels}): ({w1x}, {w1y})")
+            else:
+                # Emit world-coordinate endpoints if WCS is available on target
+                wcs = getattr(target, "wcs", None)
+                if wcs is not None:
+                    try:
+                        _x0 = float(x0) if x0 != "?" else None
+                        _y0 = float(y0) if y0 != "?" else None
+                        _x1 = float(x1) if x1 != "?" else None
+                        _y1 = float(y1) if y1 != "?" else None
+                        if None not in (_x0, _y0, _x1, _y1):
+                            npad = max(0, wcs.naxis - 2)
+                            w0 = wcs.wcs_pix2world([[_x0, _y0] + [0] * npad], 0)[0]
+                            w1 = wcs.wcs_pix2world([[_x1, _y1] + [0] * npad], 0)[0]
+                            lines.append(f"Slice Start (world {pv_world_labels}): ({w0[0]}, {w0[1]})")
+                            lines.append(f"Slice End (world {pv_world_labels}): ({w1[0]}, {w1[1]})")
+                    except Exception:
+                        pass
         width = params.get("width", 0)
         if width:
             lines.append(f"Slice Width (pix): {width}")
+        sample_spacing = params.get("sample_spacing_pix")
+        if sample_spacing is not None:
+            lines.append(f"Sample Spacing (pix): {sample_spacing}")
+        sample_axis = params.get("sample_axis")
+        if sample_axis is not None:
+            lines.append(f"Sample Axis: {sample_axis}")
         wm = params.get("weight_mode", 0)
         interp = "Gaussian" if wm == 1 else "Bilinear"
         lines.append(f"Interpolation Mode: {interp}")
+        position_origin = str(params.get("position_origin") or "start").strip().lower()
+        if position_origin in ("center", "centre", "middle"):
+            lines.append("Position Origin: center")
+        position_unit = params.get("position_unit")
+        if position_unit is not None:
+            lines.append(f"Position Unit: {position_unit}")
+        x_axis_mode = params.get("x_axis_mode")
+        if x_axis_mode is not None:
+            lines.append(f"X Axis Mode: {x_axis_mode}")
 
     elif action_name in ("run_clumpfind", "run_fellwalker", "run_dendrogram"):
         algo_map = {

@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import sys
+import tempfile
 import warnings
 from types import SimpleNamespace
 
@@ -71,11 +72,38 @@ def _configure_macos_bundle_name() -> None:
         pass
 
 
+def _configure_matplotlib_cache_dir() -> None:
+    if os.environ.get("MPLCONFIGDIR"):
+        return
+
+    candidates = []
+    try:
+        from takefits.app_paths import ensure_app_config_dir
+
+        candidates.append(os.fspath(ensure_app_config_dir() / "matplotlib"))
+    except Exception:
+        pass
+    candidates.append(os.path.join(tempfile.gettempdir(), "takefits-mplconfig"))
+
+    for cache_dir in candidates:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            probe_path = os.path.join(cache_dir, ".write-test")
+            with open(probe_path, "w", encoding="utf-8") as handle:
+                handle.write("")
+            os.remove(probe_path)
+            os.environ.setdefault("MPLCONFIGDIR", cache_dir)
+            return
+        except Exception:
+            continue
+
+
 def _load_gui_runtime():
     _configure_macos_bundle_name()
 
     from PySide6.QtCore import QEvent, QObject, QSettings, QThread, QTimer, Qt
     from PySide6.QtWidgets import QApplication, QFileDialog, QAbstractItemView
+    _configure_matplotlib_cache_dir()
     import matplotlib as mpl
     import matplotlib.style as mplstyle
     from astropy.io.fits.verify import VerifyWarning

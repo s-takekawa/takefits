@@ -1,10 +1,66 @@
 from astrodendro import Dendrogram, pp_catalog, ppv_catalog
 from astropy import units as u
 from astropy.table import Column, Table
+import math
 import numpy as np
+import os
 import warnings
 
+from takefits.logic.progress import OperationCancelled, ProgressReporter
+
 _ASTRODENDRO_BOOL_PATCHED = False
+_SCIMES_RAM_FRACTION = 0.35
+_SCIMES_FALLBACK_BYTES = 4 * 1024 ** 3
+
+
+def _detect_total_ram_bytes() -> int | None:
+    """Best-effort total physical RAM in bytes, or None if undetectable."""
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return int(pages) * int(page_size)
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2
+        )
+        value = int(out.stdout.strip())
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return None
+
+
+def _format_bytes(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
+def _scimes_memory_limit_bytes() -> int:
+    total_ram = _detect_total_ram_bytes()
+    if total_ram:
+        return int(total_ram * _SCIMES_RAM_FRACTION)
+    return _SCIMES_FALLBACK_BYTES
+
+
+def _scimes_bytes_per_leaf_pair(criteria_count: int, locscaling: bool = False) -> int:
+    """Return estimated working bytes needed per dense SCIMES leaf pair."""
+    n_criteria = max(1, int(criteria_count))
+    bytes_per_cell = np.dtype(np.intp).itemsize
+    bytes_per_cell += (n_criteria + 1) * np.dtype(np.float64).itemsize
+    bytes_per_cell += 3 * np.dtype(np.float64).itemsize
+    if locscaling:
+        bytes_per_cell += 2 * np.dtype(np.float64).itemsize
+    return int(bytes_per_cell)
 
 
 def _patch_astrodendro_quantity_truthiness():
@@ -52,16 +108,117 @@ class DendroHandler:
     def scimes_unavailable_reason():
         """Return why SCIMES cannot run, or an empty string when available."""
         try:
-            from takefits.logic.scimes.scimes import _require_sklearn
-            _require_sklearn()
+            from sklearn.metrics import silhouette_score  # noqa: F401
+            from sklearn.manifold import spectral_embedding  # noqa: F401
+            from sklearn.cluster import k_means  # noqa: F401
             return ""
-        except ImportError as exc:
-            return str(exc)
+        except Exception as exc:
+            return f"scikit-learn is required for SCIMES spectral clustering: {exc}"
 
     @staticmethod
     def is_scimes_available():
         """Check if SCIMES module is available."""
         return DendroHandler.scimes_unavailable_reason() == ""
+
+    @staticmethod
+    def estimate_scimes_working_bytes(
+        leaf_count: int,
+        criteria_count: int,
+        locscaling: bool = False,
+    ) -> int:
+        """Estimate SCIMES' N x N affinity-matrix working set."""
+        n_leaves = max(0, int(leaf_count))
+        n_criteria = max(1, int(criteria_count))
+        matrix_cells = n_leaves * n_leaves
+
+        # aff_matrix allocates one int index matrix plus one float64 matrix per
+        # criterion and one extra S/N matrix.  The clustering phase also keeps an
+        # aggregate affinity matrix, a current smoothed matrix, and reduced/copy
+        # matrices.  This is intentionally conservative: the goal is to refuse
+        # before the OS starts paging or kills the GUI.
+        return int(
+            matrix_cells
+            * _scimes_bytes_per_leaf_pair(n_criteria, locscaling=locscaling)
+        )
+
+    @staticmethod
+    def max_scimes_leaf_count(
+        criteria_count: int,
+        locscaling: bool = False,
+        memory_limit_bytes: int | None = None,
+    ) -> int:
+        """Return the largest leaf count expected to fit in the SCIMES budget."""
+        limit = (
+            _scimes_memory_limit_bytes()
+            if memory_limit_bytes is None
+            else int(memory_limit_bytes)
+        )
+        if limit <= 0:
+            return 0
+        bytes_per_pair = _scimes_bytes_per_leaf_pair(
+            criteria_count, locscaling=locscaling
+        )
+        if bytes_per_pair <= 0:
+            return 0
+        return int(math.isqrt(limit // bytes_per_pair))
+
+    @staticmethod
+    def scimes_memory_unavailable_reason(
+        leaf_count: int,
+        criteria_count: int,
+        locscaling: bool = False,
+    ) -> str:
+        """Return an actionable message if SCIMES would exceed its RAM budget."""
+        needed = DendroHandler.estimate_scimes_working_bytes(
+            leaf_count, criteria_count, locscaling=locscaling
+        )
+        limit = _scimes_memory_limit_bytes()
+        if needed <= limit:
+            return ""
+        max_leaves = DendroHandler.max_scimes_leaf_count(
+            criteria_count, locscaling=locscaling, memory_limit_bytes=limit
+        )
+        single_matrix_bytes = (
+            max(0, int(leaf_count))
+            * max(0, int(leaf_count))
+            * np.dtype(np.float64).itemsize
+        )
+        parts = [
+            (
+                "SCIMES was not started because its dense leaf-pair affinity "
+                "matrices would need "
+                f"about {_format_bytes(needed)} for {leaf_count:,} leaves and "
+                f"{criteria_count} criteria (limit {_format_bytes(limit)})."
+            ),
+            (
+                f"One {leaf_count:,} x {leaf_count:,} float64 matrix is "
+                f"{_format_bytes(single_matrix_bytes)}; memory grows with "
+                "leaves^2, not FITS file size."
+            ),
+            (
+                "With the current safety budget, reduce the dendrogram to "
+                f"about {max_leaves:,} leaves or fewer for these criteria."
+            ),
+        ]
+        if criteria_count > 1:
+            one_criterion_needed = DendroHandler.estimate_scimes_working_bytes(
+                leaf_count, 1, locscaling=locscaling
+            )
+            one_criterion_max = DendroHandler.max_scimes_leaf_count(
+                1, locscaling=locscaling, memory_limit_bytes=limit
+            )
+            parts.append(
+                "Using one criterion would need "
+                f"about {_format_bytes(one_criterion_needed)} for this leaf "
+                f"count and would allow about {one_criterion_max:,} leaves."
+            )
+        parts.append(
+            "Try a higher Min Value/Min Delta, larger Min Pixels, fewer "
+            "criteria, or crop/downsample the cube first."
+        )
+        return (
+            " ".join(parts)
+        )
 
     def __init__(self, data, wcs=None, header=None):
         self.data = data
@@ -174,20 +331,37 @@ class DendroHandler:
 
         return cat if cat is not None else Table()
 
-    def run_dendrogram(self, min_value, min_delta, min_npix):
+    def run_dendrogram(self, min_value, min_delta, min_npix, reporter=None):
         """
         Run astrodendro.
+
+        astrodendro's ``compute`` is a single uninterruptible call, so the most
+        we can do for responsiveness is run it on a worker thread (the caller's
+        job) and surface a busy/indeterminate state around it.  We still honour
+        cancellation at the boundaries before and after the heavy call.
         """
+        reporter = reporter or ProgressReporter()
+        reporter.check_cancel()
+        reporter.update(None, "Computing dendrogram (this can take a while)...")
         try:
             self.d = Dendrogram.compute(self.data, min_value=min_value, min_delta=min_delta, min_npix=min_npix, wcs=self.wcs, verbose=True)
             self.leaves = self.d.leaves
             self.catalog_cache = None
+            reporter.update(None, f"Dendrogram: {len(self.leaves)} leaves found.")
             return len(self.leaves)
+        except OperationCancelled:
+            raise
+        except MemoryError as exc:
+            # Bubble up an actionable message instead of silently returning 0,
+            # which previously masked out-of-memory failures as "0 clumps".
+            raise MemoryError(
+                "Dendrogram computation ran out of memory. Try a higher "
+                "Min Value, fewer channels, or a downsampled cube."
+            ) from exc
         except Exception as e:
-            print(f"Dendrogram Error: {e}")
-            return 0
+            raise RuntimeError(f"Dendrogram computation failed: {e}") from e
 
-    def run_scimes(self, save_isol_leaves=True, criteria=None, criteria_weights=None, rms=np.nan, s2nlim=3, locscaling=False, user_k=0):
+    def run_scimes(self, save_isol_leaves=True, criteria=None, criteria_weights=None, rms=np.nan, s2nlim=3, locscaling=False, user_k=0, reporter=None):
         """
         Run SCIMES on top of the dendrogram.
         save_isol_leaves: If True, include isolated leaves in the results.
@@ -201,7 +375,9 @@ class DendroHandler:
         if self.d is None:
             return False, "Run Dendrogram first."
 
+        reporter = reporter or ProgressReporter()
         try:
+            reporter.update(None, "SCIMES: preparing catalog...")
             structure_count = len(self.d)
             leaf_count = len(self.leaves)
             if structure_count == 0 or leaf_count == 0:
@@ -214,6 +390,19 @@ class DendroHandler:
                 self.clusters = list(self.leaves)
                 return True, f"Only {leaf_count} dendrogram leaves found; each leaf was kept as its own cluster."
 
+            # Default criteria if not provided
+            if criteria is None or len(criteria) == 0:
+                if self.data.ndim == 3:
+                    criteria = ['volume', 'luminosity']
+                else:
+                    criteria = ['area_exact', 'luminosity']
+
+            memory_reason = self.scimes_memory_unavailable_reason(
+                leaf_count, len(criteria), locscaling=locscaling
+            )
+            if memory_reason:
+                return False, memory_reason
+
             unavailable_reason = self.scimes_unavailable_reason()
             if unavailable_reason:
                 return False, unavailable_reason
@@ -221,13 +410,6 @@ class DendroHandler:
             _patch_astrodendro_quantity_truthiness()
             # Import SCIMES from the bundled location
             from takefits.logic.scimes import SpectralCloudstering
-
-            # Default criteria if not provided
-            if criteria is None or len(criteria) == 0:
-                if self.data.ndim == 3:
-                    criteria = ['volume', 'luminosity']
-                else:
-                    criteria = ['area_exact', 'luminosity']
 
             # Generate catalog
             # Use cached catalog if available to speed up re-runs with different SCIMES params
@@ -260,6 +442,7 @@ class DendroHandler:
                 from astropy.io import fits
                 header_to_use = fits.Header()
 
+            reporter.update(None, "SCIMES: spectral clustering...")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=UserWarning)
                 warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -285,7 +468,10 @@ class DendroHandler:
 
             # We can also get a mask of clusters
             # mask_cube = dclust.get_clusters_mask() # This might be new scimes version dependent
+            reporter.update(None, f"SCIMES: {len(self.clusters)} clusters.")
             return True, f"Found {len(self.clusters)} clusters (Isolated included: {save_isol_leaves})."
+        except OperationCancelled:
+            raise
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -297,9 +483,9 @@ class DendroHandler:
         mode: 'leaves' (default dendro leaves) or 'clusters' (scimes clusters)
         """
         if self.d is None:
-            return np.zeros_like(self.data, dtype=int)
+            return np.zeros_like(self.data, dtype=np.int32)
 
-        mask = np.zeros_like(self.data, dtype=int)
+        mask = np.zeros_like(self.data, dtype=np.int32)
 
         target_structures = []
         if mode == 'leaves':
@@ -342,9 +528,14 @@ class DendroHandler:
 
         return mask
 
-    def get_catalog(self, mode='leaves'):
+    def get_catalog(self, mode='leaves', mask=None, reporter=None):
         """
         Generate a catalog using standardized logic.
+
+        ``mask`` may be passed in to avoid rebuilding it (the caller usually
+        already has it), and ``reporter`` surfaces per-label progress.  Bounding
+        boxes are computed once via ``find_objects`` so each label is scanned
+        only within its box instead of over the whole cube.
         """
         if self.d is None:
             return []
@@ -358,15 +549,23 @@ class DendroHandler:
             target_structures = self.d.trunk
         # For 'all', we don't need a linear list for lookup if we use idx directly
 
+        from scipy.ndimage import find_objects
         from takefits.logic.cloud_catalog_utils import calculate_moments_and_props
 
-        mask = self.get_mask(mode=mode)
+        if mask is None:
+            mask = self.get_mask(mode=mode)
         labels = np.unique(mask)
         labels = labels[labels > 0]
 
+        slices = find_objects(mask)
+        n_slices = len(slices)
+
         catalog = []
-        for l in labels:
-            props = calculate_moments_and_props(self.data, mask, l, self.wcs)
+        total = len(labels)
+        for n, l in enumerate(labels):
+            l = int(l)
+            obj_slice = slices[l - 1] if 0 < l <= n_slices else None
+            props = calculate_moments_and_props(self.data, mask, l, self.wcs, obj_slice=obj_slice)
 
             if props:
                 # Identify the structure to add extra metadata (dendro_idx)
@@ -388,10 +587,11 @@ class DendroHandler:
                      # Maybe add level or is_leaf info?
                      props['is_leaf'] = struct.is_leaf
                      props['is_branch'] = should_be_branch = not struct.is_leaf
-                
+
                 catalog.append(props)
 
-        return catalog
+            if reporter is not None and (n % 32 == 0 or n == total - 1):
+                reporter.update(None, f"Building catalog {n + 1}/{total}...")
 
         return catalog
 

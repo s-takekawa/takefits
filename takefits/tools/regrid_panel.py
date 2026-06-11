@@ -294,6 +294,12 @@ class RegridPanel(QWidget):
 
         layout.addStretch(1)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setFixedHeight(0)
+        layout.addWidget(self.progress_bar)
+
         self.run_button = QPushButton("Run Regrid")
         self.run_button.clicked.connect(self._trigger_regrid)
         self.run_button.setDefault(True)
@@ -304,12 +310,6 @@ class RegridPanel(QWidget):
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.activated.connect(self._trigger_regrid)
             self._shortcuts.append(shortcut)
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setFixedHeight(0)
-        layout.addWidget(self.progress_bar)
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -648,6 +648,8 @@ class RegridPanel(QWidget):
             self.run_button.setEnabled(False)
         if self.progress_bar:
             self.progress_bar.setFixedHeight(max(8, self.progress_bar.sizeHint().height()))
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("Starting regrid...")
             self.progress_bar.setValue(0)
             self.progress_bar.setVisible(True)
 
@@ -657,6 +659,8 @@ class RegridPanel(QWidget):
             self.run_button.setEnabled(True)
         if self.progress_bar:
             self.progress_bar.setVisible(False)
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setFormat("%p%")
             self.progress_bar.setFixedHeight(0)
             if not success:
                 self.progress_bar.setValue(0)
@@ -665,8 +669,82 @@ class RegridPanel(QWidget):
         if self.progress_bar:
             if not self.progress_bar.isVisible():
                 self.progress_bar.setFixedHeight(max(8, self.progress_bar.sizeHint().height()))
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 100)
+            if value < 30:
+                self.progress_bar.setFormat("%p% Preparing grid")
+            elif value < 90:
+                self.progress_bar.setFormat("%p% Processing planes")
+            else:
+                self.progress_bar.setFormat("%p% Finalizing")
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(value)
+
+    # ------------------------------------------------------------------
+    # Workspace persistence (settings only; never auto-opens the panel).
+    def export_workspace_state(self) -> dict:
+        """Return restorable panel settings.
+
+        Only dataset-independent choices are persisted (interpolation, active
+        tab, template path, target system).  The manual-grid per-axis values are
+        intentionally omitted: they are derived from the loaded cube's WCS and
+        must be re-derived for each dataset, so restoring them across cubes could
+        be invalid.
+        """
+        state: Dict = {"schema": 1}
+        try:
+            state["tab_index"] = int(self.tab_widget.currentIndex())
+        except Exception:
+            pass
+        if self.interpolation_combo is not None:
+            state["interpolation"] = self.interpolation_combo.currentText()
+        if self.template_path_edit is not None:
+            state["template_path"] = self.template_path_edit.text().strip()
+        if self.target_system_combo is not None and self.target_system_combo.count():
+            data = self.target_system_combo.currentData()
+            state["target_system"] = data if data is not None else self.target_system_combo.currentText()
+        return state
+
+    def restore_workspace_state(self, state) -> bool:
+        """Apply previously saved settings.
+
+        Every field is guarded, so a workspace captured on a different dataset
+        can never leave the panel in an invalid state.
+        """
+        if not isinstance(state, dict):
+            return False
+
+        interpolation = state.get("interpolation")
+        if interpolation and self.interpolation_combo is not None:
+            idx = self.interpolation_combo.findText(str(interpolation))
+            if idx >= 0:
+                self.interpolation_combo.setCurrentIndex(idx)
+
+        template_path = state.get("template_path")
+        if template_path and self.template_path_edit is not None:
+            self.template_path_edit.setText(str(template_path))
+
+        target_system = state.get("target_system")
+        if target_system is not None and self.target_system_combo is not None:
+            idx = self.target_system_combo.findData(target_system)
+            if idx < 0:
+                idx = self.target_system_combo.findText(str(target_system))
+            if idx >= 0:
+                self.target_system_combo.setCurrentIndex(idx)
+
+        tab_index = state.get("tab_index")
+        if tab_index is not None:
+            try:
+                tab_index = int(tab_index)
+            except (TypeError, ValueError):
+                tab_index = None
+            if (
+                tab_index is not None
+                and 0 <= tab_index < self.tab_widget.count()
+                and self.tab_widget.isTabEnabled(tab_index)
+            ):
+                self.tab_widget.setCurrentIndex(tab_index)
+        return True
 
     # ------------------------------------------------------------------
     def closeEvent(self, event):

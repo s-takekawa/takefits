@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.logic.data_tools import format_nbytes
+from takefits.logic.progress import CancellationToken, ProgressReporter
 from .utils import update_datamin_datamax_if_present
+
+_CLUMP_MASK_RAM_FRACTION = 0.25
+_CLUMP_MASK_FALLBACK_BYTES = 2 * 1024 ** 3
 
 
 @dataclass
@@ -20,12 +26,125 @@ class ClumpResult:
     parameters: Dict[str, Any]
 
 
+def _detect_total_ram_bytes() -> int | None:
+    """Best-effort total physical RAM in bytes."""
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return int(pages) * int(page_size)
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2
+        )
+        value = int(out.stdout.strip())
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return None
+
+
+def _clump_mask_memory_limit_bytes() -> int:
+    total_ram = _detect_total_ram_bytes()
+    if total_ram:
+        return int(total_ram * _CLUMP_MASK_RAM_FRACTION)
+    return _CLUMP_MASK_FALLBACK_BYTES
+
+
+def _estimate_label_mask_nbytes(data) -> int | None:
+    shape = getattr(data, "shape", None)
+    if not shape:
+        return None
+    count = 1
+    try:
+        for dim in shape:
+            count *= int(dim)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return int(count) * np.dtype(np.int32).itemsize
+
+
+def _ensure_label_mask_memory_budget(data, algorithm: str) -> None:
+    """Refuse clump finding when the required result mask cannot fit in RAM."""
+    needed = _estimate_label_mask_nbytes(data)
+    if needed is None:
+        return
+    limit = _clump_mask_memory_limit_bytes()
+    if needed <= limit:
+        return
+
+    shape = tuple(int(axis) for axis in getattr(data, "shape", ()) or ())
+    pixel_count = needed // np.dtype(np.int32).itemsize
+    raise MemoryError(
+        f"{algorithm} cannot safely run on this cube because the result label "
+        f"mask would require {format_nbytes(needed)} "
+        f"({pixel_count:,} pixels, shape={shape}) and the current safety limit "
+        f"is {format_nbytes(limit)}. Use Tools > Cutout, fewer channels, or "
+        "smaller spatial bounds before running clump finding."
+    )
+
+
+def _source_data_for_mask(state: AppState, mask: np.ndarray) -> Optional[np.ndarray]:
+    """Return the source data array corresponding to a label mask, if known."""
+    data = state.data
+    if data is None:
+        return None
+
+    mask_shape = getattr(mask, "shape", None)
+    if getattr(data, "shape", None) == mask_shape:
+        return data
+
+    if getattr(data, "ndim", None) == 4:
+        try:
+            current_s = int(getattr(state, "current_s", 0))
+        except (TypeError, ValueError):
+            current_s = 0
+        current_s = max(0, min(current_s, data.shape[0] - 1))
+        candidate = data[current_s]
+        if candidate.shape == mask_shape:
+            return candidate
+
+    return None
+
+
+def _clump_mask_data_for_export(state: AppState, mask: np.ndarray) -> np.ndarray:
+    """Build FITS data for a clump mask, preserving source NaN pixels."""
+    mask_array = np.asarray(mask)
+    source_data = _source_data_for_mask(state, mask_array)
+    if source_data is None:
+        return mask_array.astype(np.int32)
+
+    if np.ma.isMaskedArray(source_data):
+        source_values = source_data.filled(np.nan)
+    else:
+        source_values = np.asarray(source_data)
+
+    try:
+        source_nan = np.isnan(source_values)
+    except TypeError:
+        return mask_array.astype(np.int32)
+
+    if not np.any(source_nan):
+        return mask_array.astype(np.int32)
+
+    export_data = mask_array.astype(np.float32)
+    export_data[source_nan] = np.nan
+    return export_data
+
+
 def run_clumpfind(
     state: AppState,
     rms: float,
     min_threshold_sigma: float = 3.0,
     step_sigma: float = 2.0,
-    min_pixels: int = 10
+    min_pixels: int = 10,
+    progress_callback: Optional[Callable[[Optional[int], Optional[str]], None]] = None,
+    cancel_token: Optional[CancellationToken] = None,
 ) -> ClumpResult:
     """
     Run ClumpFind algorithm on state data.
@@ -45,16 +164,21 @@ def run_clumpfind(
     if state.data is None:
         raise ValueError("No data loaded")
 
+    reporter = ProgressReporter(progress_callback, cancel_token)
+
     data = state.data
     if data.ndim == 4:
         data = data[state.current_s]
+    _ensure_label_mask_memory_budget(data, "ClumpFind")
 
     min_val = rms * min_threshold_sigma
     step = rms * step_sigma
 
     finder = ClumpFind(data, wcs=state.wcs)
-    mask = finder.run(min_val=min_val, step=step, min_pix=min_pixels)
+    mask = finder.run(min_val=min_val, step=step, min_pix=min_pixels, reporter=reporter)
+    reporter.update(96, "Building catalog...")
     catalog = finder.get_catalog()
+    reporter.update(100, "Done.")
 
     n_clumps = len(np.unique(mask)) - 1  # Exclude 0 (background)
     if n_clumps < 0:
@@ -81,7 +205,9 @@ def run_fellwalker(
     rms: float,
     min_threshold_sigma: float = 3.0,
     min_dip_sigma: float = 2.0,
-    min_pixels: int = 10
+    min_pixels: int = 10,
+    progress_callback: Optional[Callable[[Optional[int], Optional[str]], None]] = None,
+    cancel_token: Optional[CancellationToken] = None,
 ) -> ClumpResult:
     """
     Run FellWalker (watershed-based) algorithm.
@@ -101,16 +227,21 @@ def run_fellwalker(
     if state.data is None:
         raise ValueError("No data loaded")
 
+    reporter = ProgressReporter(progress_callback, cancel_token)
+
     data = state.data
     if data.ndim == 4:
         data = data[state.current_s]
+    _ensure_label_mask_memory_budget(data, "FellWalker")
 
     min_val = rms * min_threshold_sigma
     min_dip = rms * min_dip_sigma
 
     walker = FellWalker(data, wcs=state.wcs)
-    mask = walker.run(min_val=min_val, min_dip=min_dip, min_pix=min_pixels)
+    mask = walker.run(min_val=min_val, min_dip=min_dip, min_pix=min_pixels, reporter=reporter)
+    reporter.update(96, "Building catalog...")
     catalog = walker.get_catalog()
+    reporter.update(100, "Done.")
 
     n_clumps = len(np.unique(mask)) - 1  # Exclude 0 (background)
     if n_clumps < 0:
@@ -142,7 +273,9 @@ def run_dendrogram(
     use_scimes: bool = False,
     scimes_criteria: Optional[list] = None,
     scimes_user_k: int = 0,
-    scimes_save_isol: bool = True
+    scimes_save_isol: bool = True,
+    progress_callback: Optional[Callable[[Optional[int], Optional[str]], None]] = None,
+    cancel_token: Optional[CancellationToken] = None,
 ) -> ClumpResult:
     """
     Run Dendrogram algorithm (optionally with SCIMES clustering).
@@ -167,29 +300,38 @@ def run_dendrogram(
     if state.data is None:
         raise ValueError("No data loaded")
 
+    reporter = ProgressReporter(progress_callback, cancel_token)
+
     data = state.data
     if data.ndim == 4:
         data = data[state.current_s]
+    _ensure_label_mask_memory_budget(data, "Dendrogram")
 
     min_value = rms * min_value_sigma
     min_delta = rms * min_delta_sigma
 
     # Pass header to handler!
     handler = DendroHandler(data, wcs=state.wcs, header=state.header)
-    handler.run_dendrogram(min_value=min_value, min_delta=min_delta, min_npix=min_npix)
+    handler.run_dendrogram(min_value=min_value, min_delta=min_delta, min_npix=min_npix, reporter=reporter)
 
     if use_scimes and scimes_criteria:
         ok, message = handler.run_scimes(
             criteria=scimes_criteria,
             user_k=scimes_user_k,
             rms=rms,
-            save_isol_leaves=scimes_save_isol
+            save_isol_leaves=scimes_save_isol,
+            reporter=reporter,
         )
         if not ok:
             raise ValueError(f"SCIMES failed: {message}")
 
+    reporter.update(None, "Building label mask...")
     mask = handler.get_mask(mode=output_mode)
-    catalog = handler.get_catalog()
+    reporter.update(None, "Building catalog...")
+    # Reuse the mask we just built and match the catalog to the displayed mode
+    # (the catalog previously defaulted to 'leaves' regardless of output_mode).
+    catalog = handler.get_catalog(mode=output_mode, mask=mask, reporter=reporter)
+    reporter.update(100, "Done.")
 
     n_clumps = len(np.unique(mask)) - 1  # Exclude 0 (background)
     if n_clumps < 0:
@@ -251,7 +393,7 @@ def generate_catalog(state: AppState, mask: np.ndarray) -> List[Dict[str, Any]]:
     Returns:
         List of property dictionaries (one per clump)
     """
-    from takefits.logic.cloud_catalog_utils import calculate_moments_and_props
+    from takefits.logic.cloud_catalog_utils import build_catalog
 
     if state.data is None:
         raise ValueError("No data loaded")
@@ -264,16 +406,7 @@ def generate_catalog(state: AppState, mask: np.ndarray) -> List[Dict[str, Any]]:
     if mask.shape != data.shape:
         raise ValueError(f"Mask shape {mask.shape} does not match data shape {data.shape}")
 
-    labels = np.unique(mask)
-    labels = labels[labels > 0]
-
-    catalog = []
-    for l in labels:
-        props = calculate_moments_and_props(data, mask, l, wcs=state.wcs)
-        if props:
-            catalog.append(props)
-
-    return catalog
+    return build_catalog(data, mask, wcs=state.wcs)
 
 
 def export_clump_mask(
@@ -318,10 +451,11 @@ def export_clump_mask(
         for entry in history_entries:
             header.add_history(entry)
 
-    update_datamin_datamax_if_present(header, result.mask)
+    export_data = _clump_mask_data_for_export(state, result.mask)
+    update_datamin_datamax_if_present(header, export_data)
 
     # Write file
-    hdu = fits.PrimaryHDU(data=result.mask.astype(np.int32), header=header)
+    hdu = fits.PrimaryHDU(data=export_data, header=header)
     hdu.writeto(output_path, overwrite=True)
 
     return output_path
