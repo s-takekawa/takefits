@@ -33,7 +33,6 @@ from takefits.core.usecases import (
 )
 
 class SpecWindow(QWidget):
-    is_on = False
     channel_changed = pyqtSignal(int)
 
     
@@ -378,8 +377,6 @@ class SpecWindow(QWidget):
         #Set label
         self.ax.set_xlabel(f"{self.fits_viewer.displaymap.third_axis_label}")
         self.ax.set_ylabel(f"Intensity [{self.fits_viewer.bunit}]", labelpad=10)
-    
-        SpecWindow.is_on = True
 
         self.setWindowTitle(f'Spec Panel: {self.fits_viewer.filename}')
 
@@ -1566,12 +1563,6 @@ class SpecWindow(QWidget):
 
         else:
              return None, "Application state not initialized"
-
-    def closeEvent(self, event):
-        SpecWindow.is_on = False
-        super().closeEvent(event)
-
-
 
 class SpecNavigationToolbar(NavigationToolbar):
     def __init__(self, canvas, parent=None):

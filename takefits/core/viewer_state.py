@@ -10,7 +10,7 @@ from weakref import ref as weakref
 
 class ViewerState:
     """
-    Encapsulates all per-plane state that was previously stored in Common.
+    Encapsulates all per-plane state for a viewer.
     Each FITSViewer/SubWindow owns one ViewerState instance.
     """
 

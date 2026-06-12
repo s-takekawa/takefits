@@ -1536,9 +1536,6 @@ class ChannelMapWindow(QMainWindow):
 
 
 
-        #Common.update_ch_colorbar(self.colorbar)
-        #Common.update_ch_cax(self.cax)
-
         ColorSettingsPanel.apply_colorbar_settings(cax = self.cax, colorbar = self.colorbar, config=self.config)
         self._set_colorbar_zorder()
         
@@ -2871,7 +2868,6 @@ class ChannelMapWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._flush_pending_annotation_commits()
-        #self.remove_colorbar()
         #self.toolbar._subplot_dialog = None
         self._unregister_contour_layer()
         if self.color_settings_panel is not None:

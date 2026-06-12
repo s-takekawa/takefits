@@ -75,7 +75,7 @@ Extract spectra from a single pixel or calculate the average spectrum within sel
 
 Generate publication-quality figures directly from the GUI.
 
-- **Contours**: Overlay customizable contours with adjustable levels.
+- **Contours**: Overlay customizable contours with adjustable levels. Contours can also be loaded from another FITS file with a live preview; the dialog shows data range/rms, lets you generate linear Min/Max/Steps levels or edit the Levels field directly, and aligns the resulting contours through the source WCS so images on different grids can be compared without regridding. Double-click an imported overlay in the contour panel to re-edit its levels.
 - **Markers**: Annotate images with symbols, lines, and text.
 - **Beam Size**: Visualize the HPBW ellipse.
 - **Vector Export**: Save plots in PDF, EPS, or SVG formats.

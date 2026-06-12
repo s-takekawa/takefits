@@ -13,13 +13,6 @@ from takefits.core.wcs_frames import (
 
 
 class MenuBar:
-    _instance = None 
-    @staticmethod
-    def get_instance(parent):
-        if MenuBar._instance is None:
-            MenuBar._instance = MenuBar(parent)
-        return MenuBar._instance
-
     def __init__(self, parent):
         self.parent = parent
         self.make_menu()

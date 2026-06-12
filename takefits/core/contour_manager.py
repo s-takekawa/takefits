@@ -10,6 +10,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TY
 import numpy as np
 import matplotlib.cm as cm
 import matplotlib.colors as mcolors
+from matplotlib.artist import Artist as MplArtist
 from matplotlib.collections import LineCollection
 from PySide6.QtCore import QObject, Signal as pyqtSignal
 
@@ -130,6 +131,18 @@ def _ds9_keyword_from_frame(frame_name: Optional[str]) -> Optional[str]:
     }.get(name)
 
 
+def contour_set_artists(contour_set) -> List[object]:
+    """Return the artists belonging to a ContourSet across Matplotlib versions.
+
+    Matplotlib >= 3.8 makes the ContourSet itself a single artist
+    (``.collections`` was removed in 3.10); older versions expose one
+    collection per level.
+    """
+    if isinstance(contour_set, MplArtist):
+        return [contour_set]
+    return list(getattr(contour_set, "collections", []) or [])
+
+
 def _pixel_coords_to_world(pixels: np.ndarray, wcs: Optional[object]) -> Optional[np.ndarray]:
     if wcs is None:
         return None
@@ -228,6 +241,9 @@ class ContourState:
     # Optional source world coordinate frame for saved world coords (e.g., 'ICRS', 'FK5', 'GALACTIC').
     world_frame: Optional[str] = None
     overlay_id: Optional[str] = None
+    # Optional provenance for re-editable overlays (e.g., external-FITS source
+    # path and level settings). Must stay JSON-serializable.
+    source_meta: Optional[Dict[str, object]] = None
 
 
 @dataclass
@@ -475,46 +491,6 @@ class ContourLayer:
             except Exception:
                 pass
 
-    @staticmethod
-    def _extract_path_polylines(path: Path) -> List[np.ndarray]:
-        if path is None:
-            return []
-        verts = getattr(path, "vertices", None)
-        if verts is None or len(verts) == 0:
-            return []
-        codes = getattr(path, "codes", None)
-        if codes is None:
-            try:
-                polygons = path.to_polygons(closed_only=False)
-            except Exception:
-                polygons = None
-            if not polygons:
-                polygons = [verts]
-            return [np.asarray(poly, dtype=float) for poly in polygons if np.asarray(poly, dtype=float).size]
-
-        polylines: List[np.ndarray] = []
-        current: List[np.ndarray] = []
-        for vertex, code in zip(verts, codes):
-            if code == Path.MOVETO:
-                if len(current) >= 2:
-                    polylines.append(np.asarray(current, dtype=float))
-                current = [np.asarray(vertex, dtype=float)]
-            elif code == Path.LINETO:
-                current.append(np.asarray(vertex, dtype=float))
-            elif code == Path.CLOSEPOLY:
-                if current:
-                    current.append(np.asarray(current[0], dtype=float))
-                    if len(current) >= 2:
-                        polylines.append(np.asarray(current, dtype=float))
-                current = []
-            else:
-                if len(current) >= 2:
-                    polylines.append(np.asarray(current, dtype=float))
-                current = []
-        if len(current) >= 2:
-            polylines.append(np.asarray(current, dtype=float))
-        return polylines
-
     def _split_polyline(
         self,
         pixels: np.ndarray,
@@ -690,6 +666,7 @@ class ContourLayer:
             levels=list(state.levels),
             items=canonical_items,
             world_frame=derived_world_frame,
+            source_meta=copy.deepcopy(state.source_meta) if state.source_meta else None,
         )
         if state.overlay_id:
             canonical_state.overlay_id = state.overlay_id
@@ -1026,7 +1003,6 @@ class ContourLayer:
                 state = getattr(owner, 'state', None)
                 
                 # 1. Collect standard artists (lines, labels)
-                # Prefer viewer state, fall back to Common
                 if state is not None:
                     if state.vline: hidden_artists.append(state.vline)
                     if state.hline: hidden_artists.append(state.hline)
@@ -1144,18 +1120,11 @@ class ContourLayer:
                         **contour_kwargs,
                     )
 
-                    for coll in contour.collections:
+                    # Negative levels are drawn dashed by Matplotlib itself for
+                    # monochrome contours (contour.negative_linestyle rcParam).
+                    for coll in contour_set_artists(contour):
                         drawn_artists.append(coll)
                         self._mark_contour_artist_for_export(coll)
-                        
-                        try:
-                            level = coll.get_array()[0]
-                            if level < 0:
-                                coll.set_linestyle("dashed")
-                            else:
-                                coll.set_linestyle("solid")
-                        except Exception:
-                            pass
 
                     new_gen_artists.extend(drawn_artists)
                     new_last_contour_sets[item.label] = contour
@@ -1232,63 +1201,69 @@ class ContourLayer:
             segments = ContourItemState(item_label=item_label)
             wcs = getattr(target_item.ax, "wcs", None)
 
-            for level, collection in zip(contour.levels, contour.collections):
+            frame_name = _frame_name_from_wcs(wcs) if wcs is not None else None
+            if state_world_frame is None and frame_name is not None:
+                state_world_frame = frame_name
+
+            # allsegs gives per-level polyline vertex arrays on both old and
+            # new Matplotlib (ContourSet.collections was removed in 3.10).
+            contour_levels = getattr(contour, "levels", None)
+            contour_levels = [] if contour_levels is None else list(contour_levels)
+            allsegs = getattr(contour, "allsegs", None)
+            allsegs = [] if allsegs is None else list(allsegs)
+            for level, level_segs in zip(contour_levels, allsegs):
                 linestyle = "solid"
                 if level < 0:
                     linestyle = "dashed"
-                
-                collection_color = None
-                try:
-                    colors_arr = collection.get_colors()
-                    if colors_arr is not None and len(colors_arr):
-                        collection_color = np.asarray(colors_arr[0], dtype=float)
-                except Exception:
-                    collection_color = None
 
-                if collection_color is None and use_cmap and level_norm is not None:
+                collection_color = None
+                if use_cmap and level_norm is not None:
                     try:
                         collection_color = np.asarray(
                             cmap(level_norm(level)), dtype=float
                         )
                     except Exception:
                         collection_color = None
+                else:
+                    try:
+                        base_color = params.color or "white"
+                        if base_color.lower() == "original":
+                            base_color = "white"
+                        collection_color = np.asarray(
+                            mcolors.to_rgba(base_color), dtype=float
+                        )
+                    except Exception:
+                        collection_color = None
 
-                frame_name = _frame_name_from_wcs(wcs) if wcs is not None else None
-                if state_world_frame is None and frame_name is not None:
-                    state_world_frame = frame_name
-
-                for path in collection.get_paths():
-                    polylines = self._extract_path_polylines(path)
-                    for poly_arr in polylines:
-                        if poly_arr.size == 0 or poly_arr.ndim != 2:
-                            continue
-                        pixels = np.asarray(poly_arr, dtype=float)
-                        finite_mask = np.isfinite(pixels).all(axis=1)
-                        if np.count_nonzero(finite_mask) < 2:
-                            continue
-                        pixels = pixels[finite_mask]
-                        world = _pixel_coords_to_world(pixels, wcs)
-                        for pix_chunk, world_chunk in self._split_polyline(pixels, world):
-                            if world_chunk is None and wcs is not None:
-                                world_chunk = _pixel_coords_to_world(pix_chunk, wcs)
-                            if frame_name is not None and state_world_frame is None:
-                                state_world_frame = frame_name
-                            color_copy = None
-                            if collection_color is not None:
-                                try:
-                                    color_copy = np.asarray(collection_color, dtype=float).copy()
-                                except Exception:
-                                    color_copy = collection_color
-                            segments.segments.append(
-                                ContourSegment(
-                                    level=float(level),
-                                    world=world_chunk,
-                                    pixels=pix_chunk,
-                                    color=color_copy,
-                                    original_color=color_copy.copy() if color_copy is not None else None,
-                                    linestyle=linestyle,
-                                )
+                for poly_arr in level_segs:
+                    poly_arr = np.asarray(poly_arr, dtype=float)
+                    if poly_arr.size == 0 or poly_arr.ndim != 2:
+                        continue
+                    pixels = poly_arr
+                    finite_mask = np.isfinite(pixels).all(axis=1)
+                    if np.count_nonzero(finite_mask) < 2:
+                        continue
+                    pixels = pixels[finite_mask]
+                    world = _pixel_coords_to_world(pixels, wcs)
+                    for pix_chunk, world_chunk in self._split_polyline(pixels, world):
+                        if world_chunk is None and wcs is not None:
+                            world_chunk = _pixel_coords_to_world(pix_chunk, wcs)
+                        color_copy = None
+                        if collection_color is not None:
+                            try:
+                                color_copy = np.asarray(collection_color, dtype=float).copy()
+                            except Exception:
+                                color_copy = collection_color
+                        segments.segments.append(
+                            ContourSegment(
+                                level=float(level),
+                                world=world_chunk,
+                                pixels=pix_chunk,
+                                color=color_copy,
+                                original_color=color_copy.copy() if color_copy is not None else None,
+                                linestyle=linestyle,
                             )
+                        )
             
             if segments.segments:
                 segments_per_item.append(segments)
@@ -1662,6 +1637,8 @@ def serialize_state_to_json(state: ContourState) -> str:
         ],
         "world_frame": state.world_frame,
     }
+    if state.source_meta is not None:
+        payload["source_meta"] = state.source_meta
     return json.dumps(payload, indent=2)
 
 
@@ -1697,6 +1674,7 @@ def deserialize_state_from_json(data: str) -> ContourState:
             )
             item_state.segments.append(segment)
         items.append(item_state)
+    source_meta = payload.get("source_meta")
     return ContourState(
         layer_id=payload.get("layer_id", ""),
         plane=payload.get("plane"),
@@ -1705,6 +1683,7 @@ def deserialize_state_from_json(data: str) -> ContourState:
         levels=payload.get("levels", []),
         items=items,
         world_frame=payload.get("world_frame"),
+        source_meta=source_meta if isinstance(source_meta, dict) else None,
     )
 
 

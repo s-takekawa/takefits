@@ -5,6 +5,8 @@ from PySide6.QtCore import QTimer
 class SubWindow(FITSViewer):
     def __init__(self, plane, windowtitle, parent):
         self.main_viewer = parent
+        # Preset before super().__init__() so FITSViewer keeps this value.
+        self.main_window = parent
         # Share one marker manager across main/sub windows so placement/drag
         # state is consistent regardless of which window is clicked.
         self.marker_manager = parent.marker_manager

@@ -1985,12 +1985,14 @@ class ClumpFindingPanel(QWidget):
 
     def _cleanup_expired_artists(self, artists):
         """Cleanup old artists."""
+        from takefits.core.contour_manager import contour_set_artists
+
         for cs in artists:
-            try:
-                for coll in cs.collections:
-                    coll.remove()
-            except Exception:
-                pass
+            for artist in contour_set_artists(cs):
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
         # Trigger redraw to clear artifacts
         for viewer in self._plane_windows():
             if viewer.canvas:

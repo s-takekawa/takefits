@@ -10,9 +10,7 @@ from PySide6.QtCore import QObject, Signal as pyqtSignal
 
 class CoordinateState(QObject):
     """
-    Manages shared coordinate state across all viewer planes.
-
-    This replaces the coordinate-related class attributes in Common:
+    Manages shared coordinate state across all viewer planes:
     - xpix, ypix, zpix (pixel coordinates)
     - world_x, world_y, world_z (world coordinates as floats)
     - world_x_str, world_y_str, world_z_str (formatted strings)

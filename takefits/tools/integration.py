@@ -1600,14 +1600,10 @@ class IntegResultWindow(QMainWindow):
         self.cax.set_gid('colorbar')
         self.cax.set_zorder(300)
 
-        #Common.update_integ_cax(self.cax)
         self.colorbar = self.fig.colorbar(self.im, cax = self.cax, orientation = config.get('colorbar_orientation') )
         self.colorbar.ax.set_zorder(300)
-        #Common.update_integ_colorbar(self.colorbar)
         self.colorbar.ax.minorticks_on()
         ColorSettingsPanel.apply_colorbar_settings(cax = self.cax, colorbar = self.colorbar, config=config)
-        
-        self.destroyed.connect(self.remove_colorbar)
 
         self.toolbar = MyNavigationToolbar(self.canvas, self, self.plane, self.ax, color_mode = ColorMode.INTEG, default_image_name = self.fits_viewer.filename)
         self.canvas.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
@@ -2593,11 +2589,6 @@ class IntegResultWindow(QMainWindow):
         self._blit_colorbar_foreground(force=False)
 
 
-    def remove_colorbar(self):
-        #Common.remove_integ_colorbar(self.colorbar)
-        #Common.remove_integ_cax(self.cax)
-        pass
-
     def _seed_color_panel_settings_from_current_image(self):
         settings = {
             "min_val": None,
@@ -3516,7 +3507,6 @@ class IntegResultWindow(QMainWindow):
                 self.cutout_dialog = None
 
         # Cleanup canvas and figure
-        self.remove_colorbar()
         if self.canvas is not None:
             self.canvas.close()
             self.canvas = None

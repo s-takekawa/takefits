@@ -107,7 +107,7 @@ class MainWindow(FITSViewer):
         
         self.filename = os.path.basename(filename)
 
-        self.menu_bar = MenuBar.get_instance(self) #Make menubar
+        self.menu_bar = MenuBar(self) #Make menubar
     
         self.region_mode_enabled = False
         self.region_shape = None
@@ -171,7 +171,7 @@ class MainWindow(FITSViewer):
             self.integ_button.clicked.connect(lambda: self._open_control_panel_tool("open_integ_settings"))
             self.spec_button.clicked.connect(lambda: self._open_control_panel_tool("open_spec_window"))
         
-        FITSViewer.main_window = self
+        self.main_window = self
 
         # Create ViewerCoordinator and register all viewers
         self.coordinator = ViewerCoordinator(self)
@@ -6718,9 +6718,6 @@ class MainWindow(FITSViewer):
             self.data = state.data
             self.header = state.header
             self.wcs = state.wcs
-            FITSViewer.data = state.data
-            FITSViewer.header = state.header
-            FITSViewer.wcs = state.wcs
 
             viewers = [self] + list(getattr(self, "subwindows", []))
             for viewer in viewers:

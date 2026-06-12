@@ -213,18 +213,10 @@ class ChannelSlider(QSlider):
 class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
     position_updated = pyqtSignal(float, float, float)
     coordinate_updated = pyqtSignal(float, float, float)
-    data = None
-    header = None
-    wcs = None
-    instance_initialized = False
-    wcs_check_initialized = False
-    velocity_unit_converted = False
-    main_window = None  # Class-level reference to the main window (set by MainWindow)
 
-    @classmethod
-    def get_viewer_by_plane(cls, plane):
+    def get_viewer_by_plane(self, plane):
         """Return the FITSViewer instance for the given plane ('xy', 'xz', or 'zy')."""
-        main = cls.main_window
+        main = self.main_window
         if main is None:
             return None
         if plane == 'xy':
@@ -239,6 +231,10 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self.data = data
         self.header = header
         self.wcs = wcs
+        if not hasattr(self, 'main_window'):
+            # MainWindow sets this to itself after initUI; SubWindow presets it
+            # to its parent main window before calling super().__init__().
+            self.main_window = None
         self.spectral_metadata = spectral_metadata if isinstance(spectral_metadata, dict) else {}
         self.spectral_metadata.setdefault("is_cartesian_interpretation", False)
         self.region_manager = RegionManager(self)
@@ -260,37 +256,27 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.SubWindow = SubWindow_control()
         except ImportError:
             self.SubWindow = None
-        if not FITSViewer.instance_initialized:
-            if data is not None and header is not None:
-                FITSViewer.data = data
-                FITSViewer.header = header
-                FITSViewer.instance_initialized = True
-                try: 
-                    FITSViewer.wcs = WCS(header) if wcs is None else wcs
-                except Exception as e:
-                    print(f"WCS initialization error: {e}")
-                    print("\033[1;33mWarning: Interpret as a simple Cartesian coordinate system.\033[0m")
-                    self.spectral_metadata["is_cartesian_interpretation"] = True
-                    for axis in ['CTYPE1', 'CTYPE2']:
-                        axis_value = header[axis].split('-')[0]
-                        coord_keys = ['VELO', 'VRAD', 'VOPT', 'GLON', 'GLAT', 'RA', 'DEC']
-                        if axis_value in coord_keys:
-                            replacement = axis_value
-                        else:
-                            replacement = 'X' if axis == 'CTYPE1' else 'Y'
-                        print(f'{axis}: {header[axis]} ==> {replacement}')
-                        header[axis] = replacement
-                    FITSViewer.wcs = WCS(header)
-                self.data = data
-                self.header = header
-                self.wcs = FITSViewer.wcs if wcs is None else wcs
-        else:
-            self.data = FITSViewer.data
-            self.header = FITSViewer.header
-            self.wcs = FITSViewer.wcs if FITSViewer.wcs is not None else WCS(self.header)
+        if self.wcs is None and header is not None:
+            try:
+                self.wcs = WCS(header)
+            except Exception as e:
+                print(f"WCS initialization error: {e}")
+                print("\033[1;33mWarning: Interpret as a simple Cartesian coordinate system.\033[0m")
+                self.spectral_metadata["is_cartesian_interpretation"] = True
+                for axis in ['CTYPE1', 'CTYPE2']:
+                    axis_value = header[axis].split('-')[0]
+                    coord_keys = ['VELO', 'VRAD', 'VOPT', 'GLON', 'GLAT', 'RA', 'DEC']
+                    if axis_value in coord_keys:
+                        replacement = axis_value
+                    else:
+                        replacement = 'X' if axis == 'CTYPE1' else 'Y'
+                    print(f'{axis}: {header[axis]} ==> {replacement}')
+                    header[axis] = replacement
+                self.wcs = WCS(header)
         
-        #velocity unit conversion [Note: Subject to change in the future.]    
+        #velocity unit conversion [Note: Subject to change in the future.]
         spectral_meta = self.spectral_metadata
+        self.velocity_unit_converted = bool(spectral_meta.get('velocity_unit_adjusted', False))
         axis_index = spectral_meta.get('axis_index')
         if axis_index is None and self.wcs.wcs.naxis >= 3:
             axis_index = 3
@@ -326,10 +312,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                     spectral_meta['current_axis_unit'] = 'km/s'
                     spectral_meta['current_axis_type'] = 'velocity'
                     spectral_meta['current_axis_ctype'] = self.header.get(f'CTYPE{axis_index}', spectral_meta.get('current_axis_ctype'))
-
-                    if not FITSViewer.wcs_check_initialized:
-                        FITSViewer.velocity_unit_converted = True
-                        FITSViewer.wcs_check_initialized = True
+                    self.velocity_unit_converted = True
             else:
                 if spectral_meta.get('current_axis_unit') is None:
                     current_unit = self.header.get(f'CUNIT{axis_index}', '')
@@ -3678,7 +3661,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                             if xy_im:
                                 self._set_plane_image_for_index('xy', j)
                             if self._get_clicked('xz') and xy_slider:
-                                self._sync_channel_controls(FITSViewer.main_window, j)
+                                self._sync_channel_controls(self.main_window, j)
                             self._set_shared_zpix(j)
                     else:
                         if xy_needs_refresh and xy_im:
@@ -3729,7 +3712,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         zy_canvas.blit(zy_overlay.bbox)
 
                 # Redraw main window overlay
-                main = FITSViewer.main_window
+                main = self.main_window
                 if main:
                     if update_slices and xy_needs_refresh:
                         main_updated = self._update_slice_image(main, fast_blit=fast_blit)
@@ -3820,7 +3803,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                             if xy_im:
                                 self._set_plane_image_for_index('xy', i)
                             if self._get_clicked('zy') and xy_slider:
-                                self._sync_channel_controls(FITSViewer.main_window, i)
+                                self._sync_channel_controls(self.main_window, i)
                             self._set_shared_zpix(i)
                     else:
                         if xy_needs_refresh and xy_im:
@@ -3893,7 +3876,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         xz_canvas.blit(xz_overlay.bbox)
 
                 # Redraw main window overlay
-                main = FITSViewer.main_window
+                main = self.main_window
                 if main:
                     if update_slices and xy_needs_refresh:
                         main_updated = self._update_slice_image(main, fast_blit=fast_blit)
@@ -4101,7 +4084,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             if not self._get_clicked('xz'):
                 xy_plabel = self._get_plane_plabel('xy')
                 if xy_plabel and xy_plabel.isVisible():
-                    FITSViewer.main_window.redraw_main_overlay_and_blit()
+                    self.main_window.redraw_main_overlay_and_blit()
 
                     subwindow2 = getattr(self.SubWindow, 'subwindow2', None)
                     if subwindow2 is not None and subwindow2.isHidden() == False:
@@ -4175,7 +4158,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             if not self._get_clicked('zy'):
                 xy_plabel = self._get_plane_plabel('xy')
                 if xy_plabel and xy_plabel.isVisible():
-                    FITSViewer.main_window.redraw_main_overlay_and_blit()
+                    self.main_window.redraw_main_overlay_and_blit()
 
 
 
@@ -4575,7 +4558,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             panel.adjustSize()
         except Exception:
             pass
-        anchor = FITSViewer.main_window
+        anchor = self.main_window
         if anchor is None:
             anchor = self
         anchor_frame = anchor.frameGeometry()
@@ -5289,7 +5272,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         if is_full_range():
             world_limits = self.world_extent(plane)
 
-        is_main = FITSViewer.main_window is None or self is FITSViewer.main_window
+        is_main = self.main_window is None or self is self.main_window
 
         if plane == "xy" and is_main:
             xmin_val = limit('x_min', new_xlim[0])
