@@ -24,7 +24,8 @@ class FITSWorker(QObject):
         self.filename = str(filename)
 
     def run(self) -> None:
-        self.progress.emit(f"Loading {self.filename}...")
+        # The "Loading: <file>" banner is printed by the caller (main.py) before
+        # the worker starts, so it uses the same format as additional files.
         try:
             data, header, wcs, spectral_metadata = load_fits(self.filename)
         except FITSLoadError as err:

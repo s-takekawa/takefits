@@ -24,7 +24,7 @@ _os_for_threads.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 _os_for_threads.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from reproject import reproject_interp
-from takefits.logic.data_tools import LazyScaledArray
+from takefits.logic.data_tools import LazyScaledArray, _get_total_ram_bytes
 
 _SPLINE_ORDER_MAP = {
     "nearest": 0,
@@ -57,25 +57,13 @@ _THREADPOOL_VOXEL_THRESHOLD = 30_000_000
 
 
 def _detect_total_ram_bytes() -> Optional[int]:
-    """Best-effort total physical RAM in bytes, or None if undetectable."""
-    try:  # Linux and most Unix
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        if pages > 0 and page_size > 0:
-            return int(pages) * int(page_size)
-    except (ValueError, OSError, AttributeError):
-        pass
-    try:  # macOS
-        import subprocess
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2
-        )
-        value = int(out.stdout.strip())
-        if value > 0:
-            return value
-    except Exception:
-        pass
-    return None
+    """Best-effort total physical RAM in bytes, or None if undetectable.
+
+    Delegates to the shared cross-platform helper, which handles macOS, Linux
+    and Windows (the latter via the Win32 API rather than a ``sysctl`` shell-out
+    that does not exist on Windows).
+    """
+    return _get_total_ram_bytes()
 
 
 def _quiet_remove(path):

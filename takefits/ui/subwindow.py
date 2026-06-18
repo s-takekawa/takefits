@@ -81,12 +81,3 @@ class SubWindow(FITSViewer):
                 self.canvas.draw_idle()
         except Exception:
             self.canvas.draw_idle()
-        
-class SubWindow_control:
-    def __init__(self):
-        subwindow1 = None
-        subwindow2 = None
-        
-    @classmethod
-    def update_subwindow(cls, sub1, sub2):
-            cls.subwindow1, cls.subwindow2 = sub1, sub2

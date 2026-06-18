@@ -13,6 +13,8 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch
 from matplotlib.text import Text
 
+from takefits.core.fonts import resolve_mpl_font_family
+
 mpl.rcParams["mathtext.fontset"] = "cm"
 mpl.rcParams.setdefault("mathtext.rm", "cm")
 
@@ -804,7 +806,7 @@ class TextMarker(Marker):
     def _font_family_for_text(self) -> str:
         if self._is_math_text(self.text):
             return "STIXGeneral"
-        return self.style.font_family
+        return resolve_mpl_font_family(self.style.font_family)
 
 
 MarkerT = TypeVar("MarkerT", bound=Marker)

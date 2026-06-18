@@ -561,6 +561,15 @@ class RangeControlPanel(QWidget):
             QMessageBox.warning(self, 'Failed to Load Range', str(exc))
             return
 
+        # Record the loaded view so it can be reverted with View Back (Cmd/Ctrl+Z),
+        # consistent with typing a range into the panel.
+        record_history = getattr(self.fits_viewer, "_record_shared_view_history", None)
+        if callable(record_history):
+            try:
+                record_history(reason='range_panel:load')
+            except Exception:
+                pass
+
         source = payload.get('source') if isinstance(payload.get('source'), dict) else {}
         saved_name = str(source.get('filename') or '').strip()
         if saved_name:

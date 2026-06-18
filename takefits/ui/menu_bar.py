@@ -1,3 +1,6 @@
+import os
+import sys
+
 from PySide6.QtWidgets import QMenu, QMessageBox
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtCore import Qt
@@ -22,6 +25,8 @@ class MenuBar:
 
         # File Menu
         file_menu = menubar.addMenu("File")
+        self.open_new_window_action = QAction("Open FITS in New Window...", self.parent)
+        self.open_new_window_action.setShortcut(QKeySequence.StandardKey.New)
         self.save_workspace_action = QAction("Save Workspace", self.parent)
         self.load_workspace_action = QAction("Load Workspace...", self.parent)
         self.save_recipe_action = QAction("Save Recipe...", self.parent)
@@ -31,16 +36,26 @@ class MenuBar:
         self.save_recipe_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         self.load_recipe_action.setShortcut(QKeySequence("Ctrl+Shift+O"))
         for action in (
+            self.open_new_window_action,
             self.save_workspace_action,
             self.load_workspace_action,
             self.save_recipe_action,
             self.load_recipe_action,
         ):
-            action.setShortcutContext(Qt.ShortcutContext.ApplicationShortcut)
+            # WindowShortcut (not Application) so the keystroke routes to the
+            # focused window's action. With several MainWindows open, an
+            # application-wide shortcut for the same key is ambiguous and Qt
+            # fires nothing. The menu-mirror associates these actions with the
+            # window's subwindows too, so the shortcut still works when a
+            # subwindow/tool panel is focused.
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.open_new_window_action.triggered.connect(self.open_in_new_window)
         self.save_workspace_action.triggered.connect(self.save_workspace)
         self.load_workspace_action.triggered.connect(self.load_workspace)
         self.save_recipe_action.triggered.connect(self.save_recipe)
         self.load_recipe_action.triggered.connect(self.load_recipe)
+        file_menu.addAction(self.open_new_window_action)
+        file_menu.addSeparator()
         file_menu.addAction(self.save_workspace_action)
         file_menu.addAction(self.load_workspace_action)
         file_menu.addSeparator()
@@ -112,6 +127,70 @@ class MenuBar:
         window_menu.addAction(self.main_action)
         window_menu.addAction(self.sub1_action)
         window_menu.addAction(self.sub2_action)
+
+        # Multi-window switching. The menu-mirror machinery rebuilds menu
+        # objects unpredictably, which makes a *dynamic* per-window list
+        # fragile; instead we expose stable cycling actions (added once) and
+        # rely on the OS window switcher / Dock for direct selection.
+        window_menu.addSeparator()
+        self.next_window_action = QAction("Next Window", self.parent)
+        self.prev_window_action = QAction("Previous Window", self.parent)
+        self.next_window_action.setShortcut(QKeySequence("Ctrl+`"))
+        self.prev_window_action.setShortcut(QKeySequence("Ctrl+Shift+`"))
+        for action in (self.next_window_action, self.prev_window_action):
+            # WindowShortcut so each window's cycle action fires for the focused
+            # window (application scope would be ambiguous across windows).
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.next_window_action.triggered.connect(lambda: self.cycle_window(1))
+        self.prev_window_action.triggered.connect(lambda: self.cycle_window(-1))
+        window_menu.addAction(self.next_window_action)
+        window_menu.addAction(self.prev_window_action)
+        window_menu.aboutToShow.connect(self.refresh_window_switch_actions)
+
+        window_menu.addSeparator()
+        self.arrange_family_action = QAction("Gather Windows for This FITS", self.parent)
+        self.hide_this_fits_action = QAction("Hide This FITS", self.parent)
+        self.hide_other_fits_action = QAction("Hide Other FITS", self.parent)
+        self.show_all_fits_action = QAction("Show All FITS Windows", self.parent)
+        self.arrange_family_action.triggered.connect(self.gather_family_windows)
+        self.hide_this_fits_action.triggered.connect(self.hide_this_fits)
+        self.hide_other_fits_action.triggered.connect(self.hide_other_fits)
+        self.show_all_fits_action.triggered.connect(self.show_all_fits_windows)
+        window_menu.addAction(self.arrange_family_action)
+        window_menu.addAction(self.hide_this_fits_action)
+        window_menu.addAction(self.hide_other_fits_action)
+        window_menu.addAction(self.show_all_fits_action)
+
+        # Cross-window WCS sync (Phase 2). Static checkable actions only — the
+        # menu-mirror machinery is hostile to dynamic menu mutation, but
+        # toggling setChecked on stable actions is safe.
+        window_menu.addSeparator()
+        self.sync_lock_action = QAction("Lock Views Across Windows", self.parent)
+        self.sync_lock_action.setCheckable(True)
+        self.sync_lock_action.toggled.connect(self._on_sync_lock_toggled)
+        window_menu.addAction(self.sync_lock_action)
+
+        sync_menu = window_menu.addMenu("Sync Includes")
+        self.sync_pan_zoom_action = QAction("Pan/Zoom", self.parent)
+        self.sync_cursor_action = QAction("Cursor", self.parent)
+        self.sync_spectral_action = QAction("Spectral", self.parent)
+        self.sync_color_action = QAction("Color Scale", self.parent)
+        for action, channel in (
+            (self.sync_pan_zoom_action, "pan_zoom"),
+            (self.sync_cursor_action, "cursor"),
+            (self.sync_spectral_action, "spectral"),
+            (self.sync_color_action, "color"),
+        ):
+            action.setCheckable(True)
+            action.toggled.connect(
+                lambda checked, ch=channel: self._on_sync_channel_toggled(ch, checked)
+            )
+            sync_menu.addAction(action)
+        self._sync_menu = sync_menu
+        self._connect_window_sync_manager()
+        self.refresh_sync_lock_actions()
+
+        self.refresh_window_switch_actions()
 
         # Tools Menu
         tools_menu = menubar.addMenu("Tools")
@@ -365,6 +444,250 @@ class MenuBar:
         if hasattr(self.parent, "load_recipe_dialog"):
             self.parent.load_recipe_dialog()
 
+    def open_in_new_window(self):
+        if hasattr(self.parent, "open_fits_in_new_window_dialog"):
+            self.parent.open_fits_in_new_window_dialog()
+
+    @staticmethod
+    def _shorten_fits_label(text, max_chars=38):
+        label = str(text or "").strip() or "Untitled FITS"
+        if len(label) <= max_chars:
+            return label
+        if max_chars <= 8:
+            return label[:max_chars]
+        ext = os.path.splitext(label)[1]
+        suffix_budget = max(6, min(14, len(ext) + 8))
+        prefix_budget = max_chars - suffix_budget - 3
+        if prefix_budget < 4:
+            prefix_budget = max_chars - 3
+            return f"{label[:prefix_budget]}..."
+        return f"{label[:prefix_budget]}...{label[-suffix_budget:]}"
+
+    @staticmethod
+    def _window_fits_label(window, *, shorten=True):
+        raw = ""
+        if window is not None:
+            raw = str(getattr(window, "filename", "") or "").strip()
+            if not raw:
+                raw = str(getattr(window, "filepath", "") or "").strip()
+            if not raw:
+                try:
+                    title = str(window.windowTitle() or "").strip()
+                except Exception:
+                    title = ""
+                raw = title.removeprefix("MainWindow:").strip()
+        label = os.path.basename(raw) if raw else "Untitled FITS"
+        return MenuBar._shorten_fits_label(label) if shorten else label
+
+    def _registered_windows_for_switching(self):
+        from takefits.ui.window_registry import WindowRegistry
+
+        try:
+            windows = WindowRegistry.instance().windows()
+        except Exception:
+            windows = []
+        if self.parent not in windows:
+            windows = [self.parent, *windows]
+        return [window for window in windows if window is not None]
+
+    def _window_number(self, window):
+        """1-based FITS number for ``window`` (registry first, position fallback)."""
+        from takefits.ui.window_registry import WindowRegistry
+
+        try:
+            number = WindowRegistry.instance().number(window)
+        except Exception:
+            number = None
+        if number:
+            return number
+        windows = self._registered_windows_for_switching()
+        try:
+            return windows.index(window) + 1
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _fits_identity(number) -> str:
+        return f"FITS {number}" if number else "FITS"
+
+    # ------------------------------------------------------------------
+    # Cross-window WCS sync (Phase 2)
+    # ------------------------------------------------------------------
+    def _window_sync_manager(self):
+        try:
+            from takefits.ui.window_sync_manager import WindowSyncManager
+            return WindowSyncManager.instance()
+        except Exception:
+            return None
+
+    def _connect_window_sync_manager(self):
+        manager = self._window_sync_manager()
+        if manager is None:
+            return
+        if getattr(self, "_sync_manager_connected", False):
+            return
+        try:
+            manager.state_changed.connect(self.refresh_sync_lock_actions)
+        except Exception:
+            pass
+        else:
+            self._sync_manager = manager
+            self._sync_manager_connected = True
+
+    def _disconnect_window_sync_manager(self):
+        manager = getattr(self, "_sync_manager", None)
+        if manager is None:
+            return
+        try:
+            manager.state_changed.disconnect(self.refresh_sync_lock_actions)
+        except (RuntimeError, TypeError):
+            pass
+        except Exception:
+            pass
+        self._sync_manager = None
+        self._sync_manager_connected = False
+
+    def dispose(self):
+        self._disconnect_window_sync_manager()
+
+    def _on_sync_lock_toggled(self, checked):
+        manager = self._window_sync_manager()
+        if manager is not None:
+            manager.set_enabled(bool(checked))
+            if checked:
+                # Immediately align the other windows to this one's view/position.
+                manager.sync_now(self.parent)
+
+    def _on_sync_channel_toggled(self, channel, checked):
+        manager = self._window_sync_manager()
+        if manager is None:
+            return
+        manager.set_channel(channel, bool(checked))
+        # Checking Color Scale syncs the other windows to this one immediately.
+        if checked and channel == "color" and manager.enabled:
+            manager.broadcast_color(self.parent)
+
+    def refresh_sync_lock_actions(self):
+        """Mirror the global sync state onto this window's menu checkmarks.
+
+        The lock is only meaningful with two or more windows, so the actions
+        are greyed out when a single FITS is open.
+        """
+        manager = self._window_sync_manager()
+        if manager is None:
+            return
+        usable = manager.can_sync()
+        pairs = (
+            (getattr(self, "sync_lock_action", None), manager.enabled),
+            (getattr(self, "sync_pan_zoom_action", None), manager.sync_pan_zoom),
+            (getattr(self, "sync_cursor_action", None), manager.sync_cursor),
+            (getattr(self, "sync_spectral_action", None), manager.sync_spectral),
+            (getattr(self, "sync_color_action", None), manager.sync_color),
+        )
+        for action, value in pairs:
+            if action is None:
+                continue
+            try:
+                action.setEnabled(usable)
+                if action.isChecked() != bool(value):
+                    blocked = action.blockSignals(True)
+                    action.setChecked(bool(value))
+                    action.blockSignals(blocked)
+            except RuntimeError:
+                # The owning window was closed and its C++ QAction deleted.
+                continue
+
+    def refresh_window_switch_actions(self):
+        windows = self._registered_windows_for_switching()
+        count = len(windows)
+        try:
+            current = windows.index(self.parent)
+        except ValueError:
+            current = 0
+
+        if count < 2:
+            # A single FITS: the number is noise, so just show its name.
+            current_label = self._window_fits_label(self.parent)
+            self.next_window_action.setText(current_label)
+            self.next_window_action.setEnabled(False)
+            self.next_window_action.setToolTip(self._window_fits_label(self.parent, shorten=False))
+            self.prev_window_action.setVisible(False)
+            self.prev_window_action.setEnabled(False)
+            if hasattr(self, "hide_other_fits_action"):
+                self.hide_other_fits_action.setEnabled(False)
+            return
+
+        if hasattr(self, "hide_other_fits_action"):
+            self.hide_other_fits_action.setEnabled(True)
+
+        next_window = windows[(current + 1) % count]
+        next_label = self._window_fits_label(next_window)
+        next_full_label = self._window_fits_label(next_window, shorten=False)
+        next_identity = self._fits_identity(self._window_number(next_window))
+        self.next_window_action.setText(f"Switch to {next_identity}: {next_label}")
+        self.next_window_action.setEnabled(True)
+        self.next_window_action.setVisible(True)
+        self.next_window_action.setToolTip(next_full_label)
+        self.next_window_action.setStatusTip(next_full_label)
+
+        if count == 2:
+            self.prev_window_action.setVisible(False)
+            self.prev_window_action.setEnabled(False)
+            return
+
+        prev_window = windows[(current - 1) % count]
+        prev_label = self._window_fits_label(prev_window)
+        prev_full_label = self._window_fits_label(prev_window, shorten=False)
+        prev_identity = self._fits_identity(self._window_number(prev_window))
+        self.prev_window_action.setText(f"Switch back to {prev_identity}: {prev_label}")
+        self.prev_window_action.setEnabled(True)
+        self.prev_window_action.setVisible(True)
+        self.prev_window_action.setToolTip(prev_full_label)
+        self.prev_window_action.setStatusTip(prev_full_label)
+
+    def cycle_window(self, step):
+        """Activate the next/previous open MainWindow relative to this one."""
+        windows = self._registered_windows_for_switching()
+        if len(windows) < 2:
+            return
+        try:
+            current = windows.index(self.parent)
+        except ValueError:
+            current = 0
+        target = windows[(current + int(step)) % len(windows)]
+        self._activate_window(target)
+
+    @staticmethod
+    def _activate_window(window):
+        if window is None:
+            return
+        try:
+            window.showNormal() if window.isMinimized() else window.show()
+            window.raise_()
+            window.activateWindow()
+        except Exception:
+            pass
+
+    def gather_family_windows(self):
+        if hasattr(self.parent, "arrange_workspace_family"):
+            return self.parent.arrange_workspace_family(pull_to_active_space=True)
+        return None
+
+    def hide_this_fits(self):
+        if hasattr(self.parent, "hide_workspace_family"):
+            return self.parent.hide_workspace_family(include_main=True)
+        return None
+
+    def hide_other_fits(self):
+        if hasattr(self.parent, "hide_other_workspace_fits"):
+            return self.parent.hide_other_workspace_fits()
+        return None
+
+    def show_all_fits_windows(self):
+        if hasattr(self.parent, "show_all_workspace_windows"):
+            return self.parent.show_all_workspace_windows()
+        return None
+
     def save_workspace(self):
         if hasattr(self.parent, "save_workspace"):
             self.parent.save_workspace()
@@ -410,7 +733,7 @@ class MenuBar:
             if callable(ensure):
                 sub1 = ensure()
             else:
-                sub1 = getattr(self.parent.SubWindow, "subwindow1", None)
+                sub1 = getattr(self.parent, "subwindow1", None)
             if sub1 is not None:
                 sub1.show()
                 sub1.raise_()
@@ -418,7 +741,7 @@ class MenuBar:
             else:
                 self.sub1_action.setChecked(False)
         else:
-            sub1 = getattr(self.parent.SubWindow, "subwindow1", None)
+            sub1 = getattr(self.parent, "subwindow1", None)
             if sub1 is not None:
                 sub1.hide()
     
@@ -428,7 +751,7 @@ class MenuBar:
             if callable(ensure):
                 sub2 = ensure()
             else:
-                sub2 = getattr(self.parent.SubWindow, "subwindow2", None)
+                sub2 = getattr(self.parent, "subwindow2", None)
             if sub2 is not None:
                 sub2.show()
                 sub2.raise_()
@@ -436,7 +759,7 @@ class MenuBar:
             else:
                 self.sub2_action.setChecked(False)
         else:
-            sub2 = getattr(self.parent.SubWindow, "subwindow2", None)
+            sub2 = getattr(self.parent, "subwindow2", None)
             if sub2 is not None:
                 sub2.hide()
         
@@ -509,8 +832,25 @@ class MenuBar:
         self.config_panel.show()
         
     def open_header_panel(self):
-        self.header_panel = ShowHeader(self.parent.header)
+        existing = getattr(self.parent, "header_panel", None)
+        try:
+            if existing is not None and existing.isVisible():
+                existing.raise_()
+                existing.activateWindow()
+                return
+        except Exception:
+            existing = None
+
+        self.header_panel = ShowHeader(
+            self.parent.header,
+            filename=getattr(self.parent, "filename", None),
+            parent=self.parent,
+        )
+        self.parent.header_panel = self.header_panel
         self.header_panel.resize(300, 400)
+        refresh_identity = getattr(self.parent, "refresh_fits_identity_labels", None)
+        if callable(refresh_identity):
+            refresh_identity()
         self.header_panel.show()
         
     def show_about(self):
@@ -536,6 +876,41 @@ class MenuBar:
         self._open_control_panel_child("arithmetic_panel", "open_arithmetic_panel")
 
 
+# Menu roles that macOS relocates into the single, shared application menu
+# (the app-named menu next to "About"). Mirroring an action carrying one of
+# these roles into every per-window menu bar makes the Cocoa backend create a
+# *separate* native item per menu bar. Unlike About/Quit/Preferences -- unique
+# roles that Qt de-duplicates -- ApplicationSpecificRole items are never merged,
+# so as secondary windows (integration results, channel maps, PV diagrams,
+# Show Header, the X-Z/Z-Y subwindows) are shown/activated and their bars are
+# rebuilt, "Check for Updates..." piles up without bound. The owning main
+# window's real menu bar already provides the single instance, so secondary
+# windows must not mirror these.
+_GLOBAL_APP_MENU_ROLES = frozenset(
+    {
+        QAction.MenuRole.AboutRole,
+        QAction.MenuRole.AboutQtRole,
+        QAction.MenuRole.PreferencesRole,
+        QAction.MenuRole.QuitRole,
+        QAction.MenuRole.ApplicationSpecificRole,
+    }
+)
+
+
+def _skip_in_menu_mirror(action) -> bool:
+    """True when ``action`` is owned by the shared macOS application menu.
+
+    Only relevant on macOS; elsewhere each window keeps its own inline menu
+    bar, so these entries are mirrored normally.
+    """
+    if sys.platform != "darwin" or action is None:
+        return False
+    try:
+        return action.menuRole() in _GLOBAL_APP_MENU_ROLES
+    except Exception:
+        return False
+
+
 def _copy_menu_contents(source_menu: QMenu, target_menu: QMenu):
     for source_action in list(source_menu.actions() or []):
         if source_action is None:
@@ -551,6 +926,8 @@ def _copy_menu_contents(source_menu: QMenu, target_menu: QMenu):
             submenu.menuAction().setVisible(source_action.isVisible())
             _copy_menu_contents(source_submenu, submenu)
             continue
+        if _skip_in_menu_mirror(source_action):
+            continue
         target_menu.addAction(source_action)
 
 
@@ -558,6 +935,11 @@ def mirror_menu_bar_to_window(source_window, target_window) -> bool:
     if source_window is None or target_window is None:
         return False
     if source_window is target_window:
+        return False
+    # Windows that author their own menu bar (e.g. the PV diagram's bespoke
+    # "Actions" menu) opt out: clearing + mirroring would wipe their entries
+    # the moment they are focused. Their own menu bar is authoritative.
+    if getattr(target_window, "_owns_menu_bar", False):
         return False
     source_getter = getattr(source_window, "menuBar", None)
     target_getter = getattr(target_window, "menuBar", None)
@@ -580,6 +962,8 @@ def mirror_menu_bar_to_window(source_window, target_window) -> bool:
             continue
         source_menu = source_action.menu()
         if source_menu is None:
+            if _skip_in_menu_mirror(source_action):
+                continue
             target_bar.addAction(source_action)
             continue
         title = str(source_menu.title() or source_action.text() or "").strip()

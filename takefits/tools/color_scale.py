@@ -336,6 +336,18 @@ class ColorSettingsPanel(QWidget):
                 recorder(reason=reason)
             except Exception:
                 continue
+
+        # Propagate the color change to other windows when the cross-window
+        # color-scale lock is on (main image only).
+        if self.mode == ColorMode.MAIN:
+            try:
+                from takefits.ui.window_sync_manager import WindowSyncManager
+                manager = WindowSyncManager.instance()
+                if (manager.enabled and manager.sync_color
+                        and not manager._applying_color):
+                    manager.broadcast_color(self.fits_viewer)
+            except Exception:
+                pass
     
     def move_to_default_position(self):
         control_panel_geometry = self.fits_viewer.control_panel.geometry()
@@ -506,12 +518,124 @@ class ColorSettingsPanel(QWidget):
         self.intensity_max.setText(str(f"{max_val:.3g}"))
         self.update_intensity_range()
 
-    def auto_intensity(self):
-        data_min, data_max = self._data_range()
+    def _integration_mode_key(self) -> str:
+        """Best-effort semantic type for integration/moment result windows."""
+        candidates = []
+        viewer = getattr(self, "fits_viewer", None)
+        if viewer is not None:
+            candidates.append(getattr(viewer, "integ_mode", None))
+            metadata = getattr(viewer, "history_metadata", None)
+            if isinstance(metadata, dict):
+                candidates.extend(
+                    [
+                        metadata.get("mode"),
+                        metadata.get("moment_type"),
+                    ]
+                )
+
+        aliases = {
+            "moment0": "int",
+            "mom0": "int",
+            "integration": "int",
+            "moment1": "mom1",
+            "mom1": "mom1",
+            "moment2": "mom2",
+            "mom2": "mom2",
+            "peak_coord": "peak_coord",
+            "peak_corrd": "peak_coord",
+            "peak_coordinate": "peak_coord",
+            "peak coordinate": "peak_coord",
+            "average": "average",
+            "mean": "average",
+            "median": "median",
+            "median_int": "median",
+            "peak": "peak_int",
+            "peak_int": "peak_int",
+            "rms": "rms",
+            "sigma": "sigma",
+        }
+        for value in candidates:
+            key = str(value or "").strip().lower()
+            if not key:
+                continue
+            normalized = key.replace("-", "_").replace(" ", "_")
+            if normalized in aliases:
+                return aliases[normalized]
+            if key in aliases:
+                return aliases[key]
+        return ""
+
+    @staticmethod
+    def _finite_values(values):
+        try:
+            array = np.asarray(values, dtype=float).reshape(-1)
+        except Exception:
+            return np.asarray([], dtype=float)
+        with np.errstate(invalid='ignore'):
+            return array[np.isfinite(array)]
+
+    @staticmethod
+    def _percentile_limits(values, low_percentile, high_percentile):
+        finite = ColorSettingsPanel._finite_values(values)
+        if finite.size == 0:
+            return (None, None)
+        try:
+            low, high = np.nanpercentile(finite, [low_percentile, high_percentile])
+        except Exception:
+            return (None, None)
+        if not (np.isfinite(low) and np.isfinite(high)):
+            return (None, None)
+        low = float(low)
+        high = float(high)
+        if low > high:
+            low, high = high, low
+        if low == high:
+            low = float(np.nanmin(finite))
+            high = float(np.nanmax(finite))
+        return (low, high)
+
+    @staticmethod
+    def _default_auto_limits_from_range(data_min, data_max):
         max_val = data_max * 0.8 if np.isfinite(data_max) else data_max
         min_val = max(data_min, 0.0) if np.isfinite(data_min) else data_min
+        return (min_val, max_val)
 
-        #max_val = np.nanpercentile(self.data[self.data > 0], 99.99)
+    def _default_auto_intensity_limits(self):
+        data_min, data_max = self._data_range()
+        return self._default_auto_limits_from_range(data_min, data_max)
+
+    def _integration_auto_intensity_limits(self):
+        data_min, data_max = self._data_range()
+        default_limits = self._default_auto_limits_from_range(data_min, data_max)
+        mode_key = self._integration_mode_key()
+        signed_modes = {"mom1", "peak_coord", "average", "median"}
+        nonnegative_modes = {"mom2", "rms", "sigma"}
+
+        if mode_key not in signed_modes and mode_key not in nonnegative_modes:
+            return default_limits
+
+        min_val, max_val = self._percentile_limits(self.data, 0.5, 99.5)
+        if min_val is None or max_val is None:
+            return default_limits
+
+        if mode_key in nonnegative_modes and np.isfinite(min_val):
+            min_val = max(min_val, 0.0)
+
+        if np.isfinite(data_min):
+            min_val = max(float(data_min), float(min_val))
+        if np.isfinite(data_max):
+            max_val = min(float(data_max), float(max_val))
+        if min_val > max_val:
+            return default_limits
+        return (min_val, max_val)
+
+    def _auto_intensity_limits(self):
+        if self.mode == ColorMode.INTEG:
+            return self._integration_auto_intensity_limits()
+        return self._default_auto_intensity_limits()
+
+    def auto_intensity(self):
+        min_val, max_val = self._auto_intensity_limits()
         self.intensity_min.setText(str(f"{min_val:.3g}"))
         self.intensity_max.setText(str(f"{max_val:.3g}"))
         self.update_intensity_range()

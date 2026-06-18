@@ -4,7 +4,8 @@ import os
 from typing import List, Optional, Tuple, Set
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QSettings
+from PySide6.QtCore import Qt, QTimer, QSettings, QEvent
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -51,12 +52,17 @@ from takefits.app_paths import app_config_path
 
 _RECENT_EXTERNAL_FITS_KEY = "contours/recent_external_fits"
 _RECENT_EXTERNAL_FITS_MAX = 8
+_RECENT_CONTOUR_FILES_KEY = "contours/recent_contour_files"
 
 # The DS9 helpers are implemented in core.contour_manager during Step 4.
 from takefits.core.contour_manager import write_state_to_ds9, read_state_from_ds9
 
 
 class ContourPanel(QDialog):
+    # Shared copy/paste buffer: (ContourState, label). Class-level so it
+    # survives the panel being closed and reopened.
+    _clipboard_state = None
+
     COLOR_OPTIONS = [
         "original",
         "white",
@@ -90,6 +96,8 @@ class ContourPanel(QDialog):
         self._custom_levels = False
         self._updating_level_display = False
         self._suspend_target_callbacks = False
+        self._last_target_click_row: Optional[int] = None
+        self._suppress_next_target_click_toggle = False
 
         self._build_ui()
         self._apply_saved_parameters()
@@ -193,7 +201,7 @@ class ContourPanel(QDialog):
         targets_container.addLayout(targets_header_layout)
 
         self.target_list = QListWidget(self)
-        self.target_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.target_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.target_list.setFixedHeight(120)
         self.target_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.target_list.itemChanged.connect(self._on_target_item_changed)
@@ -226,6 +234,9 @@ class ContourPanel(QDialog):
         button_layout.addWidget(self.btn_execute)
         button_layout.addWidget(self.btn_clear)
         self.btn_load = QPushButton("Load", self)
+        self._load_menu = QMenu(self.btn_load)
+        self._load_menu.aboutToShow.connect(self._populate_load_menu)
+        self.btn_load.setMenu(self._load_menu)
         self.btn_load_fits = QPushButton("From FITS", self)
         self._from_fits_menu = QMenu(self.btn_load_fits)
         self._from_fits_menu.aboutToShow.connect(self._populate_from_fits_menu)
@@ -237,12 +248,25 @@ class ContourPanel(QDialog):
         button_layout.addWidget(self.btn_save)
         main_layout.addLayout(button_layout)
 
+        # Row 5: transient status line (auto-clears after a few seconds)
+        self.status_label = QLabel("", self)
+        self.status_label.setStyleSheet("color: gray;")
+        self.status_label.setFixedHeight(metrics.height())
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        main_layout.addWidget(self.status_label)
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(lambda: self.status_label.setText(""))
+
         # Signal wiring
         self.btn_execute.clicked.connect(self.execute_contours)
         self.btn_clear.clicked.connect(self.clear_contours)
-        self.btn_load.clicked.connect(self.load_contours)
         self.btn_save.clicked.connect(self.save_contours)
         self.target_list.itemDoubleClicked.connect(self._on_target_double_clicked)
+        self.target_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.target_list.customContextMenuRequested.connect(self._show_target_context_menu)
+        self.target_list.installEventFilter(self)
+        self.target_list.viewport().installEventFilter(self)
         self.btn_check_all.clicked.connect(self._check_all_targets)
         self.btn_check_none.clicked.connect(self._uncheck_all_targets)
         for line_edit in (self.entry_min, self.entry_max, self.entry_step):
@@ -291,17 +315,27 @@ class ContourPanel(QDialog):
     def _selected_overlay_ids(self) -> List[str]:
         return [entry["id"] for entry in self._selected_entries() if entry.get("kind") == "overlay"]
 
+    def _refresh_target_dependent_controls(self) -> None:
+        self._ensure_default_bounds()
+        if self._step_auto or not self.entry_step.text().strip():
+            self._ensure_step(fill_bounds=False)
+        else:
+            self._update_level_display()
+
+    def _set_target_check_state(self, item: QListWidgetItem, state: Qt.CheckState) -> None:
+        if item is not None and item.checkState() != state:
+            item.setCheckState(state)
+
     def _set_all_checks(self, checked: bool) -> None:
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         self._suspend_target_callbacks = True
         try:
             for idx in range(self.target_list.count()):
                 item = self.target_list.item(idx)
-                item.setCheckState(state)
+                self._set_target_check_state(item, state)
         finally:
             self._suspend_target_callbacks = False
-        self._ensure_default_bounds()
-        self._update_level_display()
+        self._refresh_target_dependent_controls()
 
     def _check_all_targets(self) -> None:
         self._set_all_checks(True)
@@ -416,11 +450,35 @@ class ContourPanel(QDialog):
             return
         if item is None:
             return
-        self._ensure_default_bounds()
-        if self._step_auto or not self.entry_step.text().strip():
-            self._ensure_step(fill_bounds=False)
-        else:
-            self._update_level_display()
+        self._refresh_target_dependent_controls()
+
+    def _toggle_target_item_from_click(self, item: QListWidgetItem, modifiers) -> None:
+        row = self.target_list.row(item)
+        if row < 0:
+            return
+
+        checked = item.checkState() == Qt.CheckState.Checked
+        target_state = Qt.CheckState.Unchecked if checked else Qt.CheckState.Checked
+        previous_row = self._last_target_click_row
+        use_range = (
+            bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+            and previous_row is not None
+            and 0 <= previous_row < self.target_list.count()
+        )
+
+        self._suspend_target_callbacks = True
+        try:
+            if use_range:
+                start, end = sorted((previous_row, row))
+                for idx in range(start, end + 1):
+                    self._set_target_check_state(self.target_list.item(idx), target_state)
+            else:
+                self._set_target_check_state(item, target_state)
+        finally:
+            self._suspend_target_callbacks = False
+
+        self._last_target_click_row = row
+        self._refresh_target_dependent_controls()
 
     def _ensure_default_bounds(self, force: bool = False) -> None:
         if not force:
@@ -624,6 +682,7 @@ class ContourPanel(QDialog):
             self._default_selection_applied = True
 
         self.target_list.clear()
+        self._last_target_click_row = None
 
         entries = self.manager.entries()
 
@@ -768,16 +827,18 @@ class ContourPanel(QDialog):
 
         QMessageBox.information(self, "Save Contours", f"Contours saved to:\n{path}")
 
-    def load_contours(self) -> None:
+    def load_contours(self, path: Optional[str] = None) -> None:
         layer_ids = self._selected_layer_ids()
         if not layer_ids:
             QMessageBox.information(self, "Load Contours", "Select at least one target to apply contours to.")
             return
 
-        options = "TakeFITS Contour (*.tctr);;DS9 Contour (*.ctr *.con *.txt);;All Files (*)"
-        path, selected_filter = QFileDialog.getOpenFileName(self, "Load Contours", os.getcwd(), options)
+        selected_filter = ""
         if not path:
-            return
+            options = "TakeFITS Contour (*.tctr);;DS9 Contour (*.ctr *.con *.txt);;All Files (*)"
+            path, selected_filter = QFileDialog.getOpenFileName(self, "Load Contours", os.getcwd(), options)
+            if not path:
+                return
 
         try:
             ext_lower = os.path.splitext(path)[1].lower()
@@ -805,6 +866,7 @@ class ContourPanel(QDialog):
 
         overlay_label = os.path.basename(path) or (state.label or "overlay")
         self._import_state_to_targets(state, layer_ids, overlay_label, has_segment_colors)
+        self._remember_contour_file(path)
 
     def _import_state_to_targets(
         self,
@@ -816,17 +878,24 @@ class ContourPanel(QDialog):
     ) -> None:
         style_color = self.combo_color.currentText()
         style_linewidth = float(self.spin_linewidth.value())
+        applied_labels: List[str] = []
+        skipped_labels: List[Tuple[str, bool]] = []
 
         for target_id in layer_ids:
             # For each target, create a fresh, deep copy of the source state.
             target_state = copy.deepcopy(state)
 
-            # Customize this copy for the target layer.
+            # Customize this copy for the target layer. Always drop the source
+            # overlay_id so each import gets a fresh one; reusing the id would
+            # alias the new overlay with the original (checks and restyles
+            # would hit the source overlay instead).
             target_state.layer_id = target_id
+            target_state.overlay_id = None
             target_state.label = overlay_label
             layer = self.manager.registered_layers().get(target_id)
             if layer:
-                target_state.plane = layer.plane
+                if target_state.plane is None:
+                    target_state.plane = layer.plane
 
             # For .tctr files with per-segment colors, preserve the original colors and linewidth
             if has_segment_colors:
@@ -847,9 +916,48 @@ class ContourPanel(QDialog):
                         segment.color = None
 
             # Import the prepared state.
-            self.manager.import_layer_state(target_id, target_state)
+            applied = self.manager.import_layer_state(target_id, target_state)
+            entry = self._layer_status_label(layer, target_id)
+            if applied:
+                applied_labels.append(entry)
+            else:
+                plane_mismatch = bool(
+                    target_state.plane
+                    and layer is not None
+                    and layer.plane
+                    and str(target_state.plane).lower() != str(layer.plane).lower()
+                )
+                skipped_labels.append((entry, plane_mismatch))
 
         self.refresh_targets()
+
+        parts = []
+        if applied_labels:
+            parts.append(f"Applied to {', '.join(applied_labels)}")
+        mismatched = [label for label, mismatch in skipped_labels if mismatch]
+        other_skipped = [label for label, mismatch in skipped_labels if not mismatch]
+        if mismatched:
+            parts.append(f"skipped {', '.join(mismatched)} (plane mismatch)")
+        if other_skipped:
+            parts.append(f"skipped {', '.join(other_skipped)}")
+        if parts:
+            self._show_status("; ".join(parts))
+
+    @staticmethod
+    def _layer_status_label(layer, fallback_id: str) -> str:
+        if layer is None:
+            return fallback_id
+        label = layer.label or fallback_id
+        if layer.plane:
+            tag = f"[{layer.plane.upper()}]"
+            if tag not in label.upper():
+                label = f"{label} {tag}"
+        return label
+
+    def _show_status(self, message: str, timeout_ms: int = 6000) -> None:
+        self.status_label.setText(message)
+        self.status_label.setToolTip(message)
+        self._status_timer.start(timeout_ms)
 
     # ------------------------------------------------------------------
     # Contours from an external FITS file
@@ -868,6 +976,35 @@ class ContourPanel(QDialog):
         settings = QSettings(app_config_path("takefits.ini"), QSettings.Format.IniFormat)
         settings.setValue(_RECENT_EXTERNAL_FITS_KEY, paths[:_RECENT_EXTERNAL_FITS_MAX])
         settings.sync()
+
+    def _recent_contour_files(self) -> List[str]:
+        settings = QSettings(app_config_path("takefits.ini"), QSettings.Format.IniFormat)
+        paths = settings.value(_RECENT_CONTOUR_FILES_KEY, [])
+        if isinstance(paths, str):
+            paths = [paths]
+        return [p for p in (paths or []) if isinstance(p, str) and p]
+
+    def _remember_contour_file(self, path: str) -> None:
+        path = os.path.abspath(path)
+        paths = [p for p in self._recent_contour_files() if p != path]
+        paths.insert(0, path)
+        settings = QSettings(app_config_path("takefits.ini"), QSettings.Format.IniFormat)
+        settings.setValue(_RECENT_CONTOUR_FILES_KEY, paths[:_RECENT_EXTERNAL_FITS_MAX])
+        settings.sync()
+
+    def _populate_load_menu(self) -> None:
+        self._load_menu.clear()
+        browse_action = self._load_menu.addAction("Browse...")
+        browse_action.triggered.connect(lambda: self.load_contours())
+        recent = [p for p in self._recent_contour_files() if os.path.isfile(p)]
+        if recent:
+            self._load_menu.addSeparator()
+            for path in recent:
+                action = self._load_menu.addAction(os.path.basename(path))
+                action.setToolTip(path)
+                action.triggered.connect(
+                    lambda _checked=False, p=path: self.load_contours(p)
+                )
 
     def _populate_from_fits_menu(self) -> None:
         self._from_fits_menu.clear()
@@ -985,6 +1122,158 @@ class ContourPanel(QDialog):
             apply_panel_style=False,
         )
         self._remember_external_fits(path)
+
+    def _clear_target_item(self, item: QListWidgetItem) -> None:
+        """Remove an overlay entry, or clear generated contours on a layer entry."""
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        entry_id = data.get("id")
+        if not entry_id:
+            return
+        label = self._entry_display_label(item)
+        if data.get("kind") == "overlay":
+            clear_contours([], [entry_id])
+            self._show_status(f"Removed {label}")
+        else:
+            clear_contours([entry_id], [])
+            self._show_status(f"Cleared contours on {label}")
+        self.refresh_targets()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj in (self.target_list, self.target_list.viewport()):
+            if event.type() == QEvent.Type.MouseButtonDblClick:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    item = self.target_list.itemAt(event.position().toPoint())
+                    if item is not None:
+                        self.target_list.setCurrentItem(item)
+                        self._suppress_next_target_click_toggle = True
+                        self._on_target_double_clicked(item)
+                        return True
+            if event.type() == QEvent.Type.MouseButtonRelease:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    if self._suppress_next_target_click_toggle:
+                        self._suppress_next_target_click_toggle = False
+                        return True
+                    item = self.target_list.itemAt(event.position().toPoint())
+                    if item is not None:
+                        self.target_list.setCurrentItem(item)
+                        self._toggle_target_item_from_click(item, event.modifiers())
+                        return True
+        if obj is self.target_list and event.type() == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+                item = self.target_list.currentItem()
+                if item is not None:
+                    self._clear_target_item(item)
+                return True
+            if event.matches(QKeySequence.StandardKey.Copy):
+                item = self.target_list.currentItem()
+                if item is not None:
+                    self._copy_target_item(item)
+                return True
+            if event.matches(QKeySequence.StandardKey.Paste):
+                item = self.target_list.currentItem()
+                if item is not None:
+                    layer_id = self._paste_target_layer_id(item)
+                    if layer_id:
+                        self._paste_to_layer(layer_id)
+                return True
+        return super().eventFilter(obj, event)
+
+    def _entry_display_label(self, item: QListWidgetItem) -> str:
+        return item.text().replace("↳", "").replace("• active", "").strip()
+
+    def _copy_target_item(self, item: QListWidgetItem) -> None:
+        """Copy an overlay (or a layer's generated contours) to the panel clipboard."""
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        entry_id = data.get("id")
+        if not entry_id:
+            return
+        label = self._entry_display_label(item)
+        if data.get("kind") == "overlay":
+            state = self.manager.export_overlay_state(entry_id)
+        else:
+            layer = self.manager.registered_layers().get(entry_id)
+            state = layer.export_state() if layer is not None else None
+            state = copy.deepcopy(state) if state is not None else None
+        if state is None or not state.items:
+            self._show_status(f"Nothing to copy from {label}")
+            return
+        ContourPanel._clipboard_state = (state, state.label or label)
+        self._show_status(f"Copied {label}")
+
+    def _paste_to_layer(self, layer_id: str) -> None:
+        clip = ContourPanel._clipboard_state
+        if clip is None:
+            self._show_status("Nothing to paste (copy contours first)")
+            return
+        state, label = clip
+        has_segment_colors = any(
+            seg.color is not None
+            for item_state in state.items
+            for seg in item_state.segments
+        )
+        self._import_state_to_targets(
+            state,
+            [layer_id],
+            label,
+            has_segment_colors=has_segment_colors,
+            apply_panel_style=False,
+        )
+
+    def _paste_target_layer_id(self, item: QListWidgetItem) -> Optional[str]:
+        """Layer id to paste onto: the item itself, or an overlay's parent layer."""
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return None
+        if data.get("kind") == "overlay":
+            return data.get("parent")
+        return data.get("id")
+
+    def _show_target_context_menu(self, pos) -> None:
+        item = self.target_list.itemAt(pos)
+        if item is None:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+
+        menu = QMenu(self)
+        if data.get("kind") == "overlay":
+            overlay_id = data.get("id")
+            if not overlay_id:
+                return
+            copy_action = menu.addAction("Copy")
+            remove_action = menu.addAction("Remove")
+            edit_action = None
+            state = self.manager.export_overlay_state(overlay_id)
+            meta = getattr(state, "source_meta", None) if state is not None else None
+            if isinstance(meta, dict) and meta.get("type") == "external_fits":
+                edit_action = menu.addAction("Edit Settings...")
+            chosen = menu.exec(self.target_list.mapToGlobal(pos))
+            if chosen is copy_action:
+                self._copy_target_item(item)
+            elif chosen is remove_action:
+                self._clear_target_item(item)
+            elif edit_action is not None and chosen is edit_action:
+                self._on_target_double_clicked(item)
+        else:
+            layer_id = data.get("id")
+            if not layer_id:
+                return
+            copy_action = menu.addAction("Copy Contours")
+            paste_action = menu.addAction("Paste")
+            paste_action.setEnabled(ContourPanel._clipboard_state is not None)
+            clear_action = menu.addAction("Clear Contours")
+            chosen = menu.exec(self.target_list.mapToGlobal(pos))
+            if chosen is copy_action:
+                self._copy_target_item(item)
+            elif chosen is paste_action:
+                self._paste_to_layer(layer_id)
+            elif chosen is clear_action:
+                self._clear_target_item(item)
 
     def _on_target_double_clicked(self, item: QListWidgetItem) -> None:
         data = item.data(Qt.ItemDataRole.UserRole)

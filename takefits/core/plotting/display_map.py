@@ -14,6 +14,7 @@ from takefits.logic.data_tools import (
     is_lazy_scaled,
     sanitize_slice,
 )
+from takefits.core.fonts import resolve_mpl_font_family
 
 if TYPE_CHECKING:
     from takefits.core.viewer_state import ViewerState
@@ -127,7 +128,7 @@ class DisplayMap:
         self.colorscale = config.get('colorscale', 'Rainbow')  # default color pattern
         self.coord_wrap = config.get('coord_wrap', 180)
         self.axislabel_fontsize = config.get('axislabel_fontsize', 14)
-        self.axislabel_fontfamily = config.get('axislabel_fontfamily', 'Arial')
+        self.axislabel_fontfamily = resolve_mpl_font_family(config.get('axislabel_fontfamily', 'DejaVu Sans'))
         self.axislabel_color = config.get('axislabel_color', 'black')
         self.default_ticks_position = config.get('default_ticks_position', 'btlr')
         self.xticklabel_position = config.get('xticklabel_position', 'b')
@@ -163,7 +164,7 @@ class DisplayMap:
         
         self.decimal = config.get('decimal', True)
         
-        self.tick_font = config.get('tick_font', 'Arial')
+        self.tick_font = resolve_mpl_font_family(config.get('tick_font', 'DejaVu Sans'))
         self.tick_font_weight = config.get('tick_font_weight', 'normal')
         
         self.colorbar_orientation = config.get('colorbar_orientation', 'vertical')

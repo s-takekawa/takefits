@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 
 from takefits.core.app_state import AppState
-from takefits.logic.data_tools import format_nbytes
+from takefits.logic.data_tools import format_nbytes, _get_total_ram_bytes
 from takefits.logic.progress import CancellationToken, ProgressReporter
 from .utils import update_datamin_datamax_if_present
 
@@ -27,26 +27,8 @@ class ClumpResult:
 
 
 def _detect_total_ram_bytes() -> int | None:
-    """Best-effort total physical RAM in bytes."""
-    try:
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        if pages > 0 and page_size > 0:
-            return int(pages) * int(page_size)
-    except (AttributeError, OSError, ValueError):
-        pass
-    try:
-        import subprocess
-
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2
-        )
-        value = int(out.stdout.strip())
-        if value > 0:
-            return value
-    except Exception:
-        pass
-    return None
+    """Best-effort total physical RAM in bytes (macOS / Linux / Windows)."""
+    return _get_total_ram_bytes()
 
 
 def _clump_mask_memory_limit_bytes() -> int:

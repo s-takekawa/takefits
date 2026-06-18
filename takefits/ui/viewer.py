@@ -26,6 +26,7 @@ from takefits.core.coordinate import CoordinateConverter
 from takefits.core.config import ConfigManager
 from takefits.core.colorbar_layout import compute_colorbar_geometry, orientation_for_placement
 from takefits.core.click_label_layout import compute_click_label_geometry
+from takefits.core.fonts import resolve_mpl_font_family
 from takefits.core.viewer_state import ViewerState
 from takefits.core.contour_manager import ContourManager, ContourItem
 from takefits.core.plotting.display_map import DisplayMap
@@ -251,11 +252,6 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self._pending_region_restore = []
         self._contour_layer_id = None
         self._contour_title_connected = False
-        try:
-            from takefits.ui.subwindow import SubWindow_control
-            self.SubWindow = SubWindow_control()
-        except ImportError:
-            self.SubWindow = None
         if self.wcs is None and header is not None:
             try:
                 self.wcs = WCS(header)
@@ -422,7 +418,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         #self.pos_chlabel_w = config.get('pos_chlabel_w', 250)
         #self.pos_chlabel_h = config.get('pos_chlabel_h', 20)
         self.ch_label_color = config.get('ch_label_color', 'grey')
-        self.ch_label_font = config.get('ch_label_font', 'Arial')
+        self.ch_label_font = resolve_mpl_font_family(config.get('ch_label_font', 'DejaVu Sans'))
         self.ch_label_size = config.get('ch_label_size', 10)
         
         self.range_file = config.get('range_file', 'takefits.range')
@@ -1556,7 +1552,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self.canvas.mpl_connect('button_release_event', self.on_release)
         self.canvas.mpl_connect('key_press_event', self.on_key_press)
         self.canvas.mpl_connect('key_release_event', self.on_key_release)
-        self.last_update_time = 0 
+        self.last_update_time = 0
         self.canvas.mpl_connect('motion_notify_event', self.cursor_position)
 
        
@@ -1599,6 +1595,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.slider.setSingleStep(1)
             self.slider.setRange(rmin,rmax)
             self.slider.valueChanged.connect(self.scroll_slider)
+            # Cross-window spectral sync (Phase 2): match channel by velocity/freq.
+            self.slider.valueChanged.connect(self._on_slider_sync)
         
             self.chval_box.setObjectName("chval_vox")
             _allow_compact_line_edit(self.chval_box, minimum_width=45, maximum_width=80)
@@ -2112,7 +2110,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         
         self.ch_label_color = config.get('ch_label_color')
         self.ch_label_size = config.get('ch_label_size')
-        self.ch_label_font = config.get('ch_label_font')
+        self.ch_label_font = resolve_mpl_font_family(config.get('ch_label_font'))
 
         if hasattr(self, 'displaymap') and self.displaymap is not None:
             if colorscale:
@@ -2164,7 +2162,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 #subwindow.pos_chlabel_h = config.get('pos_chlabel_h')
                 subwindow.ch_label_color = config.get('ch_label_color')
                 subwindow.ch_label_size = config.get('ch_label_size')
-                subwindow.ch_label_font = config.get('ch_label_font')
+                subwindow.ch_label_font = resolve_mpl_font_family(config.get('ch_label_font'))
                 #subwindow.label2.setStyleSheet("QLabel { color : %s; }" % self.ch_label_color)
                 #subwindow.label2.setFont(font)
                 if hasattr(subwindow, 'displaymap') and subwindow.displaymap is not None:
@@ -2347,6 +2345,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         """Apply configuration settings to a single ViewerState."""
         if state is None:
             return
+        axislabel_fontfamily = resolve_mpl_font_family(config.get('axislabel_fontfamily'))
+        tick_font = resolve_mpl_font_family(config.get('tick_font'))
 
         if state.fig:
             state.fig.set_facecolor(config.get('fig_background_color'))
@@ -2390,24 +2390,24 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         if state.ax_coord:
             if plane == 'xy':
                 state.ax_coord[0].set_axislabel(self.xlabel, fontsize=config.get('axislabel_fontsize'),
-                                                 fontfamily=config.get('axislabel_fontfamily'),
+                                                 fontfamily=axislabel_fontfamily,
                                                  color=config.get('axislabel_color'))
                 state.ax_coord[1].set_axislabel(self.ylabel, fontsize=config.get('axislabel_fontsize'),
-                                                 fontfamily=config.get('axislabel_fontfamily'),
+                                                 fontfamily=axislabel_fontfamily,
                                                  color=config.get('axislabel_color'))
             elif plane == 'xz':
                 state.ax_coord[0].set_axislabel(self.xlabel, fontsize=config.get('axislabel_fontsize'),
-                                                 fontfamily=config.get('axislabel_fontfamily'),
+                                                 fontfamily=axislabel_fontfamily,
                                                  color=config.get('axislabel_color'))
                 state.ax_coord[1].set_axislabel(self.zlabel, fontsize=config.get('axislabel_fontsize'),
-                                                 fontfamily=config.get('axislabel_fontfamily'),
+                                                 fontfamily=axislabel_fontfamily,
                                                  color=config.get('axislabel_color'))
             elif plane == 'zy':
                 state.ax_coord[0].set_axislabel(self.zlabel, fontsize=config.get('axislabel_fontsize'),
-                                                 fontfamily=config.get('axislabel_fontfamily'),
+                                                 fontfamily=axislabel_fontfamily,
                                                  color=config.get('axislabel_color'))
                 state.ax_coord[1].set_axislabel(self.ylabel, fontsize=config.get('axislabel_fontsize'),
-                                                 fontfamily=config.get('axislabel_fontfamily'),
+                                                 fontfamily=axislabel_fontfamily,
                                                  color=config.get('axislabel_color'))
 
             state.ax_coord[0].set_axislabel_position(xtick_label_position)
@@ -2418,7 +2418,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 pad=config.get('tick_pad_x'),
                 size=config.get('tick_labelsize'),
                 color=config.get('tick_labelcolor'),
-                fontfamily=config.get('tick_font'),
+                fontfamily=tick_font,
             )
             state.ax_coord[0].set_ticklabel_position(xtick_label_position)
             state.ax_coord[0].set_ticks_position(config.get('default_ticks_position'))
@@ -2427,7 +2427,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 pad=config.get('tick_pad_y'),
                 size=config.get('tick_labelsize'),
                 color=config.get('tick_labelcolor'),
-                fontfamily=config.get('tick_font'),
+                fontfamily=tick_font,
             )
             state.ax_coord[1].set_ticklabel_position(ytick_label_position)
             state.ax_coord[1].set_ticks_position(config.get('default_ticks_position'))
@@ -3010,57 +3010,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.region_manager.draw_regions_for_blit()
 
             x, y = self.ax.transData.inverted().transform((event.x, event.y))
-            xstr, ystr = self.format_pix.convert(self.plane, x, y)
-            if self.data.ndim > 2:
-                if self.plane == 'xy': 
-                    self._set_clicked('xy', True)
-                    # Note: Do not reset zpix from slider here. Preserve current slice.
-                    zpix = self._get_shared_zpix()
-                    world_z = self.format_pix.convert_chpix_to_world(self.plane, x, y, zpix)
-                    world_z_str = self.format_pix.convert_chval_to_world_str(self.plane, world_z)
-                    i, j, k = int(round(x)), int(round(y)), zpix
-                    self._update_shared_world_xyz(self._get_shared_world_x(), self._get_shared_world_y(), world_z)
-                    self._update_shared_world_xyz_str(xstr, ystr, world_z_str)
-                    try: intensity = self.cube[k,j,i]
-                    except: return
-                    
-                    
-                elif self.plane == 'xz':
-                    self._set_clicked('xz', True)
-                    # Note: Do not reset ypix from slider here. Preserve current slice.
-                    ypix = self._get_shared_ypix()
-                    world_y = self.format_pix.convert_chpix_to_world(self.plane, x, ypix, y)
-                    world_y_str = self.format_pix.convert_chval_to_world_str(self.plane, world_y)
-                    i, j, k = int(round(x)), ypix, int(round(y))
-                    self._update_shared_world_xyz(self._get_shared_world_x(), world_y, self._get_shared_world_z())
-                    self._update_shared_world_xyz_str(xstr, world_y_str, ystr)
-                    try: intensity = self.cube[k,j,i]
-                    except: return
-                    
-                elif self.plane == 'zy':
-                    self._set_clicked('zy', True)
-                    # Note: Do not reset xpix from slider here. Preserve current slice.
-                    xpix = self._get_shared_xpix()
-                    world_x = self.format_pix.convert_chpix_to_world(self.plane, xpix, y, x)
-                    world_x_str = self.format_pix.convert_chval_to_world_str(self.plane, world_x)                
-                    i, j, k = xpix, int(round(y)), int(round(x))
-                    self._update_shared_world_xyz(world_x, self._get_shared_world_y(), self._get_shared_world_z())
-                    self._update_shared_world_xyz_str(world_x_str, ystr, xstr)
-                    try: intensity = self.cube[k,j,i]
-                    except: return
-                print('\r Clicked at (%s, %s, %s)              \n Intensity = %s %s            \033[1A'  % (self._get_shared_world_x_str(), self._get_shared_world_y_str(), self._get_shared_world_z_str(), self._format_significant_digits(intensity, 4), self.bunit), end = '')
-                
-            elif self.data.ndim == 2: 
-                i, j = int(round(x)), int(round(y))
-                try: intensity =  self.data[j,i]
-                except: return
-                print('\r Clicked at (%s, %s)             \n%s %s          \033[1A'  % (self._get_shared_world_x_str(), self._get_shared_world_y_str(), self._format_significant_digits(intensity, 4), self.bunit), end = '')
-                
-            intensity_text = self._format_intensity_with_unit(intensity)
-            self.update_clicked_pix(x, y)
-            coord_text = self._format_cursor_pair_text(self.plane, xstr, ystr)
-            self.label.setText(self._compose_click_label_text(coord_text, intensity_text))
-            self._position_click_label()
+            self._perform_click_at(x, y)
+            self._broadcast_click_if_synced(x, y)
 
         elif event.inaxes != self.ax:
             if event.dblclick:
@@ -3085,6 +3036,105 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                     if canvas:
                         canvas.draw_idle()
 
+
+    def _perform_click_at(self, x, y, *, announce: bool = True):
+        """Apply a click at data coords ``(x, y)`` in this viewer's plane.
+
+        Shared by the real mouse handler and the cross-window sync path. A
+        synced click keeps the target UI updates but suppresses terminal output
+        so the readout remains tied to the window the user actually clicked.
+        """
+        def cube_intensity(k, j, i):
+            cube = getattr(self, "cube", None)
+            if cube is None:
+                return None
+            try:
+                k = int(k)
+                j = int(j)
+                i = int(i)
+                if (
+                    k < 0 or j < 0 or i < 0
+                    or k >= cube.shape[0]
+                    or j >= cube.shape[1]
+                    or i >= cube.shape[2]
+                ):
+                    return None
+                return cube[k, j, i]
+            except Exception:
+                return None
+
+        def image_intensity(j, i):
+            data = getattr(self, "data", None)
+            if data is None:
+                return None
+            try:
+                j = int(j)
+                i = int(i)
+                if j < 0 or i < 0 or j >= data.shape[0] or i >= data.shape[1]:
+                    return None
+                return data[j, i]
+            except Exception:
+                return None
+
+        xstr, ystr = self.format_pix.convert(self.plane, x, y)
+        intensity = None
+        if self.data.ndim > 2:
+            if self.plane == 'xy':
+                self._set_clicked('xy', True)
+                # Note: Do not reset zpix from slider here. Preserve current slice.
+                zpix = self._get_shared_zpix()
+                world_z = self.format_pix.convert_chpix_to_world(self.plane, x, y, zpix)
+                world_z_str = self.format_pix.convert_chval_to_world_str(self.plane, world_z)
+                i, j, k = int(round(x)), int(round(y)), zpix
+                self._update_shared_world_xyz(self._get_shared_world_x(), self._get_shared_world_y(), world_z)
+                self._update_shared_world_xyz_str(xstr, ystr, world_z_str)
+                intensity = cube_intensity(k, j, i)
+
+            elif self.plane == 'xz':
+                self._set_clicked('xz', True)
+                # Note: Do not reset ypix from slider here. Preserve current slice.
+                ypix = self._get_shared_ypix()
+                world_y = self.format_pix.convert_chpix_to_world(self.plane, x, ypix, y)
+                world_y_str = self.format_pix.convert_chval_to_world_str(self.plane, world_y)
+                i, j, k = int(round(x)), ypix, int(round(y))
+                self._update_shared_world_xyz(self._get_shared_world_x(), world_y, self._get_shared_world_z())
+                self._update_shared_world_xyz_str(xstr, world_y_str, ystr)
+                intensity = cube_intensity(k, j, i)
+
+            elif self.plane == 'zy':
+                self._set_clicked('zy', True)
+                # Note: Do not reset xpix from slider here. Preserve current slice.
+                xpix = self._get_shared_xpix()
+                world_x = self.format_pix.convert_chpix_to_world(self.plane, xpix, y, x)
+                world_x_str = self.format_pix.convert_chval_to_world_str(self.plane, world_x)
+                i, j, k = xpix, int(round(y)), int(round(x))
+                self._update_shared_world_xyz(world_x, self._get_shared_world_y(), self._get_shared_world_z())
+                self._update_shared_world_xyz_str(world_x_str, ystr, xstr)
+                intensity = cube_intensity(k, j, i)
+            if announce:
+                coord_text = f"({self._get_shared_world_x_str()}, {self._get_shared_world_y_str()}, {self._get_shared_world_z_str()})"
+                if intensity is not None:
+                    value_text = f"Intensity = {self._format_significant_digits(intensity, 4)} {self.bunit}"
+                else:
+                    value_text = "Intensity = outside data"
+                self._emit_click_readout(coord_text, value_text)
+
+        elif self.data.ndim == 2:
+            i, j = int(round(x)), int(round(y))
+            intensity = image_intensity(j, i)
+            if announce:
+                coord_text = f"({self._get_shared_world_x_str()}, {self._get_shared_world_y_str()})"
+                if intensity is not None:
+                    value_text = f"{self._format_significant_digits(intensity, 4)} {self.bunit}"
+                else:
+                    value_text = "outside data"
+                self._emit_click_readout(coord_text, value_text)
+
+        intensity_text = self._format_intensity_with_unit(intensity) if intensity is not None else "outside data"
+        self.update_clicked_pix(x, y)
+        coord_text = self._format_cursor_pair_text(self.plane, xstr, ystr)
+        self.label.setText(self._compose_click_label_text(coord_text, intensity_text))
+        self._position_click_label()
 
     def on_release(self, event):
         """Handles mouse release events, delegating to the RegionManager if in region mode."""
@@ -3127,6 +3177,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         self.label.setVisible(True)
                 except Exception:
                     pass
+                # Mirror the drag end-point to synced windows (release-only).
+                self._broadcast_click_if_synced(x, y)
 
     def _position_click_label(self):
         label = getattr(self, "label", None)
@@ -3441,9 +3493,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         if not cursor_already_redrawn:
             self._update_plane_cursor(self.plane, x=x, y=y)
 
-        # Access subwindow visibility
-        subwindow1 = getattr(self.SubWindow, 'subwindow1', None)
-        subwindow2 = getattr(self.SubWindow, 'subwindow2', None)
+        # Access subwindow visibility (THIS window's own subwindows, per-window)
+        subwindow1 = self._owned_subwindow('xz')
+        subwindow2 = self._owned_subwindow('zy')
         sub1_visible = subwindow1 is not None and not subwindow1.isHidden()
         sub2_visible = subwindow2 is not None and not subwindow2.isHidden()
         defer_orthogonal_refresh = self.is_large_data_mode() and bool(fast_blit)
@@ -3989,7 +4041,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
             if not self._get_clicked('xy'):
                 xy_plabel = self._get_plane_plabel('xy')
-                if getattr(getattr(self, 'SubWindow', None), 'subwindow1', None) is not None and not self.SubWindow.subwindow1.isHidden():
+                xz_sub_own = self._owned_subwindow('xz')
+                if xz_sub_own is not None and not xz_sub_own.isHidden():
                     if xy_plabel and xy_plabel.isVisible():
                         xz_canvas = self._get_plane_canvas('xz')
                         xz_overlay = self._get_plane_overlay_ax('xz')
@@ -4013,7 +4066,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                         if xz_canvas and xz_overlay:
                             xz_canvas.blit(xz_overlay.bbox)
 
-                subwindow2 = getattr(self.SubWindow, 'subwindow2', None)
+                subwindow2 = self._owned_subwindow('zy')
                 if subwindow2 is not None and subwindow2.isHidden() == False:
                     zy_plabel = self._get_plane_plabel('zy')
                     if zy_plabel and zy_plabel.isVisible():
@@ -4086,7 +4139,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 if xy_plabel and xy_plabel.isVisible():
                     self.main_window.redraw_main_overlay_and_blit()
 
-                    subwindow2 = getattr(self.SubWindow, 'subwindow2', None)
+                    subwindow2 = self._owned_subwindow('zy')
                     if subwindow2 is not None and subwindow2.isHidden() == False:
                         zy_canvas = self._get_plane_canvas('zy')
                         zy_overlay = self._get_plane_overlay_ax('zy')
@@ -4164,7 +4217,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
 
 
-                    if getattr(getattr(self, 'SubWindow', None), 'subwindow1', None) is not None and not self.SubWindow.subwindow1.isHidden():
+                    xz_sub_own = self._owned_subwindow('xz')
+                    if xz_sub_own is not None and not xz_sub_own.isHidden():
                         xz_canvas = self._get_plane_canvas('xz')
                         xz_overlay = self._get_plane_overlay_ax('xz')
                         xz_bg = self._get_plane_background('xz')
@@ -4405,6 +4459,67 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                     pass
             self._perf_end(perf_token)
 
+    # ------------------------------------------------------------------
+    # Cross-window sync source hooks (Phase 2 WindowSyncManager).
+    # ------------------------------------------------------------------
+    def _window_sync_manager(self):
+        try:
+            from takefits.ui.window_sync_manager import WindowSyncManager
+        except Exception:
+            return None
+        try:
+            return WindowSyncManager.instance()
+        except Exception:
+            return None
+
+    def _broadcast_click_if_synced(self, click_x=None, click_y=None):
+        """Broadcast this window's clicked position to others (source side)."""
+        manager = self._window_sync_manager()
+        if manager is None or not manager.enabled or not manager.sync_cursor:
+            return
+        if getattr(manager, "_applying", False):
+            return
+        source = self._get_main_viewer()
+        if source is None:
+            source = self
+        manager.broadcast_click(source, getattr(self, "plane", "xy"), click_x, click_y)
+
+    def _broadcast_synced_view(self):
+        """Push this window's current view to synced windows (source side).
+
+        Used by every code path that changes the viewport without going through
+        the nav toolbar's pan/zoom release (Home/Full and View Back/Forward), so
+        the cross-window lock follows regardless of how the view was changed.
+        """
+        manager = self._window_sync_manager()
+        if manager is None:
+            return
+        source = self._get_main_viewer() or self
+        try:
+            manager.broadcast_view(source)
+        except Exception:
+            pass
+
+    def _on_slider_sync(self, *args):
+        """Broadcast a slider/scroll change to other windows (source side).
+
+        Each plane's slider drives a different cube axis: XY → spectral channel
+        (z), XZ → the y slice, ZY → the x slice. The spectral channel follows
+        the Spectral toggle; the spatial slice sliders follow the Cursor toggle.
+        """
+        manager = self._window_sync_manager()
+        if manager is None or not manager.enabled:
+            return
+        if getattr(manager, "_applying", False):
+            return
+        plane = getattr(self, "plane", "xy")
+        if plane == "xy":
+            if manager.sync_spectral:
+                manager.broadcast_spectral(self)
+        elif plane in ("xz", "zy"):
+            if manager.sync_cursor:
+                source = self._get_main_viewer() or self
+                manager.broadcast_slice(source, plane)
 
     def redraw_overlay_for_plane(self, plane=None, *, lightweight: bool = False):
         """
@@ -4971,14 +5086,66 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             input_field.setText(str(value))
 
     def _get_main_viewer(self):
-        """Return the owning main viewer for this window."""
+        """Return the owning main viewer for this window.
+
+        Resolution is strictly per-instance: subwindows set ``main_viewer`` to
+        their parent main window; the main viewer leaves it unset and resolves to
+        ``self``. (An earlier version fell back to the class attribute
+        ``FITSViewer.main_window``, but that attribute is never assigned on the
+        class -- only as an instance attribute -- so the fallback was dead code
+        and a misleading process-global reference in multi-window use.)
+        """
         main = getattr(self, 'main_viewer', None)
         if main is not None:
             return main
-        class_main = getattr(FITSViewer, 'main_window', None)
-        if class_main is not None:
-            return class_main
         return self
+
+    def _owned_subwindow(self, plane):
+        """Return THIS window's own XZ/ZY subwindow (per-window, not a shared global).
+
+        The orthogonal re-blit gate historically read
+        ``SubWindow_control.subwindow1/2``, which are process-global class
+        attributes (last-writer-wins across windows). After another window was
+        closed, the survivor saw a stale/hidden subwindow and skipped its XZ/ZY
+        re-blit on click. Resolve the owning main viewer's own subwindows
+        instead. ``main_viewer`` is a per-instance attribute (set on subwindows
+        to their parent; absent on the main viewer, so falls back to ``self``).
+        """
+        main = getattr(self, 'main_viewer', None) or self
+        if plane == 'xz':
+            return getattr(main, 'subwindow1', None)
+        if plane == 'zy':
+            return getattr(main, 'subwindow2', None)
+        return None
+
+    def _emit_click_readout(self, coord_text, value_text):
+        """Print the click coordinate / intensity to the terminal in place.
+
+        Both single- and multi-FITS use the same in-place two-line read-out, so
+        repeated clicks update one block instead of spamming a new line each
+        time. With two or more FITS open the block carries a ``"FITS N:"`` tag
+        (from ``fits_identity_prefix``, empty for a lone window) so it is clear
+        which window the last click came from. The cursor is left on the block
+        for the next click to overwrite; ``mark_inplace_pending`` lets the next
+        non-click print (opening a FITS, warnings) move past it first.
+        """
+        main = getattr(self, 'main_viewer', None) or self
+        prefix = ""
+        getp = getattr(main, 'fits_identity_prefix', None)
+        if callable(getp):
+            try:
+                prefix = getp() or ""
+            except Exception:
+                prefix = ""
+        from takefits.core.terminal import mark_inplace_pending
+        # In-place two-line read-out for both single and multiple FITS. With two
+        # or more open it carries a "FITS N:" tag and the SAME line is updated on
+        # each click (no per-click newline spam). Marking it pending lets the
+        # next non-click print (opening a FITS, warnings) move past it instead of
+        # colliding ("…13Loading: foo.fits").
+        tag = f"{prefix}: " if prefix else ""
+        print(f"\r {tag}Clicked at {coord_text}              \n {value_text}            \033[1A", end='')
+        mark_inplace_pending()
 
     def _resolve_world_anchor(self, axis: str) -> str:
         """Return a safe world-value anchor string for WCS conversions."""
@@ -5371,8 +5538,42 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 record_history(reason="full_reset")
             except Exception:
                 pass
+        # "Full" buttons reach the view this way (not via toolbar.home), so
+        # propagate the reset viewport to synced windows here.
+        self._broadcast_synced_view()
 
-    
+    def apply_synced_z_range(self, zp_min, zp_max):
+        """Set the spectral (z) extent shown in the XZ/ZY planes, in pixels.
+
+        Used by the cross-window view lock so a window's z-range follows the
+        source's spectral extent. Updates the subwindow axes and the range
+        read-outs; no-op for 2-D data.
+        """
+        if self.data is None or self.data.ndim <= 2:
+            return
+        if zp_min > zp_max:
+            zp_min, zp_max = zp_max, zp_min
+        subs = list(getattr(self, 'subwindows', None) or [])
+        if len(subs) > 0 and subs[0] is not None:  # XZ: z on vertical axis
+            subs[0].ax.set_ylim(zp_min, zp_max)
+            subs[0].overlay_ax.set_position(subs[0].ax.get_position())
+            subs[0]._suspend_regions_for_full_draw()
+            subs[0].canvas.draw_idle()
+        if len(subs) > 1 and subs[1] is not None:  # ZY: z on horizontal axis
+            subs[1].ax.set_xlim(zp_min, zp_max)
+            subs[1].overlay_ax.set_position(subs[1].ax.get_position())
+            subs[1]._suspend_regions_for_full_draw()
+            subs[1].canvas.draw_idle()
+        # Refresh the world-range read-outs for the z extent.
+        try:
+            if len(subs) > 0 and subs[0] is not None:
+                self.update_ranges('xz', subs[0].ax.get_xlim(), (zp_min, zp_max))
+            if len(subs) > 1 and subs[1] is not None:
+                self.update_ranges('zy', (zp_min, zp_max), subs[1].ax.get_ylim())
+        except Exception:
+            pass
+
+
     def reset_ranges(self, plane):
         self.original_xlim = (-0.5, self.data.shape[self.data.ndim-1]-0.5)
         self.original_ylim = (-0.5, self.data.shape[self.data.ndim-2]-0.5)

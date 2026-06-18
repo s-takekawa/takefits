@@ -1,6 +1,7 @@
 from takefits.ui.viewer import FITSViewer
 from takefits.ui.menu_bar import MenuBar, mirror_menu_bar_to_window
-from takefits.ui.subwindow import SubWindow, SubWindow_control
+from takefits.ui.subwindow import SubWindow
+from takefits.ui.window_registry import WindowRegistry
 
 from takefits.ui.control_panel import ControlPanel
 from takefits.ui.range_control import RangeControlPanel
@@ -48,14 +49,19 @@ from PySide6.QtGui import QCursor, QGuiApplication
 import base64
 import io
 import os
+import sys
 import json
 import math
+import time
 import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from functools import partial
 from takefits.core.viewer_coordinator import ViewerCoordinator
 from takefits.core.wcs_frames import frame_is_available, normalize_display_frame, preferred_display_frame
+
+
+_AUTO_UPDATE_CHECK_STARTED_PROPERTY = "takefits_auto_update_check_started"
 
 
 class MainWindow(FITSViewer):
@@ -129,7 +135,6 @@ class MainWindow(FITSViewer):
             self.config_manager.config.get("startup_show_subwindow2", False)
         ) and not self._browse_first_startup
         if self.data.ndim > 2:
-            SubWindow_control.update_subwindow(self.subwindow1, self.subwindow2)
             self.menu_bar.enable_plane_menu(True)
             self.menu_bar.sub1_action.setChecked(False)
             self.menu_bar.sub2_action.setChecked(False)
@@ -145,6 +150,7 @@ class MainWindow(FITSViewer):
         self.control_panel = None
         self.range_panel = None
         self.magnifier_panel = None
+        self.header_panel = None
         if self._browse_first_startup:
             self.menu_bar.control_panel_action.setChecked(False)
             self.menu_bar.range_panel_action.setChecked(False)
@@ -251,11 +257,20 @@ class MainWindow(FITSViewer):
         self._refresh_undo_redo_actions()
         self._refresh_view_navigation_actions()
         app = QApplication.instance()
+        # Keep a reference to the focus-changed slot so closeEvent can disconnect
+        # it: focusWindowChanged lives on the process-global QApplication, so a
+        # bare connect would keep every closed MainWindow alive forever and fan
+        # the nav-refresh out to all of them on every focus change (O(N) per
+        # focus event, O(N**2) over a long session of opening/closing FITS).
+        self._focus_window_changed_slot = None
         if app is not None:
             try:
-                app.focusWindowChanged.connect(lambda *_: self._refresh_view_navigation_actions())
+                self._focus_window_changed_slot = (
+                    lambda *_: self._refresh_view_navigation_actions()
+                )
+                app.focusWindowChanged.connect(self._focus_window_changed_slot)
             except Exception:
-                pass
+                self._focus_window_changed_slot = None
             try:
                 app.installEventFilter(self)
             except Exception:
@@ -275,6 +290,31 @@ class MainWindow(FITSViewer):
         self._update_check_timer.timeout.connect(self._start_auto_update_check)
         self._update_check_timer.start(5000)
 
+        # Multi-window support: join the app-level registry so closing a window
+        # quits the app only when it is the last one open.
+        self._registered_in_window_registry = False
+        self._suppress_owner_raise_until = 0.0
+        # Tokens of the family windows that were visible when this FITS was
+        # hidden via "Hide This/Other FITS"; used to restore exactly that set.
+        self._hidden_family_snapshot = []
+        try:
+            WindowRegistry.instance().register(self)
+            self._registered_in_window_registry = True
+        except Exception:
+            pass
+        # When the open set changes (a window opens/closes), every window's
+        # "FITS N" number may shift, so refresh the identity shown in titles.
+        try:
+            WindowRegistry.instance().windows_changed.connect(
+                self.refresh_fits_identity_labels
+            )
+        except Exception:
+            pass
+        # Don't raise the owner for the activations that fire while the window
+        # and its panels are first coming up.
+        self._suppress_owner_raise(1000)
+        self.refresh_fits_identity_labels()
+
     def ensure_subwindow1(self):
         """Create the XZ subwindow on first demand."""
         if self.data.ndim <= 2:
@@ -286,7 +326,6 @@ class MainWindow(FITSViewer):
         self.subwindow1 = SubWindow('xz', "SubWindow1: %s" % filename, self)
         if self.subwindow1 not in self.subwindows:
             self.subwindows.append(self.subwindow1)
-        SubWindow_control.update_subwindow(self.subwindow1, self.subwindow2)
 
         if getattr(self, "coordinator", None) is not None:
             self.coordinator.register_viewer('xz', self.subwindow1)
@@ -316,6 +355,7 @@ class MainWindow(FITSViewer):
             self.range_panel.subwindows = self.subwindows
             self.range_panel._sync_inputs('xz')
         self._refresh_view_navigation_actions()
+        self.refresh_fits_identity_labels()
 
         return self.subwindow1
 
@@ -330,7 +370,6 @@ class MainWindow(FITSViewer):
         self.subwindow2 = SubWindow('zy', "SubWindow2: %s" % filename, self)
         if self.subwindow2 not in self.subwindows:
             self.subwindows.append(self.subwindow2)
-        SubWindow_control.update_subwindow(self.subwindow1, self.subwindow2)
 
         # SubWindow2 can be created after unsaved config Apply.
         # Mirror the live navigation config so wheel behavior matches Main/Sub1.
@@ -404,6 +443,7 @@ class MainWindow(FITSViewer):
             self.range_panel.subwindows = self.subwindows
             self.range_panel._sync_inputs('zy')
         self._refresh_view_navigation_actions()
+        self.refresh_fits_identity_labels()
 
         return self.subwindow2
 
@@ -451,6 +491,7 @@ class MainWindow(FITSViewer):
             self.control_panel = ControlPanel(self, self.subwindows, visible=visible)
             for subwindow in self.subwindows:
                 self._connect_subwindow_controls(subwindow)
+            self.refresh_fits_identity_labels()
         return self.control_panel
 
     def ensure_range_panel(self):
@@ -458,6 +499,7 @@ class MainWindow(FITSViewer):
         if getattr(self, "range_panel", None) is None:
             self.range_panel = RangeControlPanel(self, self.subwindows)
             self.range_panel.hide()
+            self.refresh_fits_identity_labels()
         return self.range_panel
 
     def ensure_magnifier_panel(self):
@@ -465,7 +507,152 @@ class MainWindow(FITSViewer):
         if getattr(self, "magnifier_panel", None) is None:
             self.magnifier_panel = MagnifierPanel(self)
             self.magnifier_panel.setProperty("_default_position_applied", False)
+            self.refresh_fits_identity_labels()
         return self.magnifier_panel
+
+    # ------------------------------------------------------------------
+    # Multi-window identity: "FITS N" number shown in titles + owner highlight
+    def fits_window_number(self):
+        """1-based number of this window among open FITS windows (or None)."""
+        try:
+            return WindowRegistry.instance().number(self)
+        except Exception:
+            return None
+
+    def fits_identity_prefix(self) -> str:
+        """Identity label, e.g. ``"FITS 2"`` -- empty when only one FITS is open.
+
+        With a single window the number is just noise, so titles fall back to
+        the plain name. The ``FITS N`` prefix appears only once it disambiguates.
+        """
+        number = self.fits_window_number()
+        try:
+            total = WindowRegistry.instance().count()
+        except Exception:
+            total = 0
+        if number and total >= 2:
+            return f"FITS {number}"
+        return ""
+
+    @staticmethod
+    def _set_window_title_if_changed(widget, title: str):
+        if widget is None:
+            return
+        try:
+            if str(widget.windowTitle()) != title:
+                widget.setWindowTitle(title)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _plane_display_label(plane) -> str:
+        """Human label for a viewer plane, e.g. 'xz' -> 'X-Z'."""
+        return {"xy": "X-Y", "xz": "X-Z", "zy": "Z-Y"}.get(
+            str(plane or "").lower(), str(plane or "").upper()
+        )
+
+    @staticmethod
+    def _identity_title(prefix: str, label: str, basename: str) -> str:
+        """Compose '[FITS N · ]<label>: <name>' (prefix omitted when empty)."""
+        return f"{prefix} · {label}: {basename}" if prefix else f"{label}: {basename}"
+
+    def refresh_fits_identity_labels(self):
+        """Stamp the ``FITS N`` identity onto every window in this FITS family.
+
+        The main viewer, its X-Z/Z-Y subwindows, and the tool/range/aux panels
+        all share one ``[FITS N · ]<label>: <name>`` scheme so it is obvious
+        which FITS each belongs to. The ``FITS N`` prefix appears only with
+        several windows open. Called on creation, when a panel/subwindow
+        appears, and whenever the open-window set changes (numbers renumber).
+        """
+        if getattr(self, "_is_app_closing", False):
+            return
+        prefix = self.fits_identity_prefix()
+        basename = str(getattr(self, "filename", "") or "").strip() or "Untitled FITS"
+
+        # Main viewer (X-Y). Keep original_window_title as the un-decorated base
+        # so the region-mode prefix machinery keeps working.
+        main_label = self._plane_display_label(getattr(self, "plane", "xy"))
+        base_title = self._identity_title(prefix, main_label, basename)
+        self.original_window_title = base_title
+        if getattr(self, "region_mode_enabled", False) and getattr(self, "region_shape", None):
+            self._set_window_title_if_changed(
+                self, f"[REGION MODE: {str(self.region_shape).upper()}] {base_title}"
+            )
+        else:
+            self._set_window_title_if_changed(self, base_title)
+
+        # Viewer subwindows (X-Z / Z-Y) share the same scheme as the main viewer.
+        for attr, plane in (("subwindow1", "xz"), ("subwindow2", "zy")):
+            sub = getattr(self, attr, None)
+            if sub is None:
+                continue
+            self._set_window_title_if_changed(
+                sub, self._identity_title(prefix, self._plane_display_label(plane), basename)
+            )
+
+        # Tool/range/aux panels carry the same prefix so their owner is obvious
+        # when it matters (multi-window); otherwise just "<Label>: <name>".
+        for attr, label in (
+            ("control_panel", "Tools"),
+            ("range_panel", "Range Control"),
+            ("magnifier_panel", "Magnifier"),
+            ("header_panel", "Header"),
+            ("marker_panel", "Markers"),
+        ):
+            panel = getattr(self, attr, None)
+            if panel is None:
+                continue
+            self._set_window_title_if_changed(panel, self._identity_title(prefix, label, basename))
+
+        # Integration result windows belong to this FITS too; let them re-stamp
+        # their own (descriptive) titles so they show the owner and renumber.
+        for window in self._live_integration_windows():
+            refresher = getattr(window, "refresh_identity_title", None)
+            if callable(refresher):
+                try:
+                    refresher()
+                except Exception:
+                    pass
+
+    def _suppress_owner_raise(self, milliseconds: int = 400):
+        """Mute the owner-raise behaviour briefly (used by bulk operations)."""
+        try:
+            self._suppress_owner_raise_until = time.monotonic() + max(0, int(milliseconds)) / 1000.0
+        except Exception:
+            self._suppress_owner_raise_until = 0.0
+
+    def _bring_owner_window_to_front(self, activated_widget=None):
+        """Raise this FITS's main window when one of its panels is activated.
+
+        The activated panel is re-raised afterwards so it stays on top of its
+        own main window and remains usable; only *other* FITS windows recede.
+        """
+        if getattr(self, "_is_app_closing", False):
+            return
+        try:
+            if time.monotonic() < float(getattr(self, "_suppress_owner_raise_until", 0.0)):
+                return
+        except Exception:
+            pass
+        try:
+            if not self.isVisible() or self.isMinimized():
+                return
+        except Exception:
+            return
+        try:
+            self.raise_()
+        except Exception:
+            pass
+        # Keep the panel the user just touched above its main window.
+        panel = activated_widget
+        try:
+            if isinstance(panel, QWidget) and not panel.isWindow():
+                panel = panel.window()
+            if panel is not None and panel is not self:
+                panel.raise_()
+        except Exception:
+            pass
 
     def _position_magnifier_panel_at_screen_top_right(self, panel):
         if panel is None:
@@ -1411,6 +1598,7 @@ class MainWindow(FITSViewer):
         _add("control_panel", getattr(self, "control_panel", None))
         _add("range_panel", getattr(self, "range_panel", None))
         _add("magnifier_panel", getattr(self, "magnifier_panel", None))
+        _add("header_panel", getattr(self, "header_panel", None))
         _add("marker_panel", getattr(self, "marker_panel", None))
         _add("regrid_panel", getattr(self, "_regrid_panel", None))
 
@@ -1564,7 +1752,631 @@ class MainWindow(FITSViewer):
         if not callable(menu_getter):
             return False
 
-        return bool(mirror_menu_bar_to_window(self, target))
+        # Re-entrancy guard: mirroring the menu bar (addMenu/clear) can itself
+        # dispatch window events that re-enter eventFilter -> _sync, which would
+        # recurse without bound. The outer mirror is authoritative; skip nested
+        # syncs while one is in progress.
+        if getattr(self, "_syncing_menu_proxy", False):
+            return False
+        self._syncing_menu_proxy = True
+        try:
+            return bool(mirror_menu_bar_to_window(self, target))
+        finally:
+            self._syncing_menu_proxy = False
+
+    @staticmethod
+    def _is_workspace_panel_token(token) -> bool:
+        text = str(token or "")
+        return (
+            text
+            in {
+                "control_panel",
+                "range_panel",
+                "magnifier_panel",
+                "header_panel",
+                "marker_panel",
+                "regrid_panel",
+            }
+            or text.startswith("tool:")
+            or text.startswith("integration_marker:")
+            or text.startswith("channel_marker:")
+        )
+
+    def _workspace_panel_windows_by_token(self):
+        return {
+            token: window
+            for token, window in self._collect_workspace_windows_by_token().items()
+            if self._is_workspace_panel_token(token) and window is not None
+        }
+
+    @staticmethod
+    def _is_workspace_subwindow_token(token) -> bool:
+        return str(token or "").startswith("subwindow:")
+
+    def _workspace_subwindows_by_token(self):
+        return {
+            token: window
+            for token, window in self._collect_workspace_windows_by_token().items()
+            if self._is_workspace_subwindow_token(token) and window is not None
+        }
+
+    @staticmethod
+    def _is_workspace_result_token(token) -> bool:
+        """Derived result viewers (integration results, channel maps)."""
+        text = str(token or "")
+        return text.startswith("integration:") or text.startswith("channel:")
+
+    def _workspace_result_windows_by_token(self):
+        return {
+            token: window
+            for token, window in self._collect_workspace_windows_by_token().items()
+            if self._is_workspace_result_token(token) and window is not None
+        }
+
+    def _workspace_arrange_windows_by_token(self):
+        return {
+            token: window
+            for token, window in self._collect_workspace_windows_by_token().items()
+            if (
+                self._is_workspace_subwindow_token(token)
+                or self._is_workspace_panel_token(token)
+                or self._is_workspace_result_token(token)
+            )
+            and window is not None
+        }
+
+    def _sync_primary_panel_toggle_states(self):
+        for action_attr, panel_attr in (
+            ("control_panel_action", "control_panel"),
+            ("range_panel_action", "range_panel"),
+            ("magnifier_panel_action", "magnifier_panel"),
+        ):
+            panel = getattr(self, panel_attr, None)
+            visible = False
+            if panel is not None:
+                try:
+                    visible = bool(panel.isVisible())
+                except Exception:
+                    visible = False
+            self._set_panel_toggle_checked(action_attr, visible)
+
+    @staticmethod
+    def _visible_workspace_windows(windows_by_token):
+        visible = []
+        for token, window in windows_by_token.items():
+            if window is None:
+                continue
+            try:
+                if not window.isVisible():
+                    continue
+            except Exception:
+                continue
+            visible.append((token, window))
+        return visible
+
+    def _screen_available_geometry_for_family(self):
+        try:
+            screen = QGuiApplication.screenAt(self.frameGeometry().center())
+        except Exception:
+            screen = None
+        if screen is None:
+            try:
+                screen = QGuiApplication.primaryScreen()
+            except Exception:
+                screen = None
+        if screen is None:
+            return None
+        try:
+            return screen.availableGeometry()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _arrange_window_size(window):
+        width = 240
+        height = 160
+        is_viewer = str(getattr(window, "plane", "") or "").lower() in {"xy", "xz", "zy"}
+        # NB: we only *measure* here -- never resize. Arranged panels are already
+        # visible and laid out, so their current frame size is authoritative;
+        # calling adjustSize() would shrink any panel the user enlarged.
+        try:
+            geo = window.frameGeometry()
+            width = max(width, int(geo.width()))
+            height = max(height, int(geo.height()))
+        except Exception:
+            pass
+        if not is_viewer:
+            try:
+                hint = window.sizeHint()
+                width = max(width, int(hint.width()))
+                height = max(height, int(hint.height()))
+            except Exception:
+                pass
+        else:
+            try:
+                width = max(width, int(getattr(window, "figure_width", width)))
+                height = max(height, int(getattr(window, "figure_height", height)))
+            except Exception:
+                pass
+        return width, height
+
+    @staticmethod
+    def _clamped_window_position(x, y, width, height, available):
+        if available is None:
+            return int(x), int(y)
+        try:
+            min_x = int(available.left())
+            min_y = int(available.top())
+            max_x = int(available.right()) - int(width) + 1
+            max_y = int(available.bottom()) - int(height) + 1
+            return max(min_x, min(int(x), max_x)), max(min_y, min(int(y), max_y))
+        except Exception:
+            return int(x), int(y)
+
+    def _place_visible_subwindows_behind_main(self):
+        try:
+            main_geo = self.frameGeometry()
+        except Exception:
+            return 0
+        available = self._screen_available_geometry_for_family()
+        placed = 0
+        for _token, window in self._visible_workspace_windows(self._workspace_subwindows_by_token()):
+            width, height = self._arrange_window_size(window)
+            x, y = self._clamped_window_position(
+                int(main_geo.x()),
+                int(main_geo.y()),
+                width,
+                height,
+                available,
+            )
+            try:
+                window.move(x, y)
+                placed += 1
+            except Exception:
+                pass
+        return placed
+
+    def _place_result_windows_near_main(self):
+        """Cascade derived result viewers (integration/channel) near the main
+        window so they are gathered without stacking exactly on each other."""
+        try:
+            main_geo = self.frameGeometry()
+        except Exception:
+            return 0
+        available = self._screen_available_geometry_for_family()
+        placed = 0
+        for idx, (_token, window) in enumerate(
+            self._visible_workspace_windows(self._workspace_result_windows_by_token())
+        ):
+            width, height = self._arrange_window_size(window)
+            offset = 28 * (idx + 1)
+            x, y = self._clamped_window_position(
+                int(main_geo.x()) + offset,
+                int(main_geo.y()) + offset,
+                width,
+                height,
+                available,
+            )
+            try:
+                window.move(x, y)
+                placed += 1
+            except Exception:
+                pass
+        return placed
+
+    def _pull_window_to_active_space(self, window):
+        """macOS: re-home a window onto the currently active Space.
+
+        A window assigned to another Space (virtual desktop) stays there when
+        merely moved; raising it makes the OS jump to that Space. Ordering it
+        out then back in (hide/show) re-homes it onto the *active* Space, so
+        gather can pull the whole family onto the main window's desktop without
+        switching desktops. No-op off macOS.
+        """
+        if sys.platform != "darwin" or window is None or window is self:
+            return
+        try:
+            if not window.isVisible() or window.isMinimized():
+                return
+            # Skip windows already on the active Space: those are exposed
+            # (mapped on the current screen), so hiding/showing them would be
+            # pure flicker. Only off-Space windows are not exposed and need the
+            # re-home.
+            handle = window.windowHandle()
+            if handle is not None and handle.isExposed():
+                return
+            window.hide()
+            window.show()
+        except Exception:
+            pass
+
+    def arrange_workspace_family(self, *, pull_to_active_space: bool = False):
+        """Gather this FITS window family around the MainWindow.
+
+        With ``pull_to_active_space`` (explicit "Gather" action), family windows
+        living on other macOS Spaces are pulled onto the main window's desktop
+        instead of the OS switching away to them.
+        """
+        self._suppress_owner_raise()
+        panels = self._visible_workspace_windows(self._workspace_panel_windows_by_token())
+        subwindows = self._visible_workspace_windows(self._workspace_subwindows_by_token())
+        # Derived result viewers (integration results, channel maps) are part of
+        # this FITS family too, so gather/pull them along with everything else.
+        result_windows = self._visible_workspace_windows(self._workspace_result_windows_by_token())
+        if not panels and not subwindows and not result_windows:
+            return 0
+        order = {
+            "range_panel": 0,
+            "control_panel": 1,
+            "magnifier_panel": 2,
+            "marker_panel": 3,
+            "regrid_panel": 4,
+        }
+        panels.sort(key=lambda item: (order.get(item[0], 20), item[0]))
+
+        try:
+            main_geo = self.frameGeometry()
+        except Exception:
+            return 0
+        available = self._screen_available_geometry_for_family()
+        gap = 12
+        start_y = int(main_geo.y())
+        column_x = int(main_geo.x() + main_geo.width() + gap)
+        y = start_y
+        column_width = 0
+        arranged = self._place_visible_subwindows_behind_main()
+        arranged += self._place_result_windows_near_main()
+
+        for _token, panel in panels:
+            width, height = self._arrange_window_size(panel)
+            if available is not None:
+                try:
+                    if column_x + width > int(available.right()) + 1:
+                        column_x = int(main_geo.x() - width - gap)
+                    if y > start_y and y + height > int(available.bottom()) + 1:
+                        column_x += column_width + gap
+                        y = start_y
+                        column_width = 0
+                        if column_x + width > int(available.right()) + 1:
+                            column_x = int(main_geo.x() - width - gap)
+                except Exception:
+                    pass
+            move_x, move_y = self._clamped_window_position(
+                column_x,
+                y,
+                width,
+                height,
+                available,
+            )
+            try:
+                panel.move(move_x, move_y)
+                arranged += 1
+            except Exception:
+                pass
+            y += height + gap
+            column_width = max(column_width, width)
+
+        if pull_to_active_space:
+            # Re-home each gathered window onto the main window's Space, then
+            # focus only the main window -- never raise an off-Space window
+            # (that is what made the OS switch desktops). Subwindows/results
+            # first so panels and the main window end up in front.
+            for _token, window in subwindows:
+                self._pull_window_to_active_space(window)
+            for _token, window in result_windows:
+                self._pull_window_to_active_space(window)
+            for _token, panel in panels:
+                self._pull_window_to_active_space(panel)
+            try:
+                self.raise_()
+                self.activateWindow()
+                self._touch_workspace_window_order("main_window")
+            except Exception:
+                pass
+        else:
+            self.bring_workspace_family_to_front()
+        return arranged
+
+    def _translate_workspace_family_once(self, dx: int, dy: int):
+        moved = 0
+        if not dx and not dy:
+            return moved
+        windows = self._visible_workspace_windows(self._workspace_arrange_windows_by_token())
+        for _token, window in windows:
+            try:
+                window.move(int(window.x()) + int(dx), int(window.y()) + int(dy))
+                moved += 1
+            except Exception:
+                pass
+        return moved
+
+    def _place_startup_subwindows_behind_main(self):
+        """Put visible startup subwindows directly behind the MainWindow."""
+        return self._place_visible_subwindows_behind_main()
+
+    def show_workspace_subwindows(self):
+        if getattr(self, "data", None) is None or self.data.ndim <= 2:
+            return 0
+        self._suppress_owner_raise()
+        shown = 0
+        for action_attr, ensure_name in (
+            ("sub1_action", "ensure_subwindow1"),
+            ("sub2_action", "ensure_subwindow2"),
+        ):
+            ensure = getattr(self, ensure_name, None)
+            if not callable(ensure):
+                continue
+            window = ensure()
+            if window is None:
+                continue
+            try:
+                if not window.isVisible():
+                    window.show()
+                    shown += 1
+                window.raise_()
+            except Exception:
+                pass
+            self._set_panel_toggle_checked(action_attr, True)
+        self.arrange_workspace_family()
+        return shown
+
+    def hide_workspace_subwindows(self):
+        hidden = 0
+        for token, window in self._workspace_subwindows_by_token().items():
+            try:
+                if window.isVisible():
+                    window.hide()
+                    hidden += 1
+            except Exception:
+                pass
+            if token == "subwindow:xz":
+                self._set_panel_toggle_checked("sub1_action", False)
+            elif token == "subwindow:zy":
+                self._set_panel_toggle_checked("sub2_action", False)
+        return hidden
+
+    def hide_other_workspace_subwindows(self):
+        try:
+            windows = WindowRegistry.instance().windows()
+        except Exception:
+            windows = []
+        hidden = 0
+        for window in windows:
+            if window is None or window is self:
+                continue
+            hide_subwindows = getattr(window, "hide_workspace_subwindows", None)
+            if callable(hide_subwindows):
+                try:
+                    hidden += int(hide_subwindows() or 0)
+                except Exception:
+                    pass
+        return hidden
+
+    def bring_workspace_family_to_front(self):
+        """Raise visible windows that belong to this FITS without changing visibility."""
+        family = self._collect_workspace_windows_by_token()
+        raised = 0
+        for token, window in self._visible_workspace_windows(family):
+            try:
+                window.raise_()
+                self._touch_workspace_window_order(token)
+                raised += 1
+            except Exception:
+                pass
+        try:
+            self.raise_()
+            self.activateWindow()
+            self._touch_workspace_window_order("main_window")
+        except Exception:
+            pass
+        return raised
+
+    def hide_workspace_panels(self):
+        hidden = 0
+        for _token, panel in self._workspace_panel_windows_by_token().items():
+            try:
+                if panel.isVisible():
+                    panel.hide()
+                    hidden += 1
+            except Exception:
+                pass
+        self._sync_primary_panel_toggle_states()
+        return hidden
+
+    def show_workspace_panels(self):
+        self._suppress_owner_raise()
+        self.show_control_panel()
+        self.show_range_panel()
+        panels = self._workspace_panel_windows_by_token()
+        shown = 0
+        for token, panel in panels.items():
+            if token in {"control_panel", "range_panel"}:
+                continue
+            if token == "magnifier_panel" and getattr(self, "magnifier_panel", None) is None:
+                continue
+            try:
+                if not panel.isVisible():
+                    panel.show()
+                    shown += 1
+                panel.raise_()
+            except Exception:
+                pass
+        self._sync_primary_panel_toggle_states()
+        self.arrange_workspace_family()
+        return shown
+
+    def hide_workspace_aux_windows(self):
+        """Hide this FITS family's panels and subwindows, leaving MainWindow visible."""
+        return int(self.hide_workspace_subwindows() or 0) + int(self.hide_workspace_panels() or 0)
+
+    # Token -> menu toggle action that mirrors a family window's visibility.
+    _FAMILY_TOKEN_TOGGLE = {
+        "main_window": "main_action",
+        "control_panel": "control_panel_action",
+        "range_panel": "range_panel_action",
+        "magnifier_panel": "magnifier_panel_action",
+        "subwindow:xz": "sub1_action",
+        "subwindow:zy": "sub2_action",
+    }
+
+    def _capture_family_visibility_snapshot(self):
+        """Tokens of this FITS's family windows that are currently visible."""
+        visible = []
+        for token, window in self._collect_workspace_windows_by_token().items():
+            if window is None:
+                continue
+            try:
+                if window.isVisible():
+                    visible.append(token)
+            except Exception:
+                continue
+        return visible
+
+    def hide_workspace_family(self, *, include_main: bool = True):
+        """Hide this FITS family; optionally include the MainWindow itself.
+
+        Records which windows were visible so "Show All FITS Windows" can
+        restore exactly that set (not just the main window).
+        """
+        # Capture before anything is hidden. Only record a non-empty snapshot so
+        # a repeated hide (family already hidden) doesn't clobber the original.
+        snapshot = self._capture_family_visibility_snapshot()
+        if snapshot:
+            self._hidden_family_snapshot = snapshot
+        hidden = self.hide_workspace_aux_windows()
+        hidden_extra_ids = set()
+        for token, window in self._collect_workspace_windows_by_token().items():
+            if (
+                token == "main_window"
+                or window is None
+                or window is self
+                or self._is_workspace_panel_token(token)
+                or self._is_workspace_subwindow_token(token)
+            ):
+                continue
+            key = id(window)
+            if key in hidden_extra_ids:
+                continue
+            try:
+                if window.isVisible():
+                    window.hide()
+                    hidden += 1
+            except Exception:
+                pass
+            hidden_extra_ids.add(key)
+        if include_main:
+            try:
+                if self.isVisible():
+                    self.hide()
+                    hidden += 1
+            except Exception:
+                pass
+            self._set_panel_toggle_checked("main_action", False)
+        return hidden
+
+    def hide_other_workspace_panels(self):
+        try:
+            windows = WindowRegistry.instance().windows()
+        except Exception:
+            windows = []
+        hidden = 0
+        for window in windows:
+            if window is None or window is self:
+                continue
+            hide_panels = getattr(window, "hide_workspace_panels", None)
+            if callable(hide_panels):
+                try:
+                    hidden += int(hide_panels() or 0)
+                except Exception:
+                    pass
+        return hidden
+
+    def hide_other_workspace_fits(self):
+        try:
+            windows = WindowRegistry.instance().windows()
+        except Exception:
+            windows = []
+        hidden = 0
+        for window in windows:
+            if window is None or window is self:
+                continue
+            hide_family = getattr(window, "hide_workspace_family", None)
+            if callable(hide_family):
+                try:
+                    hidden += int(hide_family(include_main=True) or 0)
+                except Exception:
+                    pass
+        return hidden
+
+    def restore_workspace_family(self):
+        """Re-show the family windows that were visible when this FITS was hidden.
+
+        Restores the recorded snapshot (main window + whatever panels/subwindows
+        were on screen), not just the main window. Windows the user had closed
+        before hiding stay closed. Positions are untouched (hide only hid them).
+        """
+        self._suppress_owner_raise()
+        snapshot = list(getattr(self, "_hidden_family_snapshot", []) or [])
+        # Always bring the main window back even if there was no snapshot
+        # (e.g. this FITS was never hidden via a family-hide).
+        if "main_window" not in snapshot:
+            snapshot = ["main_window", *snapshot]
+        family = self._collect_workspace_windows_by_token()
+        shown = 0
+        for token in snapshot:
+            window = family.get(token)
+            if window is None:
+                continue
+            try:
+                was_visible = bool(window.isVisible())
+                if window.isMinimized():
+                    window.showNormal()
+                elif not was_visible:
+                    window.show()
+                if not was_visible:
+                    shown += 1
+                window.raise_()
+            except Exception:
+                pass
+            action_attr = self._FAMILY_TOKEN_TOGGLE.get(token)
+            if action_attr:
+                self._set_panel_toggle_checked(action_attr, True)
+        self._hidden_family_snapshot = []
+        return shown
+
+    def show_all_workspace_windows(self):
+        """Restore every open FITS family (main + the panels/subwindows that
+        were visible when each was hidden)."""
+        try:
+            windows = WindowRegistry.instance().windows()
+        except Exception:
+            windows = []
+        shown = 0
+        for window in windows:
+            if window is None:
+                continue
+            restore = getattr(window, "restore_workspace_family", None)
+            if callable(restore):
+                try:
+                    shown += int(restore() or 0)
+                    continue
+                except Exception:
+                    pass
+            # Fallback: at least bring the main window back.
+            try:
+                if window.isMinimized():
+                    window.showNormal()
+                elif not window.isVisible():
+                    window.show()
+                    shown += 1
+            except Exception:
+                pass
+        try:
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        return shown
 
     def _capture_workspace_window_z_order(self):
         windows = self._collect_workspace_windows_by_token()
@@ -1889,6 +2701,14 @@ class MainWindow(FITSViewer):
                 self._touch_workspace_window_order(token)
                 if event_type in (QEvent.Type.WindowActivate, QEvent.Type.Show):
                     self._sync_takefits_menu_proxy(_obj)
+                    # Catch panels created elsewhere (e.g. markers) and keep the
+                    # "FITS N" identity on their titles up to date.
+                    self.refresh_fits_identity_labels()
+                # Activating one of this FITS's panels brings the owning main
+                # window forward so the user sees the image the panel drives
+                # (the panel itself is kept on top so it stays usable).
+                if event_type == QEvent.Type.WindowActivate and self._is_workspace_panel_token(token):
+                    self._bring_owner_window_to_front(_obj)
         if event_type != QEvent.Type.KeyPress:
             return super().eventFilter(_obj, event)
 
@@ -5511,6 +6331,15 @@ class MainWindow(FITSViewer):
             if contour_bundle:
                 entry["contour"] = contour_bundle
 
+            slit_exporter = getattr(window, "export_slit_overlay_state", None)
+            if callable(slit_exporter):
+                try:
+                    slit_payload = slit_exporter()
+                except Exception:
+                    slit_payload = None
+                if isinstance(slit_payload, dict):
+                    entry["pv_slit_overlay"] = slit_payload
+
             payload["integration_windows"].append(entry)
 
         for window in list(getattr(self, "channel_map_windows", []) or []):
@@ -5608,6 +6437,16 @@ class MainWindow(FITSViewer):
                     ):
                         window_restored = True
 
+                slit_payload = entry.get("pv_slit_overlay")
+                if isinstance(slit_payload, dict):
+                    restore_slit = getattr(window, "restore_slit_overlay_state", None)
+                    if callable(restore_slit):
+                        try:
+                            if restore_slit(slit_payload):
+                                window_restored = True
+                        except Exception:
+                            pass
+
                 if window_restored:
                     restored["integration"] += 1
                     self._refresh_viewer_after_contour_restore(window)
@@ -5689,8 +6528,32 @@ class MainWindow(FITSViewer):
                 "color_settings": self._capture_color_settings_state(),
                 "colorbar_state": self._capture_workspace_colorbar_state(),
                 "annotation_state": self._capture_workspace_annotation_state(),
+                "window_sync": self._capture_window_sync_state(),
             },
         }
+
+    def _capture_window_sync_state(self):
+        try:
+            from takefits.ui.window_sync_manager import WindowSyncManager
+            return WindowSyncManager.instance().serialize()
+        except Exception:
+            return {}
+
+    def _restore_window_sync_state(self, payload):
+        if not isinstance(payload, dict):
+            return
+        try:
+            from takefits.ui.window_sync_manager import WindowSyncManager
+            WindowSyncManager.instance().restore(payload)
+        except Exception:
+            return
+        menu_bar = getattr(self, "menu_bar", None)
+        refresh = getattr(menu_bar, "refresh_sync_lock_actions", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
 
     def _log_workspace_restore_diagnostics(self, diagnostics: dict):
         if not isinstance(diagnostics, dict):
@@ -6058,6 +6921,178 @@ class MainWindow(FITSViewer):
         except Exception:
             return
 
+    # ------------------------------------------------------------------
+    # Multi-window: open another FITS/workspace in a separate MainWindow
+    def open_fits_in_new_window_dialog(self):
+        """Prompt for a FITS or workspace file and open it in a new window."""
+        from PySide6.QtCore import QSettings
+        from takefits.app_paths import app_config_path
+
+        settings = QSettings(
+            app_config_path("takefits.ini"), QSettings.Format.IniFormat
+        )
+        last_dir = settings.value("last_fits_dir", "", str)
+        start_dir = last_dir if last_dir and os.path.isdir(last_dir) else os.getcwd()
+        filters = (
+            "FITS / Workspace (*.fits *.FITS *.fit *.json);;"
+            "FITS Files (*.fits *.FITS *.fit);;"
+            "Workspace (*.json);;All Files (*)"
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open FITS in New Window", start_dir, filters
+        )
+        if not path:
+            return None
+        try:
+            settings.setValue("last_fits_dir", os.path.dirname(path) or ".")
+            settings.sync()
+        except Exception:
+            pass
+        # Opening another FITS goes multi-window: keep this (existing) window's
+        # panels as they are, but open the new one main-only for a clean,
+        # launch-consistent layout (panels reachable via its Window menu).
+        return self.open_path_in_new_window(path, main_only=True)
+
+    def _position_new_window_beside_previous(self, window):
+        """Place ``window`` to the right of the previously opened window so
+        several FITS sit side by side for comparison. Wraps to a new row when it
+        would run off the right edge, and cascades if there is no room at all.
+        Returns the (dx, dy) the window was moved by so its family can follow.
+        """
+        try:
+            windows = WindowRegistry.instance().windows()
+        except Exception:
+            windows = []
+        anchor = self
+        try:
+            idx = windows.index(window)
+            if idx > 0:
+                anchor = windows[idx - 1]
+        except ValueError:
+            anchor = self
+        move_delta = (0, 0)
+        try:
+            old_pos = window.pos()
+            anchor_geo = anchor.frameGeometry()
+            gap = 12
+            new_w = max(
+                int(window.frameGeometry().width()),
+                int(getattr(window, "figure_width", 0) or 0),
+                200,
+            )
+            new_h = max(
+                int(window.frameGeometry().height()),
+                int(getattr(window, "figure_height", 0) or 0),
+                200,
+            )
+            available = self._screen_available_geometry_for_family()
+            x = int(anchor_geo.x()) + int(anchor_geo.width()) + gap
+            y = int(anchor_geo.y())
+            if available is not None:
+                if x + new_w > int(available.right()) + 1:
+                    # Off the right edge: wrap to a new row, else cascade.
+                    x = int(available.left())
+                    y = int(anchor_geo.y()) + int(anchor_geo.height()) + gap
+                    if y + new_h > int(available.bottom()) + 1:
+                        x = int(anchor_geo.x()) + 30
+                        y = int(anchor_geo.y()) + 30
+                x, y = self._clamped_window_position(x, y, new_w, new_h, available)
+            window.move(x, y)
+            new_pos = window.pos()
+            move_delta = (
+                int(new_pos.x()) - int(old_pos.x()),
+                int(new_pos.y()) - int(old_pos.y()),
+            )
+        except Exception:
+            move_delta = (0, 0)
+        return move_delta
+
+    def open_path_in_new_window(self, path: str, *, main_only: bool = False):
+        """Load a FITS (or workspace) file into a new, independent MainWindow.
+
+        ``main_only`` (used when launching several FITS at once) stows the tool
+        and range panels so the comparison view stays uncluttered -- just the
+        main viewers, side by side.
+        """
+        from takefits.main import (
+            is_workspace_file,
+            resolve_workspace_source_fits,
+            print_fits_loading_banner,
+            print_fits_loaded_summary,
+        )
+        from takefits.core.io.fits import load_fits
+
+        workspace_path = None
+        fits_path = path
+        if is_workspace_file(path):
+            try:
+                workspace_path, fits_path = resolve_workspace_source_fits(path)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, "Open in New Window", f"Failed to open workspace:\n{exc}"
+                )
+                return None
+
+        # Banner first so the WCS notices from load_fits are grouped under the
+        # file they belong to (matters when opening several FITS).
+        print_fits_loading_banner(fits_path)
+        try:
+            data, header, wcs, spectral_metadata = load_fits(fits_path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Open in New Window", f"Failed to open FITS file:\n{exc}"
+            )
+            return None
+
+        window = MainWindow(
+            "xy",
+            f"MainWindow: {fits_path}",
+            data,
+            header,
+            wcs,
+            fits_path,
+            spectral_metadata,
+        )
+
+        # Place the new window beside the previous one (side-by-side) so several
+        # FITS can be compared at a glance instead of stacking on top.
+        move_delta = self._position_new_window_beside_previous(window)
+
+        window.show()
+        print_fits_loaded_summary(window, path=fits_path)
+        try:
+            window._translate_workspace_family_once(*move_delta)
+            window._place_startup_subwindows_behind_main()
+        except Exception:
+            pass
+        if main_only:
+            # Launching several FITS at once: stow the tool/range panels to
+            # avoid a wall of windows, but keep whatever subwindow the startup
+            # showed (typically X-Z for a light cube) tucked behind the main, so
+            # heavy/2D FITS end up main-only while light cubes keep X-Z handy.
+            try:
+                window.hide_workspace_panels()
+            except Exception:
+                pass
+        window.raise_()
+        window.activateWindow()
+
+        if workspace_path:
+            try:
+                window.set_workspace_save_path(workspace_path)
+                window.load_workspace_from_path(
+                    workspace_path,
+                    confirm_replace=False,
+                    show_result_dialog=False,
+                )
+            except Exception as exc:
+                import sys as _sys
+                print(
+                    f"[takefits] Failed to restore workspace in new window: {exc}",
+                    file=_sys.stderr,
+                )
+        return window
+
     def set_workspace_save_path(self, path: str | None):
         text = str(path or "").strip()
         if not text:
@@ -6278,6 +7313,7 @@ class MainWindow(FITSViewer):
                 allow_window_axis_limits=same_dataset,
             )
             restored_ui_widgets = self._restore_workspace_ui_state(workspace_state.get("ui_state"))
+            self._restore_window_sync_state(workspace_state.get("window_sync"))
             restored_view = False
             restored_world = False
             restore_mode = compute_range_restore_mode(
@@ -6609,6 +7645,11 @@ class MainWindow(FITSViewer):
             applied = False
         if not applied:
             self._shared_view_history_index = previous_index
+        else:
+            # Centralised here so every caller (toolbar Back button, the Edit
+            # menu item, and the Undo keyboard shortcut) propagates the restored
+            # view to synced windows. The owner that actually changed is `self`.
+            self._broadcast_synced_view()
         self._refresh_view_navigation_actions()
         return bool(applied)
 
@@ -6647,6 +7688,8 @@ class MainWindow(FITSViewer):
             applied = False
         if not applied:
             self._shared_view_history_index = previous_index
+        else:
+            self._broadcast_synced_view()
         self._refresh_view_navigation_actions()
         return bool(applied)
 
@@ -7022,21 +8065,180 @@ class MainWindow(FITSViewer):
 
             self.integ_result_windows = live_windows
 
-    def closeEvent(self, event):
-        self._is_app_closing = True
-        app = QApplication.instance()
-        if app is not None:
+    @staticmethod
+    def _owned_window_may_prompt_on_close(window) -> bool:
+        if window is None:
+            return False
+        checks = (
+            "has_pending_changes",
+            "_has_pending_close_changes",
+            "_has_pending_preview_in_history",
+        )
+        for name in checks:
+            checker = getattr(window, name, None)
+            if callable(checker):
+                try:
+                    if bool(checker()):
+                        return True
+                except Exception:
+                    pass
+        attrs = (
+            "_has_pending_changes",
+            "_regrid_running",
+            "_has_restored_preview",
+            "result_mask",
+            "_label_view_active",
+            "_cloud_overlay_ids",
+        )
+        for name in attrs:
             try:
-                app.setProperty("takefits_app_closing", True)
+                if bool(getattr(window, name, False)):
+                    return True
             except Exception:
                 pass
+        try:
+            live_integration = [
+                item for item in list(getattr(window, "integ_result_windows", []) or [])
+                if item is not None
+            ]
+            if live_integration:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _close_owned_windows(self) -> bool:
+        """Close this window's subwindows and tool panels (its document family).
+
+        When several MainWindows are open, closing one must not leave its own
+        subwindows/panels orphaned on screen. We close every window in this
+        window's family except the MainWindow itself.
+
+        Returns False when any owned window rejects closeEvent, so the MainWindow
+        close can be cancelled too.
+        """
+        try:
+            family = self._collect_workspace_windows_by_token()
+        except Exception:
+            return True
+        windows = [
+            window
+            for window in list(family.values())
+            if window is not None and window is not self
+        ]
+        windows.sort(key=lambda window: not self._owned_window_may_prompt_on_close(window))
+        for window in windows:
+            if window is None or window is self:
+                continue
+            close = getattr(window, "close", None)
+            if not callable(close):
+                continue
+            try:
+                if close() is False:
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def closeEvent(self, event):
+        # Suppress this window's own deferred callbacks while it tears down.
+        self._is_app_closing = True
+        app = QApplication.instance()
+
+        # Decide whether this is the last registered MainWindow before
+        # unregistering. Unregister only after all owned windows accept close.
+        registry = None
+        try:
+            registry = WindowRegistry.instance()
+        except Exception:
+            registry = None
+        is_last_window = True
+        if registry is not None:
+            try:
+                is_last_window = not any(window is not self for window in registry.windows())
+            except Exception:
+                is_last_window = True
+
+        if app is not None:
+            if is_last_window:
+                # Only treat the process as shutting down once the final window
+                # is closing, so per-panel "discard changes?" prompts are
+                # skipped on real app exit but kept while other windows live.
+                try:
+                    app.setProperty("takefits_app_closing", True)
+                except Exception:
+                    pass
+
+        # Tear down this window's own subwindows/panels so they never orphan
+        # when other MainWindows remain open. On the last window the app quit
+        # below would also handle it, but doing it uniformly keeps teardown
+        # predictable.
+        if not self._close_owned_windows():
+            self._is_app_closing = False
+            if app is not None and is_last_window:
+                try:
+                    app.setProperty("takefits_app_closing", False)
+                except Exception:
+                    pass
+            event.ignore()
+            return
+
+        if app is not None:
             try:
                 app.removeEventFilter(self)
             except Exception:
                 pass
-        print("\n\nProgram exited.")
+            # Drop the process-global focusWindowChanged connection so this
+            # closed window stops receiving (and re-fanning) focus events.
+            slot = getattr(self, "_focus_window_changed_slot", None)
+            if slot is not None:
+                try:
+                    app.focusWindowChanged.disconnect(slot)
+                except Exception:
+                    pass
+                self._focus_window_changed_slot = None
+
         super().closeEvent(event)
-        if app is not None:
+
+        if not event.isAccepted():
+            self._is_app_closing = False
+            if app is not None and is_last_window:
+                try:
+                    app.setProperty("takefits_app_closing", False)
+                except Exception:
+                    pass
+            return
+
+        menu_bar = getattr(self, "menu_bar", None)
+        dispose_menu = getattr(menu_bar, "dispose", None)
+        if callable(dispose_menu):
+            try:
+                dispose_menu()
+            except Exception:
+                pass
+
+        if registry is not None:
+            try:
+                registry.windows_changed.disconnect(self.refresh_fits_identity_labels)
+            except Exception:
+                pass
+            try:
+                registry.unregister(self)
+                self._registered_in_window_registry = False
+            except Exception:
+                pass
+        # NOTE: disconnecting the two process-global connections above stops a
+        # closed window from doing per-event work, which is what mattered for
+        # performance. The Python wrapper itself is NOT freed after close: the
+        # window's object graph is pinned by many C++-held signal->lambda
+        # connections (buttons, menu actions, managers, subwindows, panels,
+        # coordinator, toolbar) that Python's gc cannot break, and the data cube
+        # is additionally retained through numpy views (.base) that
+        # gc.get_referrers cannot even enumerate. Fully reclaiming the window +
+        # cube needs a dedicated dispose() protocol across the UI. See the
+        # xfail regression target in tests/test_window_memory.py.
+        if app is not None and is_last_window:
+            print("\n\nProgram exited.")
             app.quit()
 
     # ------------------------------------------------------------------
@@ -7381,6 +8583,13 @@ class MainWindow(FITSViewer):
     def _start_auto_update_check(self):
         if getattr(self, "_is_app_closing", False):
             return
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                if bool(app.property(_AUTO_UPDATE_CHECK_STARTED_PROPERTY)):
+                    return
+            except Exception:
+                pass
         from takefits.logic import update_check
 
         try:
@@ -7389,6 +8598,11 @@ class MainWindow(FITSViewer):
             return
         if not update_check.should_auto_check(state):
             return
+        if app is not None:
+            try:
+                app.setProperty(_AUTO_UPDATE_CHECK_STARTED_PROPERTY, True)
+            except Exception:
+                pass
         self._launch_update_check(manual=False)
 
     def check_for_updates_manual(self):

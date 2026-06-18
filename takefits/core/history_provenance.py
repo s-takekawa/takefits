@@ -51,6 +51,7 @@ _ACTION_PARAM_KEYS: Dict[str, List[str]] = {
         "target_bmaj",
         "target_bmin",
         "target_bpa",
+        "beam_unit_scale",
     ],
     "apply_scaling": ["scale_factor"],
     "apply_baseline_subtraction": ["order", "world_ranges"],
@@ -409,6 +410,23 @@ def _build_verbose_history(action_name: str, params: Dict[str, Any], timestamp: 
         bmin = params.get("target_bmin")
         bpa = params.get("target_bpa")
         lines.append(f"Target resolution: BMAJ={bmaj}, BMIN={bmin}, BPA={bpa}")
+        current_bmaj = params.get("current_bmaj")
+        current_bmin = params.get("current_bmin")
+        current_bpa = params.get("current_bpa")
+        if current_bmaj is not None and current_bmin is not None:
+            current_bpa_text = current_bpa if current_bpa is not None else "unknown"
+            lines.append(
+                f"Input resolution: BMAJ={current_bmaj}, "
+                f"BMIN={current_bmin}, BPA={current_bpa_text}"
+            )
+        beam_unit_scale = params.get("beam_unit_scale")
+        if beam_unit_scale is not None:
+            bunit = params.get("bunit") or "per-beam"
+            basis = params.get("beam_unit_scale_basis") or "target/current beam area"
+            lines.append(
+                f"Beam unit scaling: BUNIT={bunit}, "
+                f"factor={beam_unit_scale} ({basis})"
+            )
 
     elif action_name == "apply_scaling":
         lines.append(f"Data scaled using takefits on {time_str}")

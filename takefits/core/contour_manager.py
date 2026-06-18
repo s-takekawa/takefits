@@ -557,6 +557,12 @@ class ContourLayer:
         if not all_provider_items or state is None or not state.items:
             return None
 
+        # Ignore mismatched planes (e.g. importing celestial 'xy' onto subwindow 'xz'/'zy')
+        source_plane = (state.plane or "").strip().lower()
+        target_plane = (self.plane or "").strip().lower()
+        if source_plane and target_plane and source_plane != target_plane:
+            return None
+
         # Collect all segments from the source state into one list.
         all_segments_to_load = [
             seg
@@ -1158,16 +1164,21 @@ class ContourLayer:
 
         return None
 
-    def redraw_from_state(self, state: ContourState) -> None:
-        """Store and plot overlay contours from a saved state."""
+    def redraw_from_state(self, state: ContourState) -> bool:
+        """Store and plot overlay contours from a saved state.
+
+        Returns True when the state produced an overlay on this layer, False
+        when it was skipped (e.g. plane mismatch or no drawable segments).
+        """
         if state is None or not state.items:
-            return
+            return False
 
         canonical_state = self._canonicalize_overlay_state(state)
         if canonical_state is None:
-            return
+            return False
         self._overlay_states.append(canonical_state)
         self._replot_overlay_states()
+        return True
 
     def export_state(self) -> Optional[ContourState]:
         if self._state is not None:
@@ -1554,18 +1565,19 @@ class ContourManager(QObject):
                 return copy.deepcopy(state)
         return None
 
-    def import_layer_state(self, layer_id: str, state: ContourState) -> None:
+    def import_layer_state(self, layer_id: str, state: ContourState) -> bool:
         layer = self._layers.get(layer_id)
         if layer is None:
-            return
+            return False
         # If state lacks plane info, default it to the target layer's plane
         if state.plane is None:
             try:
                 state.plane = layer.plane
             except Exception:
                 pass
-        layer.redraw_from_state(state)
+        applied = layer.redraw_from_state(state)
         self.targets_changed.emit()
+        return applied
 
     def import_overlay_state(self, layer_id: str, state: ContourState) -> Optional[str]:
         """

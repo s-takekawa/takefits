@@ -44,6 +44,7 @@ from .pv import (
 from .visualization import export_moment_image, export_channel_map_image
 from .smoothing import (
     SmoothingKernel,
+    beam_unit_scale_for_target_resolution,
     compute_smoothed,
     compute_smoothed_to_resolution,
     apply_smoothing,

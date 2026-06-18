@@ -385,6 +385,20 @@ class SmoothSettingsPanel(QDialog):
             QMessageBox.warning(self, 'Invalid Input', str(e))
             return None
 
+        beam_unit_scale = usecases.beam_unit_scale_for_target_resolution(
+            self.header,
+            current_bmaj=current_bmaj,
+            current_bmin=current_bmin,
+            target_bmaj=target_bmaj,
+            target_bmin=target_bmin,
+        )
+        if beam_unit_scale != 1.0:
+            self._last_action_params.update({
+                "bunit": str(self.header.get("BUNIT", "")),
+                "beam_unit_scale": float(beam_unit_scale),
+                "beam_unit_scale_basis": "target/current beam area",
+            })
+
         elapsed_time = time.time() - current_time
         print(f"Smoothing done in {elapsed_time:.3g} sec")
 

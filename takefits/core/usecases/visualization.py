@@ -11,6 +11,7 @@ from takefits.core.usecases.channel_map import compute_channel_map, channel_labe
 from takefits.core.usecases.export import export_figure
 from takefits.core.usecases.utils import create_2d_header_from_3d
 from takefits.core.config import ConfigManager
+from takefits.core.fonts import resolve_mpl_font_family
 from astropy.wcs import WCS
 import astropy.units as u
 
@@ -311,7 +312,8 @@ def export_channel_map_image(
     tick_width = config.get('tick_width', 1)
     tick_labelsize = config.get('tick_labelsize', 10)
     tick_labelcolor = config.get('tick_labelcolor', 'black')
-    tick_font = config.get('tick_font', 'Arial')
+    tick_font = resolve_mpl_font_family(config.get('tick_font', 'DejaVu Sans'))
+    axislabel_fontfamily = resolve_mpl_font_family(config.get('axislabel_fontfamily', 'DejaVu Sans'))
     tick_direction = config.get('tick_direction', 'out')
     tick_length = config.get('tick_length', 4)
     tick_pad_x = config.get('tick_pad_x', 5)
@@ -357,7 +359,7 @@ def export_channel_map_image(
                     label_text = str(lbl)
                 
                 # Use config font/color for label
-                ch_label_font = config.get('ch_label_font', 'Arial')
+                ch_label_font = resolve_mpl_font_family(config.get('ch_label_font', 'DejaVu Sans'))
                 ch_label_color = config.get('ch_label_color', 'grey')
                 ch_label_size = config.get('ch_label_size', 10)
                 pos_x = config.get('pos_chlabel_x', 0.98)
@@ -450,7 +452,7 @@ def export_channel_map_image(
                         if alias in ax.coords:
                             ax.coords[alias].set_axislabel(label, 
                                 fontsize=config.get('axislabel_fontsize', 14),
-                                fontfamily=config.get('axislabel_fontfamily', 'Arial'),
+                                fontfamily=axislabel_fontfamily,
                                 color=config.get('axislabel_color', 'black'))
 
                     # Apply Visibility

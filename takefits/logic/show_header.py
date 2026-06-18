@@ -3,9 +3,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPalette
 
 class ShowHeader(QMainWindow):
-    def __init__(self, header):
-        super().__init__()
+    def __init__(self, header, filename=None, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
         self.header = header
+        self.filename = str(filename or "").strip()
         self.initUI()
 
     def initUI(self):
@@ -22,7 +23,10 @@ class ShowHeader(QMainWindow):
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         self.setCentralWidget(scroll)
-        self.setWindowTitle("FITS Header")
+        title = "FITS Header"
+        if self.filename:
+            title = f"{title}:{self.filename}"
+        self.setWindowTitle(title)
 
 
     def buildHeaderHTML(self):

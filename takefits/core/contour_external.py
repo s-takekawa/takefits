@@ -190,6 +190,31 @@ def _contour_polylines(data2d: np.ndarray, levels: List[float]):
     return contour_set.allsegs
 
 
+def _detect_fits_plane(state) -> str:
+    """Detect the display plane of a FITS file (xy, xz, zy) based on WCS ctype or naxis."""
+    wcs = getattr(state, "wcs", None)
+    if wcs is None:
+        return "xy"
+    try:
+        naxis = wcs.wcs.naxis
+    except Exception:
+        naxis = 2
+    if naxis >= 3:
+        return "xy"
+    try:
+        ctype = [str(c or "").strip().upper().split("-")[0] for c in wcs.wcs.ctype]
+    except Exception:
+        ctype = []
+    if len(ctype) >= 2:
+        axis1_spectral = any(kw in ctype[0] for kw in ("VEL", "FREQ", "VRAD", "VOPT", "WAVE", "ENER", "CHAN"))
+        axis2_spectral = any(kw in ctype[1] for kw in ("VEL", "FREQ", "VRAD", "VOPT", "WAVE", "ENER", "CHAN"))
+        if axis2_spectral and not axis1_spectral:
+            return "xz"
+        elif axis1_spectral and not axis2_spectral:
+            return "zy"
+    return "xy"
+
+
 def build_contour_state_from_app_state(
     state,
     levels: Sequence[float],
@@ -202,17 +227,18 @@ def build_contour_state_from_app_state(
     source_meta: Optional[Dict[str, object]] = None,
 ) -> ContourState:
     """
-    Compute contours of an AppState's XY plane as a world-coordinate ContourState.
-
-    The returned state can be imported onto any contour layer with
-    ContourManager.import_layer_state(); vertices are reprojected through the
-    target WCS on import.
+    Compute contours of an AppState's plane as a world/pixel ContourState.
     """
     level_values = _normalize_levels(levels)
     if not level_values:
         raise ExternalContourError("No valid contour levels were provided.")
 
-    wcs_cel = _celestial_wcs(getattr(state, "wcs", None))
+    plane = _detect_fits_plane(state)
+
+    # Non-celestial planes (xz/zy) carry raw pixel coordinates instead of
+    # world coordinates; celestial alignment is only meaningful for xy.
+    wcs_cel = _celestial_wcs(getattr(state, "wcs", None)) if plane == "xy" else None
+
     data2d = smooth_plane(_slice_xy_plane(state, channel), smoothing)
 
     if label is None:
@@ -228,14 +254,20 @@ def build_contour_state_from_app_state(
             finite_mask = np.isfinite(vertices).all(axis=1)
             if np.count_nonzero(finite_mask) < 2:
                 continue
-            world = _pixel_coords_to_world(vertices[finite_mask], wcs_cel)
-            if world is None or world.shape[0] < 2:
-                continue
+
+            pix_coords = vertices[finite_mask]
+
+            world = None
+            if wcs_cel is not None:
+                world = _pixel_coords_to_world(pix_coords, wcs_cel)
+                if world is None or world.shape[0] < 2:
+                    continue
+
             segments.append(
                 ContourSegment(
                     level=level,
                     world=world,
-                    pixels=None,
+                    pixels=None if wcs_cel is not None else pix_coords,
                     linestyle="dashed" if level < 0 else "solid",
                 )
             )
@@ -251,12 +283,12 @@ def build_contour_state_from_app_state(
     )
     return ContourState(
         layer_id="",
-        plane=None,
+        plane=plane,
         label=label,
         parameters=parameters,
         levels=list(level_values),
         items=[ContourItemState(item_label=label, segments=segments)],
-        world_frame=_frame_name_from_wcs(wcs_cel),
+        world_frame=_frame_name_from_wcs(wcs_cel) if wcs_cel is not None else None,
         source_meta=dict(source_meta) if source_meta else None,
     )
 

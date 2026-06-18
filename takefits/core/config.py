@@ -69,7 +69,7 @@ class ConfigManager:
         
             # Axis label settings
             'axislabel_fontsize': 14,        # Font size of the axis labels
-            'axislabel_fontfamily': 'Arial', # Font family of the axis labels
+            'axislabel_fontfamily': 'DejaVu Sans', # Font family of the axis labels
             'axislabel_color': 'black',      # Color of the axis labels
         
             # Tick position and appearance
@@ -97,7 +97,7 @@ class ConfigManager:
             'tick_pad_y': 5,         # Distance between ticks and tick labels
             'tick_xlabelrotation': 0, # Rotation angle of X-axis tick labels
             'tick_ylabelrotation': 0, # Rotation angle of Y-axis tick labels
-            'tick_font': 'Arial',
+            'tick_font': 'DejaVu Sans',
             'tick_font_weight': 'normal',
         
             # Coordinate and decimal settings
@@ -126,7 +126,7 @@ class ConfigManager:
             #'pos_chlabel_h': 20,   # Height of the coordinate label
 
             'ch_label_color': 'grey', 
-            'ch_label_font': 'Arial',
+            'ch_label_font': 'DejaVu Sans',
             'ch_label_size': 10,
             
             # Click-related settings

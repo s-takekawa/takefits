@@ -7,6 +7,7 @@ import os
 import warnings
 
 from takefits.logic.progress import OperationCancelled, ProgressReporter
+from takefits.logic.data_tools import _get_total_ram_bytes
 
 _ASTRODENDRO_BOOL_PATCHED = False
 _SCIMES_RAM_FRACTION = 0.35
@@ -14,26 +15,8 @@ _SCIMES_FALLBACK_BYTES = 4 * 1024 ** 3
 
 
 def _detect_total_ram_bytes() -> int | None:
-    """Best-effort total physical RAM in bytes, or None if undetectable."""
-    try:
-        pages = os.sysconf("SC_PHYS_PAGES")
-        page_size = os.sysconf("SC_PAGE_SIZE")
-        if pages > 0 and page_size > 0:
-            return int(pages) * int(page_size)
-    except (AttributeError, OSError, ValueError):
-        pass
-    try:
-        import subprocess
-
-        out = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=2
-        )
-        value = int(out.stdout.strip())
-        if value > 0:
-            return value
-    except Exception:
-        pass
-    return None
+    """Best-effort total physical RAM in bytes (macOS / Linux / Windows)."""
+    return _get_total_ram_bytes()
 
 
 def _format_bytes(num_bytes: int) -> str:

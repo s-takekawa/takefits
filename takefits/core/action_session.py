@@ -269,6 +269,7 @@ class ActionSession:
         handler = action.handler
         accepts_state = _handler_accepts_state(handler)
         accepts_result = _handler_accepts_result(handler)
+        _augment_action_params_for_history(name=name, params=params, state=self.state)
         call_params = _filter_handler_kwargs(handler, params)
 
         previous_result = self.last_result
@@ -317,6 +318,81 @@ def _handler_accepts_result(handler: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return "result" in sig.parameters
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _header_float(header: Any, key: str, scale: float = 1.0) -> Optional[float]:
+    if header is None:
+        return None
+    try:
+        value = header.get(key)
+    except Exception:
+        return None
+    numeric = _float_or_none(value)
+    if numeric is None:
+        return None
+    return numeric * scale
+
+
+def _augment_action_params_for_history(
+    *,
+    name: str,
+    params: Dict[str, Any],
+    state: Optional[AppState],
+) -> None:
+    if name != "apply_smoothing_to_resolution" or state is None:
+        return
+    if not isinstance(params, dict):
+        return
+
+    header = getattr(state, "header", None)
+    if header is None:
+        return
+
+    current_bmaj = _float_or_none(params.get("current_bmaj"))
+    if current_bmaj is None:
+        current_bmaj = _header_float(header, "BMAJ", 3600.0)
+        if current_bmaj is not None:
+            params["current_bmaj"] = current_bmaj
+
+    current_bmin = _float_or_none(params.get("current_bmin"))
+    if current_bmin is None:
+        current_bmin = _header_float(header, "BMIN", 3600.0)
+        if current_bmin is not None:
+            params["current_bmin"] = current_bmin
+
+    current_bpa = _float_or_none(params.get("current_bpa"))
+    if current_bpa is None:
+        current_bpa = _header_float(header, "BPA", 1.0)
+        if current_bpa is not None:
+            params["current_bpa"] = current_bpa
+
+    target_bmaj = _float_or_none(params.get("target_bmaj"))
+    target_bmin = _float_or_none(params.get("target_bmin"))
+    if None in (current_bmaj, current_bmin, target_bmaj, target_bmin):
+        return
+
+    from takefits.core.usecases.smoothing import beam_unit_scale_for_target_resolution
+
+    scale = beam_unit_scale_for_target_resolution(
+        header,
+        current_bmaj=float(current_bmaj),
+        current_bmin=float(current_bmin),
+        target_bmaj=float(target_bmaj),
+        target_bmin=float(target_bmin),
+    )
+    if scale != 1.0:
+        params.setdefault("bunit", str(header.get("BUNIT", "")))
+        params.setdefault("beam_unit_scale", float(scale))
+        params.setdefault("beam_unit_scale_basis", "target/current beam area")
 
 
 def _filter_handler_kwargs(handler: Any, params: Dict[str, Any]) -> Dict[str, Any]:

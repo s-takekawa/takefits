@@ -11,6 +11,156 @@ from takefits.core.app_state import AppState
 SmoothingKernel = Literal["gaussian", "boxcar", "hanning"]
 
 
+def _is_per_beam_bunit(bunit: Any) -> bool:
+    """Return True for FITS BUNIT strings expressed per synthesized beam."""
+    text = "".join(str(bunit or "").lower().split())
+    return "/beam" in text or "beam-1" in text or "beam^-1" in text
+
+
+def _beam_area_ratio_for_bunit(
+    header: Any,
+    *,
+    current_bmaj: float,
+    current_bmin: float,
+    target_bmaj: float,
+    target_bmin: float,
+) -> float:
+    """Scale Jy/beam-like data from current-beam to target-beam units."""
+    if not _is_per_beam_bunit(header.get("BUNIT", "")):
+        return 1.0
+
+    if current_bmaj <= 0 or current_bmin <= 0:
+        raise ValueError(
+            "Current BMAJ and BMIN are required for Jy/beam target-resolution smoothing"
+        )
+    if target_bmaj <= 0 or target_bmin <= 0:
+        raise ValueError("Target BMAJ and BMIN must be positive")
+
+    return (target_bmaj * target_bmin) / (current_bmaj * current_bmin)
+
+
+def beam_unit_scale_for_target_resolution(
+    header: Any,
+    *,
+    current_bmaj: float,
+    current_bmin: float,
+    target_bmaj: float,
+    target_bmin: float,
+) -> float:
+    """Return the intensity scale needed when target smoothing changes beam units."""
+    return _beam_area_ratio_for_bunit(
+        header,
+        current_bmaj=current_bmaj,
+        current_bmin=current_bmin,
+        target_bmaj=target_bmaj,
+        target_bmin=target_bmin,
+    )
+
+
+def _centered(arr: np.ndarray, newshape) -> np.ndarray:
+    """Crop ``arr`` to ``newshape`` about its centre (matches scipy.signal)."""
+    currshape = np.array(arr.shape)
+    newshape = np.asarray(newshape)
+    startind = (currshape - newshape) // 2
+    endind = startind + newshape
+    sl = tuple(slice(startind[k], endind[k]) for k in range(len(endind)))
+    return arr[sl]
+
+
+class _ReflectFFTConvolver:
+    """Reflect-padded 2D FFT convolution with a fixed kernel.
+
+    The kernel's frequency transform is computed once and reused for every
+    plane, and planes free of NaNs skip the weight-normalisation pass.  This is
+    numerically equivalent (to FFT round-off) to the previous per-plane
+    ``scipy.signal.fftconvolve(..., mode="same")`` calls, but avoids re-running
+    the kernel FFT on each plane and never materialises a padded copy of the
+    whole cube.
+    """
+
+    def __init__(self, kernel_2d: np.ndarray, plane_shape: Tuple[int, int]) -> None:
+        from scipy import fft as sp_fft
+
+        self._sp_fft = sp_fft
+        kernel_2d = np.asarray(kernel_2d)
+        self._pad_width = [(s // 2, s // 2) for s in kernel_2d.shape]
+        self._slices = tuple(
+            slice(p[0], -p[1] if p[1] != 0 else None) for p in self._pad_width
+        )
+        self._padded_shape = tuple(
+            int(d + p[0] + p[1]) for d, p in zip(plane_shape, self._pad_width)
+        )
+        self._plane_shape = tuple(int(d) for d in plane_shape)
+        self._clean_weight: Optional[np.ndarray] = None
+        full_shape = np.array(self._padded_shape) + np.array(kernel_2d.shape) - 1
+        self._fshape = [sp_fft.next_fast_len(int(d), True) for d in full_shape]
+        self._fslice = tuple(slice(0, int(d)) for d in full_shape)
+        self._kernel_fft = sp_fft.rfftn(kernel_2d, self._fshape)
+
+    def _fft_same(self, padded_plane: np.ndarray) -> np.ndarray:
+        # Match scipy.signal.fftconvolve: a float32 plane transforms to
+        # complex64, but the (out-of-place) product with the complex128 kernel
+        # promotes back to double precision before the inverse transform.
+        sp_fft = self._sp_fft
+        spec = sp_fft.rfftn(padded_plane, self._fshape) * self._kernel_fft
+        full = sp_fft.irfftn(spec, self._fshape)[self._fslice]
+        return _centered(full, self._padded_shape)
+
+    def _clean_plane_weight(self) -> np.ndarray:
+        """conv(valid) for a fully-valid plane, computed once and reused.
+
+        Matches the per-plane weight the previous implementation produced from a
+        float32 validity mask, so NaN-free planes reproduce the old weighted
+        normalisation without running a weight convolution on every plane.
+        """
+        if self._clean_weight is None:
+            ones = np.ones(self._plane_shape, dtype=np.float32)
+            padded = np.pad(ones, self._pad_width, mode="reflect")
+            self._clean_weight = self._fft_same(padded)[self._slices].copy()
+        return self._clean_weight
+
+    def convolve_plane(self, plane: np.ndarray, *, nan_aware: bool = True) -> np.ndarray:
+        plane = np.asarray(plane)
+
+        if not nan_aware:
+            padded = np.pad(plane, self._pad_width, mode="reflect")
+            return self._fft_same(padded)[self._slices].copy()
+
+        valid_mask = np.isfinite(plane)
+        if valid_mask.all():
+            padded = np.pad(plane, self._pad_width, mode="reflect")
+            smoothed = self._fft_same(padded)[self._slices]
+            return smoothed / self._clean_plane_weight()
+        if not valid_mask.any():
+            return np.full(plane.shape, np.nan, dtype=np.float64)
+
+        filled = np.where(valid_mask, plane, 0.0)
+        data_padded = np.pad(filled, self._pad_width, mode="reflect")
+        valid_padded = np.pad(valid_mask.astype(np.float32), self._pad_width, mode="reflect")
+        smoothed = self._fft_same(data_padded)[self._slices]
+        weights = self._fft_same(valid_padded)[self._slices]
+        out = np.full(plane.shape, np.nan, dtype=np.float64)
+        np.divide(smoothed, weights, out=out, where=weights > 1e-12)
+        out[~valid_mask] = np.nan
+        return out
+
+
+def _apply_planewise(
+    convolver: "_ReflectFFTConvolver",
+    data: np.ndarray,
+    *,
+    nan_aware: bool,
+) -> np.ndarray:
+    """Convolve each trailing 2D plane of ``data`` one at a time."""
+    if data.ndim == 2:
+        return convolver.convolve_plane(data, nan_aware=nan_aware)
+
+    out = np.empty(data.shape, dtype=np.float64)
+    for idx in np.ndindex(*data.shape[:-2]):
+        out[idx] = convolver.convolve_plane(data[idx], nan_aware=nan_aware)
+    return out
+
+
 def compute_smoothed(
     data: np.ndarray,
     kernel_type: str = "gaussian",
@@ -119,21 +269,31 @@ def compute_smoothed(
     else:
         raise ValueError(f"Unknown kernel type: {kernel_type}")
 
-    # Calculate padding and kernel dimensions for FFT convolution
-    kernel_shape = kernel.shape
-    if data.ndim != len(kernel_shape):
-        pad_width = [(0, 0)] * (data.ndim - len(kernel_shape)) + [(s // 2, s // 2) for s in kernel_shape]
-    else:
-        pad_width = [(s // 2, s // 2) for s in kernel_shape]
+    kernel_array = kernel.array
 
-    kernel_nd = kernel.array
+    # Planar (2D) kernels convolve each image plane independently, so iterate
+    # plane-by-plane: this reuses one kernel FFT, skips weight normalisation on
+    # NaN-free planes, and never materialises a padded copy of the whole cube.
+    # 3D kernels mix the spectral axis and stay on the whole-array FFT path.
+    if kernel_array.ndim == 2 and data.ndim >= 2:
+        convolver = _ReflectFFTConvolver(kernel_array, data.shape[-2:])
+        if use_nan_aware:
+            return _apply_planewise(convolver, data, nan_aware=True)
+        data_clean = np.nan_to_num(data, nan=0.0) if has_nan else np.asarray(data)
+        return _apply_planewise(convolver, data_clean, nan_aware=False)
+
+    # Whole-array FFT convolution for 3D (spectral-mixing) kernels.
+    kernel_shape = kernel_array.shape
+    pad_width = [(0, 0)] * (data.ndim - len(kernel_shape)) + [(s // 2, s // 2) for s in kernel_shape]
+
+    kernel_nd = kernel_array
     while kernel_nd.ndim < data.ndim:
         kernel_nd = kernel_nd[None, ...]
 
     slices = tuple(slice(p[0], -p[1] if p[1] != 0 else None) for p in pad_width)
 
     if use_nan_aware:
-        # Fast NaN-aware smoothing via weighted convolution:
+        # NaN-aware smoothing via weighted convolution:
         # smoothed = conv(data * valid) / conv(valid)
         valid_mask = np.isfinite(data)
         if not np.any(valid_mask):
@@ -153,7 +313,7 @@ def compute_smoothed(
         out[~valid_mask] = np.nan
         return out
 
-    # Fast convolution without NaN interpolation
+    # Whole-array convolution without NaN interpolation
     data_clean = np.nan_to_num(data, nan=0.0) if has_nan else np.asarray(data)
     data_padded = np.pad(data_clean, pad_width=pad_width, mode='reflect')
     smoothed_padded = fftconvolve(data_padded, kernel_nd, mode='same')
@@ -191,7 +351,6 @@ def compute_smoothed_to_resolution(
         ValueError: If target resolution is smaller than current resolution
     """
     from astropy.convolution import Gaussian2DKernel
-    from scipy.signal import fftconvolve
 
     # Get current beam from header if not provided
     if current_bmaj is None:
@@ -223,6 +382,14 @@ def compute_smoothed_to_resolution(
     if sigma_kernel_maj_sq <= 0 or sigma_kernel_min_sq <= 0:
         raise ValueError("Target resolution must be larger than current resolution")
 
+    beam_unit_scale = beam_unit_scale_for_target_resolution(
+        header,
+        current_bmaj=float(current_bmaj),
+        current_bmin=float(current_bmin),
+        target_bmaj=float(target_bmaj),
+        target_bmin=float(target_bmin),
+    )
+
     sigma_kernel_maj = np.sqrt(sigma_kernel_maj_sq)
     sigma_kernel_min = np.sqrt(sigma_kernel_min_sq)
 
@@ -234,43 +401,16 @@ def compute_smoothed_to_resolution(
     # Create kernel
     kernel = Gaussian2DKernel(x_stddev=sigma_kernel_x, y_stddev=sigma_kernel_y, theta=theta)
 
-    kernel_array = kernel.array
-    pad_width = [(s // 2, s // 2) for s in kernel_array.shape]
-    slices = tuple(slice(p[0], -p[1] if p[1] != 0 else None) for p in pad_width)
-
-    def _convolve_2d_preserve_nan(slice_data: np.ndarray) -> np.ndarray:
-        valid_mask = np.isfinite(slice_data)
-        if not np.any(valid_mask):
-            return np.full(slice_data.shape, np.nan, dtype=np.float64)
-
-        slice_filled = np.where(valid_mask, slice_data, 0.0)
-        data_padded = np.pad(slice_filled, pad_width=pad_width, mode='reflect')
-        valid_padded = np.pad(valid_mask.astype(np.float32), pad_width=pad_width, mode='reflect')
-
-        smoothed_padded = fftconvolve(data_padded, kernel_array, mode='same')
-        weight_padded = fftconvolve(valid_padded, kernel_array, mode='same')
-        smoothed = smoothed_padded[slices]
-        weights = weight_padded[slices]
-
-        out = np.full(slice_data.shape, np.nan, dtype=np.float64)
-        np.divide(smoothed, weights, out=out, where=weights > 1e-12)
-        out[~valid_mask] = np.nan
-        return out
-
-    # Perform convolution
-    if data.ndim == 2:
-        smoothed = _convolve_2d_preserve_nan(np.asarray(data))
-    elif data.ndim == 3:
-        smoothed = np.empty(data.shape, dtype=np.float64)
-        for i in range(data.shape[0]):
-            smoothed[i] = _convolve_2d_preserve_nan(data[i])
-    elif data.ndim == 4:
-        smoothed = np.empty(data.shape, dtype=np.float64)
-        for s in range(data.shape[0]):
-            for z in range(data.shape[1]):
-                smoothed[s, z] = _convolve_2d_preserve_nan(data[s, z])
-    else:
+    # Convolve each spatial plane independently (NaN-preserving), reusing one
+    # kernel FFT across planes and bounding peak memory to a single plane.
+    if data.ndim not in (2, 3, 4):
         raise ValueError(f"Unsupported data dimensionality: {data.ndim}")
+
+    convolver = _ReflectFFTConvolver(kernel.array, data.shape[-2:])
+    smoothed = _apply_planewise(convolver, np.asarray(data), nan_aware=True)
+
+    if beam_unit_scale != 1.0:
+        smoothed = smoothed * beam_unit_scale
 
     # New beam parameters (in degrees for FITS header)
     new_beam = {

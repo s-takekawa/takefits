@@ -4,7 +4,7 @@ from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
-from PySide6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QGroupBox, QFormLayout, QCheckBox, QComboBox, QDoubleSpinBox, QLabel, QButtonGroup, QRadioButton, QLineEdit, QGridLayout, QFileDialog, QMessageBox, QScrollArea, QSizePolicy, QAbstractScrollArea, QSlider
+from PySide6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QGroupBox, QFormLayout, QCheckBox, QComboBox, QDoubleSpinBox, QLabel, QButtonGroup, QRadioButton, QLineEdit, QGridLayout, QFileDialog, QMessageBox, QScrollArea, QSizePolicy, QAbstractScrollArea, QSlider, QMenu
 import time
 import math
 import os
@@ -48,9 +48,12 @@ from takefits.core.usecases import (
     position_axis_bounds,
     position_from_fraction,
     sample_count_from_spacing,
+    sample_path_points,
     set_pv_endpoints,
     straight_line_from_center,
+    StraightPathGeometry,
 )
+from takefits.tools.pv_slit_overlay import build_slit_overlay
 
 DEFAULT_SAMPLE_SPACING_PIX = 1.0
 
@@ -144,6 +147,12 @@ class PVNavigationToolbar(MyNavigationToolbar):
 
 
 class PVdiagram(QMainWindow):
+    # This window builds its own menu bar (the "Actions" menu, below), so it
+    # opts out of the main window's menu-bar mirroring: mirroring would clear
+    # and overwrite the bespoke "Actions" entries the moment the PV window is
+    # focused. See takefits.ui.menu_bar.mirror_menu_bar_to_window.
+    _owns_menu_bar = True
+
     # Slit (PV path) undo/redo keyboard shortcuts. Aligned with the app-wide
     # Undo/Redo convention (Option+Left / Option+Right == Alt+Left/Right, the
     # same keys as "Undo Analysis"), NOT Cmd+Z which is reserved for View Back.
@@ -236,6 +245,7 @@ class PVdiagram(QMainWindow):
         self.slice_width = 1.0       # Default slice width
         self.sample_spacing_pix = DEFAULT_SAMPLE_SPACING_PIX
         self.x_axis_mode = PV_X_AXIS_POSITION
+        self.position_axis_flipped = False
         self.ellipse_axis_unit = "pixel"
         self.position_origin = POSITION_ORIGIN_START
         self.geometry_input_mode = "endpoints"
@@ -942,6 +952,13 @@ class PVdiagram(QMainWindow):
         self.swapAxesCheck = QCheckBox("Swap PV Axes")
         self.swapAxesCheck.stateChanged.connect(self.on_swap_axes_changed)
         options_layout.addRow(self.swapAxesCheck)
+        self.flipPositionAxisCheck = QCheckBox("Flip Position Axis")
+        self.flipPositionAxisCheck.setToolTip(
+            "Reverse the displayed PV position axis without changing the slit "
+            "geometry or FITS export data."
+        )
+        self.flipPositionAxisCheck.stateChanged.connect(self._on_position_axis_flip_changed)
+        options_layout.addRow(self.flipPositionAxisCheck)
         arrow_control_layout.addRow(self.optionsPanel)
         self.optionsPanel.setVisible(False)
 
@@ -974,8 +991,27 @@ class PVdiagram(QMainWindow):
         self.loadPathButton.clicked.connect(self.load_path_recipe)
         path_button_layout.addWidget(self.savePathButton)
         path_button_layout.addWidget(self.loadPathButton)
+
+        copy_button_layout = QHBoxLayout()
+        copy_button_layout.setContentsMargins(0, 0, 0, 0)
+        copy_button_layout.setSpacing(4)
+        self.copySlitButton = QPushButton("Copy Slit to Window")
+        self.copySlitButton.setToolTip(
+            "Drop a static copy of this slit onto an open xy result window "
+            "(e.g. an integrated/moment map) for figures. The copy stays after "
+            "this PV panel is closed; click it on that window and press Delete "
+            "to remove it."
+        )
+        self._copy_slit_button_menu = QMenu(self.copySlitButton)
+        self._copy_slit_button_menu.aboutToShow.connect(
+            lambda: self._populate_copy_slit_menu(self._copy_slit_button_menu)
+        )
+        self.copySlitButton.setMenu(self._copy_slit_button_menu)
+        copy_button_layout.addWidget(self.copySlitButton)
+
         action_buttons_layout.addLayout(arrow_button_layout)
         action_buttons_layout.addLayout(path_button_layout)
+        action_buttons_layout.addLayout(copy_button_layout)
         arrow_control_layout.addRow(action_buttons_widget)
 
         control_layout_right.addWidget(arrow_control_group)
@@ -1122,6 +1158,11 @@ class PVdiagram(QMainWindow):
         self.redo_slit_action.triggered.connect(self.redo_slit)
         actions_menu.addAction(self.undo_slit_action)
         actions_menu.addAction(self.redo_slit_action)
+        actions_menu.addSeparator()
+        self.copy_slit_menu = actions_menu.addMenu("Copy Slit to Window")
+        self.copy_slit_menu.aboutToShow.connect(
+            lambda: self._populate_copy_slit_menu(self.copy_slit_menu)
+        )
 
     def _create_slit_shortcuts(self, sequences, callback):
         shortcuts = []
@@ -2943,6 +2984,7 @@ class PVdiagram(QMainWindow):
                 "length_unit": str(workspace_state.get("length_unit") or self.lengthUnitCombo.currentText() or "pixel"),
                 "x_axis_mode": workspace_state.get("x_axis_mode", PV_X_AXIS_POSITION),
                 "swap_axes": bool(workspace_state.get("swap_axes", self.swapAxesCheck.isChecked())),
+                "position_axis_flipped": bool(workspace_state.get("position_axis_flipped", self._position_axis_flipped())),
             },
         }
 
@@ -3042,6 +3084,7 @@ class PVdiagram(QMainWindow):
                 "ellipse_axis_unit": str(workspace_state.get("ellipse_axis_unit") or self._current_ellipse_axis_unit()),
                 "x_axis_mode": normalize_pv_x_axis_mode(workspace_state.get("x_axis_mode", self._current_x_axis_mode())),
                 "swap_axes": bool(workspace_state.get("swap_axes", self.swapAxesCheck.isChecked())),
+                "position_axis_flipped": bool(workspace_state.get("position_axis_flipped", self._position_axis_flipped())),
             },
         }
 
@@ -3096,6 +3139,7 @@ class PVdiagram(QMainWindow):
                 "length_unit": str(workspace_state.get("length_unit") or self.lengthUnitCombo.currentText() or "pixel"),
                 "x_axis_mode": PV_X_AXIS_POSITION,
                 "swap_axes": bool(workspace_state.get("swap_axes", self.swapAxesCheck.isChecked())),
+                "position_axis_flipped": bool(workspace_state.get("position_axis_flipped", self._position_axis_flipped())),
             },
         }
 
@@ -3318,6 +3362,7 @@ class PVdiagram(QMainWindow):
             "position_origin": position_origin,
             "geometry_input_mode": geometry_input_mode,
             "swap_axes": bool(display.get("swap_axes", self.swapAxesCheck.isChecked())),
+            "position_axis_flipped": bool(display.get("position_axis_flipped", self._position_axis_flipped())),
             "auto_update": bool(self.autoUpdateCheck.isChecked()),
             "length_unit": str(display.get("length_unit") or self.lengthUnitCombo.currentText() or "pixel"),
             "x_axis_mode": x_axis_mode,
@@ -3406,6 +3451,7 @@ class PVdiagram(QMainWindow):
             "position_origin": POSITION_ORIGIN_START,
             "geometry_input_mode": "endpoints",
             "swap_axes": bool(display.get("swap_axes", self.swapAxesCheck.isChecked())),
+            "position_axis_flipped": bool(display.get("position_axis_flipped", self._position_axis_flipped())),
             "auto_update": bool(self.autoUpdateCheck.isChecked()),
             "length_unit": str(display.get("length_unit") or self.lengthUnitCombo.currentText() or "pixel"),
             "x_axis_mode": PV_X_AXIS_POSITION,
@@ -3556,6 +3602,7 @@ class PVdiagram(QMainWindow):
             "position_origin": POSITION_ORIGIN_START,
             "geometry_input_mode": "endpoints",
             "swap_axes": bool(display.get("swap_axes", self.swapAxesCheck.isChecked())),
+            "position_axis_flipped": bool(display.get("position_axis_flipped", self._position_axis_flipped())),
             "auto_update": bool(self.autoUpdateCheck.isChecked()),
             "length_unit": str(display.get("length_unit") or self.lengthUnitCombo.currentText() or "pixel"),
             "ellipse_axis_unit": str(display.get("ellipse_axis_unit") or self._current_ellipse_axis_unit() or "pixel"),
@@ -5801,11 +5848,12 @@ class PVdiagram(QMainWindow):
                 return
 
             # Apply based on axis swap state
+            pos_limits = self._display_position_limits((pos_min_val, pos_max_val))
             if self.swapAxesCheck.isChecked():
-                self.pv_ax.set_ylim(pos_min_val, pos_max_val) # Position on Y axis
+                self.pv_ax.set_ylim(*pos_limits) # Position on Y axis
                 self.pv_ax.set_xlim(vel_min_val, vel_max_val) # Velocity on X axis
             else:
-                self.pv_ax.set_xlim(pos_min_val, pos_max_val) # Position on X axis
+                self.pv_ax.set_xlim(*pos_limits) # Position on X axis
                 self.pv_ax.set_ylim(vel_min_val, vel_max_val) # Velocity on Y axis
 
             self.is_range_manual = True # Mark that range was set manually
@@ -5815,6 +5863,82 @@ class PVdiagram(QMainWindow):
             print("Invalid input for range. Please enter numeric values.")
             # Restore previous valid values from plot
             self.update_range_inputs()
+
+    def _position_axis_flipped(self, *, fallback=None):
+        check = getattr(self, "flipPositionAxisCheck", None)
+        if check is not None:
+            try:
+                return bool(check.isChecked())
+            except Exception:
+                pass
+        if fallback is not None:
+            return bool(fallback)
+        return bool(getattr(self, "position_axis_flipped", False))
+
+    def _set_position_axis_flip_state(self, flipped):
+        self.position_axis_flipped = bool(flipped)
+        check = getattr(self, "flipPositionAxisCheck", None)
+        if check is None:
+            return
+        try:
+            check.blockSignals(True)
+            check.setChecked(self.position_axis_flipped)
+        finally:
+            try:
+                check.blockSignals(False)
+            except Exception:
+                pass
+
+    def _display_position_limits(self, limits, *, flipped=None):
+        if limits is None:
+            return None
+        left, right = float(limits[0]), float(limits[1])
+        use_flipped = self._position_axis_flipped() if flipped is None else bool(flipped)
+        if use_flipped:
+            return (right, left)
+        return (left, right)
+
+    def _logical_position_limits_from_display(self, limits, *, flipped=None):
+        if limits is None:
+            return None
+        left, right = float(limits[0]), float(limits[1])
+        use_flipped = self._position_axis_flipped() if flipped is None else bool(flipped)
+        if use_flipped:
+            return (right, left)
+        return (left, right)
+
+    def _current_position_axis_limits(self):
+        if self.pv_ax is None:
+            return None
+        if self.swapAxesCheck.isChecked():
+            return self.pv_ax.get_ylim()
+        return self.pv_ax.get_xlim()
+
+    def _set_position_axis_limits(self, logical_limits, *, flipped=None):
+        display_limits = self._display_position_limits(logical_limits, flipped=flipped)
+        if display_limits is None or self.pv_ax is None:
+            return
+        if self.swapAxesCheck.isChecked():
+            self.pv_ax.set_ylim(*display_limits)
+        else:
+            self.pv_ax.set_xlim(*display_limits)
+
+    def _on_position_axis_flip_changed(self):
+        new_flipped = self._position_axis_flipped()
+        old_flipped = not new_flipped
+        raw_limits = self._current_position_axis_limits()
+        self.position_axis_flipped = new_flipped
+        if raw_limits is not None:
+            logical_limits = self._logical_position_limits_from_display(
+                raw_limits,
+                flipped=old_flipped,
+            )
+            self._set_position_axis_limits(logical_limits, flipped=new_flipped)
+        self.update_range_inputs()
+        try:
+            self.pv_canvas.draw_idle()
+        except Exception:
+            pass
 
     def update_range_inputs(self):
         """Update QLineEdit inputs based on current plot axes limits."""
@@ -5831,6 +5955,7 @@ class PVdiagram(QMainWindow):
         else:
             pos_range = xlim
             vel_range = ylim
+        pos_range = self._logical_position_limits_from_display(pos_range)
 
         # Update Position inputs (format to reasonable precision)
         self.pos_min_input.blockSignals(True)
@@ -5905,10 +6030,10 @@ class PVdiagram(QMainWindow):
         if self.is_range_manual and self.original_position_range is not None and self.original_velocity_range is not None:
             is_swapped = self.swapAxesCheck.isChecked()
             if is_swapped:
-                pos_view_lim = self.pv_ax.get_ylim()
+                pos_view_lim = self._logical_position_limits_from_display(self.pv_ax.get_ylim())
                 vel_view_lim = self.pv_ax.get_xlim()
             else:
-                pos_view_lim = self.pv_ax.get_xlim()
+                pos_view_lim = self._logical_position_limits_from_display(self.pv_ax.get_xlim())
                 vel_view_lim = self.pv_ax.get_ylim()
 
             old_pos_full_lim = self.original_position_range
@@ -6072,7 +6197,7 @@ class PVdiagram(QMainWindow):
             self.pv_im.set_data(pv_display)
             self.pv_im.set_extent((new_vel_full_range[0], new_vel_full_range[1], new_pos_full_range[0], new_pos_full_range[1])) # ★ Use FULL range for extent
             self._refresh_contours()
-            self.pv_ax.set_ylim(pos_lim_final)
+            self.pv_ax.set_ylim(*self._display_position_limits(pos_lim_final))
             self.pv_ax.set_xlim(vel_lim_final)
             self.pv_ax.set_xlabel(vel_label)
             self.pv_ax.set_ylabel(position_label)
@@ -6080,7 +6205,7 @@ class PVdiagram(QMainWindow):
             self.pv_im.set_data(pv)
             self.pv_im.set_extent((new_pos_full_range[0], new_pos_full_range[1], new_vel_full_range[0], new_vel_full_range[1])) # ★ Use FULL range for extent
             self._refresh_contours()
-            self.pv_ax.set_xlim(pos_lim_final)
+            self.pv_ax.set_xlim(*self._display_position_limits(pos_lim_final))
             self.pv_ax.set_ylim(vel_lim_final)
             self.pv_ax.set_xlabel(position_label)
             self.pv_ax.set_ylabel(vel_label)
@@ -6785,6 +6910,150 @@ class PVdiagram(QMainWindow):
                 best_score = score
         return best
 
+    def _slit_overlay_color(self):
+        combo = getattr(self, "arrowColorCombo", None)
+        if combo is not None:
+            try:
+                text = str(combo.currentText() or "").strip()
+                if text:
+                    return text
+            except Exception:
+                pass
+        return getattr(self, "pvarrow_color", "yellow")
+
+    def _build_slit_overlay_payload(self):
+        """Sample the current slit into a static overlay dict (pixel coords).
+
+        Returns ``None`` when no usable slit geometry exists. The result is a
+        plain dict (see ``pv_slit_overlay.build_slit_overlay``) that can be drawn
+        on any window sharing the main image's xy pixel grid.
+        """
+        path_type = self._current_path_type()
+        geometry = None
+        closed = False
+        try:
+            if path_type in ("ellipse", "ellipse_arc"):
+                geometry = self._current_ellipse_path_geometry()
+                closed = path_type == "ellipse"
+            elif path_type == "polyline":
+                geometry = self._current_polyline_path_geometry()
+            else:
+                if self.line_start is None or self.line_end is None:
+                    return None
+                geometry = StraightPathGeometry.from_endpoints(
+                    float(self.line_start[0]), float(self.line_start[1]),
+                    float(self.line_end[0]), float(self.line_end[1]),
+                )
+        except Exception:
+            geometry = None
+        if geometry is None:
+            return None
+
+        try:
+            samples = sample_path_points(
+                geometry,
+                sample_spacing_pix=self._current_sample_spacing_pix(),
+                sample_axis=self._current_x_axis_mode(),
+            )
+        except Exception:
+            return None
+
+        try:
+            width_px = float(self.sliceWidthSpin.value())
+        except Exception:
+            width_px = 0.0
+        try:
+            linewidth = max(0.5, 1.5 * float(self.arrowSizeSpin.value()))
+        except Exception:
+            linewidth = 1.5
+
+        return build_slit_overlay(
+            samples.xs,
+            samples.ys,
+            samples.normal_x,
+            samples.normal_y,
+            width_px=width_px,
+            color=self._slit_overlay_color(),
+            linewidth=linewidth,
+            closed=closed,
+            label=f"PV slit ({self.fits_viewer.filename})",
+        )
+
+    def _live_xy_overlay_targets(self):
+        """Return [(window, title)] of live xy result windows that can host a slit."""
+        targets = []
+        seen = set()
+        refs = getattr(self.fits_viewer, "integ_result_windows", None) or []
+        for ref in list(refs):
+            try:
+                window = ref() if callable(ref) else ref
+            except Exception:
+                window = None
+            if window is None or id(window) in seen:
+                continue
+            if getattr(window, "plane", None) != "xy":
+                continue
+            if not hasattr(window, "add_slit_overlay"):
+                continue
+            seen.add(id(window))
+            try:
+                title = window.windowTitle() or "Result window"
+            except Exception:
+                title = "Result window"
+            targets.append((window, title))
+        return targets
+
+    def _copy_slit_to_window(self, window):
+        overlay = self._build_slit_overlay_payload()
+        if overlay is None:
+            self._set_pv_status_message(
+                "No slit to copy — draw or place a slit first."
+            )
+            return
+        try:
+            window.add_slit_overlay(overlay)
+        except Exception as exc:
+            self._set_pv_status_message(f"Could not copy slit: {exc}")
+            return
+        self._set_pv_status_message("Slit copied to the selected window.")
+
+    def _populate_copy_slit_menu(self, menu):
+        menu.clear()
+        targets = self._live_xy_overlay_targets()
+        if not targets:
+            action = menu.addAction("No xy result windows open")
+            action.setEnabled(False)
+            return
+        for window, title in targets:
+            action = menu.addAction(title)
+            action.triggered.connect(
+                lambda _checked=False, w=window: self._copy_slit_to_window(w)
+            )
+        windows_with_slit = [
+            (window, title)
+            for window, title in targets
+            if getattr(window, "has_slit_overlay", None) and window.has_slit_overlay()
+        ]
+        if windows_with_slit:
+            menu.addSeparator()
+            for window, title in windows_with_slit:
+                action = menu.addAction(f"Clear copied slit: {title}")
+                action.triggered.connect(
+                    lambda _checked=False, w=window: self._clear_slit_from_window(w)
+                )
+
+    def _clear_slit_from_window(self, window):
+        try:
+            window.clear_slit_overlays()
+        except Exception:
+            return
+        self._set_pv_status_message("Copied slit cleared.")
+
+    def _set_pv_status_message(self, message):
+        # Do not call QMainWindow.statusBar() here. Qt creates the bottom status
+        # bar on first use, which slightly changes the PV/integration window size.
+        pass
+
     def _export_single_path_state(self):
         state = {
             "schema": 1,
@@ -6801,6 +7070,7 @@ class PVdiagram(QMainWindow):
             "position_origin": self._current_position_origin(),
             "geometry_input_mode": self._current_geometry_input_mode(),
             "swap_axes": bool(self.swapAxesCheck.isChecked()),
+            "position_axis_flipped": self._position_axis_flipped(),
             "x_axis_mode": self._current_x_axis_mode(),
             "auto_update": bool(self.autoUpdateCheck.isChecked()),
             "length_unit": str(self.lengthUnitCombo.currentText() or "pixel"),
@@ -7041,6 +7311,7 @@ class PVdiagram(QMainWindow):
             except Exception:
                 pass
         self._sync_x_axis_controls()
+        self._set_position_axis_flip_state(bool(state.get("position_axis_flipped", False)))
 
         try:
             self.autoUpdateCheck.setChecked(bool(state.get("auto_update", False)))

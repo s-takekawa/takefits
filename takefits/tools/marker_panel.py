@@ -122,8 +122,8 @@ class MarkerPanel(QDialog):
     UNIT_OPTIONS = ["pixel", "arcsec", "arcmin", "deg"]
 
     FONT_OPTIONS = [
-        "Arial",
         "DejaVu Sans",
+        "Arial",
         "STIXGeneral",
         "Helvetica",
         "Times New Roman",
@@ -455,7 +455,7 @@ class MarkerPanel(QDialog):
         font_combo = QComboBox()
         for family in self.FONT_OPTIONS:
             font_combo.addItem(family)
-        font_combo.setCurrentText("Arial")
+        font_combo.setCurrentText("DejaVu Sans")
 
         return TextControls(
             widget=QWidget(), # Dummy

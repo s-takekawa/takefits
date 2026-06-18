@@ -37,9 +37,10 @@ def _build_argument_parser(*, prog: str = "takefits") -> argparse.ArgumentParser
         description="GUI-based astronomical FITS viewer and analysis tool.",
     )
     parser.add_argument(
-        "path",
-        nargs="?",
-        help="FITS file or workspace file to open.",
+        "paths",
+        nargs="*",
+        metavar="path",
+        help="FITS file or workspace file to open. Provide multiple paths to open several windows.",
     )
     parser.add_argument(
         "--version",
@@ -96,6 +97,32 @@ def _configure_matplotlib_cache_dir() -> None:
             return
         except Exception:
             continue
+
+
+def _enable_windows_ansi() -> None:
+    """Enable ANSI escape processing on the Windows console.
+
+    The terminal read-outs and load banners use ANSI colour/cursor codes
+    (``\\033[…``). Windows' legacy console (cmd.exe / conhost) does not process
+    them unless ``ENABLE_VIRTUAL_TERMINAL_PROCESSING`` is set, so without this
+    they render as literal garbage like ``←[96m``. No-op everywhere else.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        enable_vt = 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        for std_handle_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(std_handle_id)
+            if not handle or handle == ctypes.c_void_p(-1).value:
+                continue
+            mode = ctypes.c_uint32()
+            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                kernel32.SetConsoleMode(handle, mode.value | enable_vt)
+    except Exception:
+        pass
 
 
 def _load_gui_runtime():
@@ -162,6 +189,13 @@ def resolve_workspace_source_fits(workspace_path: str) -> tuple[str, str]:
     return absolute_workspace, os.path.abspath(source_fits)
 
 
+def resolve_launch_target(path: str) -> tuple[str, str | None]:
+    if is_workspace_file(path):
+        workspace_path, filename = resolve_workspace_source_fits(path)
+        return filename, workspace_path
+    return path, None
+
+
 def choose_fits_file(runtime):
     """Show a single file dialog with a visible hint and return the chosen file or None."""
     settings_path = runtime.app_config_path("takefits.ini")
@@ -224,7 +258,11 @@ def choose_fits_file(runtime):
     return filename
 
 
-def launch_gui(filename: str | None, workspace_path: str | None) -> int:
+def launch_gui(
+    filename: str | None,
+    workspace_path: str | None,
+    extra_launch_targets: list[tuple[str, str | None]] | None = None,
+) -> int:
     runtime = _load_gui_runtime()
 
     print(APP_VERSION_TEXT)
@@ -245,12 +283,20 @@ def launch_gui(filename: str | None, workspace_path: str | None) -> int:
     class StartupController(runtime.QObject):
         """Handle worker completion on the GUI thread."""
 
-        def __init__(self, app_obj, thread, launch_filename: str, launch_workspace_path: str | None):
+        def __init__(
+            self,
+            app_obj,
+            thread,
+            launch_filename: str,
+            launch_workspace_path: str | None,
+            remaining_launch_targets,
+        ):
             super().__init__()
             self.app = app_obj
             self.thread = thread
             self.filename = launch_filename
             self.workspace_path = launch_workspace_path
+            self.remaining_launch_targets = list(remaining_launch_targets or [])
             self.main_win = None
 
         def on_finished(self, data, header, wcs, spectral_metadata):
@@ -263,8 +309,11 @@ def launch_gui(filename: str | None, workspace_path: str | None) -> int:
                 self.filename,
                 spectral_metadata,
             )
-            print("*--*--*--*--*--*--*--*--*--*--*--*--*--*--*--*--*")
             self.main_win.show()
+            print_fits_loaded_summary(self.main_win, path=self.filename)
+            if not self.remaining_launch_targets:
+                # Single-FITS launch: loading is done -> ready divider.
+                print_ready_separator()
             if self.workspace_path:
                 set_workspace_path = getattr(self.main_win, "set_workspace_save_path", None)
                 if callable(set_workspace_path):
@@ -276,8 +325,53 @@ def launch_gui(filename: str | None, workspace_path: str | None) -> int:
                 )
                 if not restored:
                     print(f"[takefits] Failed to restore workspace: {self.workspace_path}", file=sys.stderr)
+            if self.remaining_launch_targets:
+                # Launching several FITS: keep the comparison view clean by
+                # stowing this first window's tool/range panels, but tuck any
+                # startup subwindow (e.g. X-Z for a light cube) behind its main.
+                place_behind = getattr(self.main_win, "_place_startup_subwindows_behind_main", None)
+                if callable(place_behind):
+                    try:
+                        place_behind()
+                    except Exception:
+                        pass
+                hide_panels = getattr(self.main_win, "hide_workspace_panels", None)
+                if callable(hide_panels):
+                    try:
+                        hide_panels()
+                    except Exception:
+                        pass
             self.thread.quit()
             self.thread.wait()
+            if self.remaining_launch_targets:
+                runtime.QTimer.singleShot(0, self.open_remaining_targets)
+
+        def open_remaining_targets(self):
+            if self.main_win is None:
+                return
+            for target_filename, target_workspace_path in list(self.remaining_launch_targets):
+                path = target_workspace_path or target_filename
+                try:
+                    opened = self.main_win.open_path_in_new_window(path, main_only=True)
+                    if opened is None:
+                        print(f"[takefits] Failed to open additional file: {path}", file=sys.stderr)
+                except Exception as exc:
+                    print(f"[takefits] Failed to open additional file {path}: {exc}", file=sys.stderr)
+            # Launching several FITS together implies a comparison: start with
+            # the cross-window view lock on AND align the ranges to this first
+            # window, so the comparison opens already synced.
+            try:
+                from takefits.ui.window_registry import WindowRegistry
+                from takefits.ui.window_sync_manager import WindowSyncManager
+                if WindowRegistry.instance().count() >= 2:
+                    manager = WindowSyncManager.instance()
+                    manager.set_enabled(True)
+                    main_win = self.main_win
+                    runtime.QTimer.singleShot(0, lambda: manager.sync_now(main_win))
+            except Exception:
+                pass
+            # All launch files loaded -> ready divider.
+            print_ready_separator()
 
         def on_error(self, title, details):
             self.thread.quit()
@@ -289,7 +383,7 @@ def launch_gui(filename: str | None, workspace_path: str | None) -> int:
 
     thread = runtime.QThread()
     worker = runtime.FITSWorker(filename)
-    controller = StartupController(app, thread, filename, workspace_path)
+    controller = StartupController(app, thread, filename, workspace_path, extra_launch_targets)
     worker.moveToThread(thread)
 
     thread.started.connect(worker.run)
@@ -300,28 +394,86 @@ def launch_gui(filename: str | None, workspace_path: str | None) -> int:
     worker.progress.connect(lambda msg: print(msg))
     worker.error.connect(controller.on_error)
 
+    print_fits_loading_banner(filename)
     thread.start()
     return app.exec()
 
 
+def print_ready_separator() -> None:
+    """Divider marking the end of the launch load phase (ready to interact)."""
+    from takefits.core.terminal import commit_inplace
+    commit_inplace()
+    print("*--*--*--*--*--*--*--*--*--*--*--*--*--*--*--*--*")
+
+
+def print_fits_loading_banner(path) -> None:
+    """Terminal banner printed before a FITS is loaded, so the WCS notices that
+    follow are grouped under the file they came from (matters with several
+    FITS open). The first-file worker already emits its own loading message."""
+    from takefits.core.terminal import commit_inplace
+    commit_inplace()
+    print(f"\033[96mLoading: {os.path.basename(str(path))}\033[0m")
+
+
+def print_fits_loaded_summary(window=None, *, path=None, data=None, header=None) -> None:
+    """Terminal summary after a FITS finishes loading: file, shape, axes, bunit.
+
+    Uses the bare filename (no "FITS N") so every file's line looks the same;
+    the window↔number mapping lives in the window title and click read-outs."""
+    name = os.path.basename(str(path)) if path else ""
+    if window is not None:
+        try:
+            name = os.path.basename(str(getattr(window, "filename", None) or name))
+        except Exception:
+            pass
+        if data is None:
+            data = getattr(window, "data", None)
+        if header is None:
+            header = getattr(window, "header", None)
+    parts = []
+    shape = "x".join(str(s) for s in (getattr(data, "shape", None) or []))
+    if shape:
+        parts.append(f"shape={shape}")
+    if header is not None:
+        try:
+            naxis = int(header.get("NAXIS", 0) or 0)
+            axes = [str(header.get(f"CTYPE{k}", "") or "").strip() for k in range(1, naxis + 1)]
+            axes = [a for a in axes if a]
+            if axes:
+                parts.append("axes=" + ",".join(axes))
+            bunit = str(header.get("BUNIT", "") or "").strip()
+            if bunit:
+                parts.append(f"bunit={bunit}")
+        except Exception:
+            pass
+    detail = f"  ({'  '.join(parts)})" if parts else ""
+    print(f"\033[92mLoaded: {name}{detail}\033[0m")
+
+
 def main(argv=None, *, gui_launcher=None, prog: str | None = None) -> int:
+    _enable_windows_ansi()
     parser = _build_argument_parser(prog=_resolve_prog(argv=argv, prog=prog))
     args = parser.parse_args(argv)
 
     filename = None
     workspace_path = None
-    if args.path:
-        if is_workspace_file(args.path):
+    extra_launch_targets = []
+    launch_paths = list(getattr(args, "paths", []) or [])
+    if launch_paths:
+        launch_targets = []
+        for path in launch_paths:
             try:
-                workspace_path, filename = resolve_workspace_source_fits(args.path)
+                launch_targets.append(resolve_launch_target(path))
             except Exception as exc:
                 print(f"[takefits] Failed to open workspace: {exc}", file=sys.stderr)
                 return 1
-        else:
-            filename = args.path
+        filename, workspace_path = launch_targets[0]
+        extra_launch_targets = launch_targets[1:]
 
     if gui_launcher is None:
         gui_launcher = launch_gui
+    if extra_launch_targets:
+        return int(gui_launcher(filename, workspace_path, extra_launch_targets) or 0)
     return int(gui_launcher(filename, workspace_path) or 0)
 
 

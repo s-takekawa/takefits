@@ -22,6 +22,7 @@ from takefits.core.plotting.display_map import TransparentOverlayAxes
 from takefits.core.coordinate import Format_pix_to_wcs
 from takefits.core.colorbar_layout import compute_colorbar_geometry, orientation_for_placement
 from takefits.core.click_label_layout import compute_click_label_geometry
+from takefits.core.fonts import resolve_mpl_font_family
 from takefits.logic.add_hpbw import AddHPBW
 from astropy.io import fits
 from takefits.core.usecases import compute_moment, export_moment_fits, AppState
@@ -1043,6 +1044,9 @@ class IntegResultWindow(QMainWindow):
         mode_suffix = self.integ_mode if isinstance(self.integ_mode, str) else 'integ'
         self.filename = f"{base_root}.{mode_suffix}.fits"
         self.config_manager = getattr(self.fits_viewer, 'config_manager', None)
+        # Descriptive part of the title (e.g. "Moment 2: -10 to 10"); the owning
+        # FITS identity and name are folded in by refresh_identity_title().
+        self._descriptive_window_title = window_title
         self.setWindowTitle(window_title)
         self.original_window_title = window_title
         self.region_mode_enabled = self.fits_viewer.region_mode_enabled
@@ -1126,6 +1130,10 @@ class IntegResultWindow(QMainWindow):
             shape_for_integ = 'rectangle' if current_shape == 'cube' else current_shape
             self.region_manager.set_region_mode(shape_for_integ)
             self.setWindowTitle(f"[REGION MODE: {shape_for_integ.upper()}] {self.original_window_title}")
+
+        # Show which FITS this result belongs to, e.g.
+        # "FITS 2 · Moment 2: -10 to 10 — beta.fits" (preserves region-mode tag).
+        self.refresh_identity_title()
 
         self._setup_region_action_bridge()
         self._initialize_annotation_history_seed()
@@ -1544,9 +1552,10 @@ class IntegResultWindow(QMainWindow):
         
         xtick_label_position = config.get('xticklabel_position')
         ytick_label_position = config.get('yticklabel_position')
+        axislabel_fontfamily = resolve_mpl_font_family(config.get('axislabel_fontfamily'))
         
         self.ax.coords[0].set_axislabel(self.xlabel, fontsize=config.get('axislabel_fontsize'),
-                           fontfamily=config.get('axislabel_fontfamily'),
+                           fontfamily=axislabel_fontfamily,
                            color=config.get('axislabel_color'))
         self.ax.coords[0].set_axislabel_position(xtick_label_position)
         self.ax.coords[0].set_ticklabel(rotation = config.get('tick_xlabelrotation'), pad = config.get('tick_pad_x'), ha='right', va='top')
@@ -1556,7 +1565,7 @@ class IntegResultWindow(QMainWindow):
         
         
         self.ax.coords[1].set_axislabel(self.ylabel, fontsize=config.get('axislabel_fontsize'),
-                           fontfamily=config.get('axislabel_fontfamily'),
+                           fontfamily=axislabel_fontfamily,
                            color=config.get('axislabel_color'))
         self.ax.coords[1].set_axislabel_position(ytick_label_position)
         self.ax.coords[1].set_ticklabel(rotation = config.get('tick_ylabelrotation'), pad = config.get('tick_pad_y'), ha='center', va='top')
@@ -1582,7 +1591,7 @@ class IntegResultWindow(QMainWindow):
             self.ax.coords[2].set_ticklabel_position(xtick_label_position)
 
         self.ax.coords[2].set_axislabel(self.zlabel, fontsize=config.get('axislabel_fontsize'),
-                    fontfamily=config.get('axislabel_fontfamily'),
+                    fontfamily=axislabel_fontfamily,
                     color=config.get('axislabel_color'))
         self.ax.coords[2].set_ticks_position(config.get('default_ticks_position'))
         self.ax.coords[2].set_minor_frequency(config.get('z_mtick_freq', 5))
@@ -1848,7 +1857,7 @@ class IntegResultWindow(QMainWindow):
             "pad": pad,
             "size": config.get('tick_labelsize'),
             "color": config.get('tick_labelcolor'),
-            "fontfamily": config.get('tick_font'),
+            "fontfamily": resolve_mpl_font_family(config.get('tick_font')),
         }
         kwargs.update(extra_kwargs)
         coord.set_ticklabel(**kwargs)
@@ -1918,11 +1927,12 @@ class IntegResultWindow(QMainWindow):
         coords = list(self.ax.coords)
         xtick_label_position = config.get('xticklabel_position')
         ytick_label_position = config.get('yticklabel_position')
+        axislabel_fontfamily = resolve_mpl_font_family(config.get('axislabel_fontfamily'))
         if len(coords) > 0:
             coords[0].set_axislabel(
                 self.xlabel,
                 fontsize=config.get('axislabel_fontsize'),
-                fontfamily=config.get('axislabel_fontfamily'),
+                fontfamily=axislabel_fontfamily,
                 color=config.get('axislabel_color'),
             )
             coords[0].set_axislabel_position(xtick_label_position)
@@ -1932,7 +1942,7 @@ class IntegResultWindow(QMainWindow):
             coords[1].set_axislabel(
                 self.ylabel,
                 fontsize=config.get('axislabel_fontsize'),
-                fontfamily=config.get('axislabel_fontfamily'),
+                fontfamily=axislabel_fontfamily,
                 color=config.get('axislabel_color'),
             )
             coords[1].set_axislabel_position(ytick_label_position)
@@ -1943,7 +1953,7 @@ class IntegResultWindow(QMainWindow):
             coords[2].set_axislabel(
                 self.zlabel,
                 fontsize=config.get('axislabel_fontsize'),
-                fontfamily=config.get('axislabel_fontfamily'),
+                fontfamily=axislabel_fontfamily,
                 color=config.get('axislabel_color'),
             )
             self._apply_ticklabel_style(coords[2], z_axis_role, config, ha='center', va='top')
@@ -4036,6 +4046,10 @@ class IntegResultWindow(QMainWindow):
                 self.redraw_main_overlay_and_blit()
                 return
 
+        if self._maybe_handle_slit_overlay_click(event):
+            self.canvas.setFocus()
+            return
+
         if (
             getattr(self, 'marker_mode_enabled', False)
             and self.toolbar.mode == ''
@@ -4212,6 +4226,8 @@ class IntegResultWindow(QMainWindow):
                     plane = marker.plane
                     marker_manager.remove_marker(marker.marker_id, plane)
                     marker_manager.redraw_plane(plane)
+            elif getattr(self, '_slit_overlay_selected', False):
+                self.clear_slit_overlays()
 
     def on_key_release(self, event):
         region_manager = getattr(self, 'region_manager', None)
@@ -4250,6 +4266,130 @@ class IntegResultWindow(QMainWindow):
         if clim is not None:
             metadata["clim"] = tuple(clim)
         return [ContourItem(ax=self.ax, data=data, label=self._default_contour_label(), metadata=metadata)]
+
+    # ------------------------------------------------------------------
+    # Static PV-slit overlays (copied from a PV diagram for figures)
+
+    def add_slit_overlay(self, overlay):
+        """Draw a static PV-slit overlay copied from a PV diagram.
+
+        Re-copying replaces any previous copied slit so the overlay does not
+        stack. The artists live on this window's image axes, so they persist
+        after the source PV panel is closed and are disposed when this window
+        closes. The copy can be selected with a click and removed with the
+        Delete/Backspace key.
+        """
+        from takefits.tools.pv_slit_overlay import (
+            deserialize_slit_overlay,
+            draw_slit_overlay,
+            serialize_slit_overlay,
+        )
+
+        overlay = deserialize_slit_overlay(overlay)
+        if overlay is None:
+            return []
+        self.clear_slit_overlays()
+        artists = draw_slit_overlay(self.ax, overlay)
+        if not artists:
+            self._slit_overlay_payload = None
+            return artists
+        for line in artists:
+            line._takefits_base_lw = line.get_linewidth()
+            try:
+                line.set_pickradius(6.0)
+            except Exception:
+                pass
+        self._slit_overlay_artists = list(artists)
+        self._slit_overlay_payload = serialize_slit_overlay(overlay)
+        self._slit_overlay_selected = False
+        self._background = None
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+        return artists
+
+    def has_slit_overlay(self):
+        return bool(getattr(self, "_slit_overlay_artists", None))
+
+    def export_slit_overlay_state(self):
+        if not self.has_slit_overlay():
+            return None
+        from takefits.tools.pv_slit_overlay import serialize_slit_overlay
+
+        return serialize_slit_overlay(getattr(self, "_slit_overlay_payload", None))
+
+    def restore_slit_overlay_state(self, payload):
+        from takefits.tools.pv_slit_overlay import deserialize_slit_overlay
+
+        overlay = deserialize_slit_overlay(payload)
+        if overlay is None:
+            return False
+        return bool(self.add_slit_overlay(overlay))
+
+    def clear_slit_overlays(self):
+        for artist in getattr(self, "_slit_overlay_artists", None) or []:
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        self._slit_overlay_artists = []
+        self._slit_overlay_payload = None
+        self._slit_overlay_selected = False
+        self._background = None
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _set_slit_overlay_selected(self, selected):
+        selected = bool(selected)
+        if selected == getattr(self, "_slit_overlay_selected", False):
+            return
+        self._slit_overlay_selected = selected
+        # Selection feedback is the thicker line only; no status-bar message,
+        # because showing the status bar slightly resizes the window.
+        for line in getattr(self, "_slit_overlay_artists", None) or []:
+            base = getattr(line, "_takefits_base_lw", line.get_linewidth())
+            line.set_linewidth(base * 1.8 if selected else base)
+        self._background = None
+        try:
+            self.canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _maybe_handle_slit_overlay_click(self, event):
+        """Select/deselect the copied slit on plain left clicks.
+
+        Returns True when the click landed on the slit (and was consumed).
+        Region/marker modes keep their own click+Delete semantics, so the slit
+        is only selectable in plain browse mode.
+        """
+        artists = getattr(self, "_slit_overlay_artists", None) or []
+        if not artists:
+            return False
+        if getattr(event, "button", None) != 1 or getattr(event, "dblclick", False):
+            return False
+        if getattr(self.toolbar, "mode", "") != "":
+            return False
+        if getattr(self, "region_mode_enabled", False) or getattr(self, "marker_mode_enabled", False):
+            return False
+        if event.inaxes not in (self.ax, getattr(self, "overlay_ax", None)):
+            # Clicking outside the image still drops the selection.
+            if getattr(self, "_slit_overlay_selected", False):
+                self._set_slit_overlay_selected(False)
+            return False
+        for line in artists:
+            try:
+                contains, _ = line.contains(event)
+            except Exception:
+                contains = False
+            if contains:
+                self._set_slit_overlay_selected(True)
+                return True
+        if getattr(self, "_slit_overlay_selected", False):
+            self._set_slit_overlay_selected(False)
+        return False
 
     def _register_contour_layer(self):
         from takefits.core.contour_manager import ContourManager
@@ -4454,6 +4594,40 @@ class IntegResultWindow(QMainWindow):
                     print(f"Skipping invalid key-value pair: {key} -> {value}")
     
         return new_header
+
+    def _compose_identity_title(self) -> str:
+        """Build "<FITS N> · <descriptive> — <parent fits>" for this result."""
+        descriptive = str(getattr(self, "_descriptive_window_title", "") or "").strip()
+        viewer = getattr(self, "fits_viewer", None)
+        prefix = ""
+        getter = getattr(viewer, "fits_identity_prefix", None)
+        if callable(getter):
+            try:
+                prefix = str(getter() or "").strip()
+            except Exception:
+                prefix = ""
+        parent_name = str(getattr(viewer, "filename", "") or "").strip()
+        head = descriptive
+        if prefix:
+            head = f"{prefix} · {descriptive}" if descriptive else prefix
+        if parent_name:
+            return f"{head} — {parent_name}" if head else parent_name
+        return head or "Integration Result"
+
+    def refresh_identity_title(self):
+        """Re-stamp the title with the owning FITS identity (renumber-safe)."""
+        base = self._compose_identity_title()
+        self.original_window_title = base
+        shape = None
+        try:
+            shape = self.region_manager.region_mode
+        except Exception:
+            shape = None
+        if getattr(self, "region_mode_enabled", False) and shape:
+            shape_for_integ = 'rectangle' if shape == 'cube' else shape
+            self.setWindowTitle(f"[REGION MODE: {shape_for_integ.upper()}] {base}")
+        else:
+            self.setWindowTitle(base)
 
     def set_region_mode(self, checked):
         checked = bool(checked)

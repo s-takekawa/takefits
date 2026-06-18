@@ -419,7 +419,7 @@ class ConfigPanel(QWidget):
         axis_layout.addWidget(QLabel('Axis Label Font Size:'), 0, 0)
         axis_layout.addWidget(self.axislabel_fontsize_input, 0, 1)
 
-        self.axislabel_fontfamily_input = self.create_font_combobox(self.config_manager.config.get('axislabel_fontfamily', 'Arial'))
+        self.axislabel_fontfamily_input = self.create_font_combobox(self.config_manager.config.get('axislabel_fontfamily', 'DejaVu Sans'))
         self.axislabel_fontfamily_input.setFixedWidth(100)
         axis_layout.addWidget(QLabel('Axis Label Font Family:'), 1, 0)
         axis_layout.addWidget(self.axislabel_fontfamily_input, 1, 1)
@@ -564,7 +564,7 @@ class ConfigPanel(QWidget):
         label_style_layout.addWidget(QLabel('Tick Label Color:'), 2, 0)
         label_style_layout.addWidget(self.tick_labelcolor_input, 2, 1)
 
-        self.ticklabel_fontfamily_input = self.create_font_combobox(self.config_manager.config.get('tick_font', 'Arial'))
+        self.ticklabel_fontfamily_input = self.create_font_combobox(self.config_manager.config.get('tick_font', 'DejaVu Sans'))
         self.ticklabel_fontfamily_input.setFixedWidth(100)
         label_style_layout.addWidget(QLabel('Tick Label Font Family:'), 3, 0)
         label_style_layout.addWidget(self.ticklabel_fontfamily_input, 3, 1)
@@ -774,7 +774,7 @@ class ConfigPanel(QWidget):
         channel_label_layout.addWidget(QLabel('Ch. Label Font Size:'), 1, 0)
         channel_label_layout.addWidget(self.ch_label_size_input, 1, 1)
 
-        self.ch_label_font_input = self.create_font_combobox(self.config_manager.config.get('ch_label_font', 'Arial'))
+        self.ch_label_font_input = self.create_font_combobox(self.config_manager.config.get('ch_label_font', 'DejaVu Sans'))
         self.ch_label_font_input.setEditable(True)
         self.ch_label_font_input.setFixedWidth(100)
         channel_label_layout.addWidget(QLabel('Ch. Label Font:'), 2, 0)

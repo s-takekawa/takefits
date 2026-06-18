@@ -171,9 +171,19 @@ class MyNavigationToolbar(NavigationToolbar2QT):
 
 
     def release_zoom(self, event):
+        before = self._axes_limits_snapshot()
         super().release_zoom(event)
-        self.get_current_lim(event)
-        self._record_shared_view_history("zoom")
+        # A sub-threshold click is a no-op zoom in Matplotlib (it cancels the
+        # rubber-band and leaves the axes limits untouched). Re-deriving world
+        # ranges via get_current_lim round-trips the limits through the world-
+        # coordinate text boxes and drifts them by a sub-pixel amount, which then
+        # slips past the 1e-9 history de-dup and records a spurious entry that
+        # clutters View Back/Forward. Only re-apply ranges / record history /
+        # broadcast when the zoom actually changed the view.
+        if self._axes_limits_changed(before, self._axes_limits_snapshot()):
+            self.get_current_lim(event)
+            self._record_shared_view_history("zoom")
+            self._broadcast_view_if_synced()
         self._apply_cursor_for_mode()
         self._refresh_overlay_after_nav()
         self._notify_view_history_changed()
@@ -183,8 +193,15 @@ class MyNavigationToolbar(NavigationToolbar2QT):
 
     def release_pan(self, event):
         super().release_pan(event)
-        self.get_current_lim(event)
-        self._record_shared_view_history("pan")
+        # Pan moves the limits live during the drag, so compare against the limits
+        # captured when the pan started (press_pan); a press/release with no drag
+        # is a no-op and must not record history (same drift concern as zoom).
+        start = getattr(self, "_pan_start_limits", None)
+        self._pan_start_limits = None
+        if self._axes_limits_changed(start, self._axes_limits_snapshot()):
+            self.get_current_lim(event)
+            self._record_shared_view_history("pan")
+            self._broadcast_view_if_synced()
         self._apply_cursor_for_mode()
         self._refresh_overlay_after_nav()
         self._notify_view_history_changed()
@@ -195,6 +212,8 @@ class MyNavigationToolbar(NavigationToolbar2QT):
             callback = getattr(target, "view_back", None)
             if callable(callback):
                 try:
+                    # view_back broadcasts the restored view from the window that
+                    # actually changed (the active owner), so no broadcast here.
                     callback()
                 finally:
                     self._apply_cursor_for_mode()
@@ -212,6 +231,7 @@ class MyNavigationToolbar(NavigationToolbar2QT):
         self._apply_cursor_for_mode()
         self._refresh_overlay_after_nav()
         self._notify_view_history_changed()
+        self._broadcast_view_if_synced()
 
     def forward(self, *args):
         if self.color_mode is None:
@@ -219,6 +239,7 @@ class MyNavigationToolbar(NavigationToolbar2QT):
             callback = getattr(target, "view_forward", None)
             if callable(callback):
                 try:
+                    # view_forward broadcasts from the active owner (see back()).
                     callback()
                 finally:
                     self._apply_cursor_for_mode()
@@ -236,6 +257,7 @@ class MyNavigationToolbar(NavigationToolbar2QT):
         self._apply_cursor_for_mode()
         self._refresh_overlay_after_nav()
         self._notify_view_history_changed()
+        self._broadcast_view_if_synced()
 
     def set_history_buttons(self):
         super().set_history_buttons()
@@ -261,6 +283,8 @@ class MyNavigationToolbar(NavigationToolbar2QT):
     def press_pan(self, event):
         super().press_pan(event)
         self._apply_cursor_for_mode(during_pan=True)
+        # Baseline for the no-op-pan guard in release_pan (limits move live).
+        self._pan_start_limits = self._axes_limits_snapshot()
         # optional? no draw on move
 
     def drag_pan(self, motion_event):
@@ -346,6 +370,8 @@ class MyNavigationToolbar(NavigationToolbar2QT):
             self.parent.set_full_range()
         self._apply_cursor_for_mode()
         self._notify_view_history_changed()
+        # Note: the main-viewer Home path runs reset_all_ranges, which already
+        # broadcasts the synced viewport, so no extra broadcast here.
 
     def set_external_history_state(self, can_back: bool, can_forward: bool):
         self._external_can_back = bool(can_back)
@@ -379,6 +405,58 @@ class MyNavigationToolbar(NavigationToolbar2QT):
                 recorder(reason=reason)
             except Exception:
                 pass
+
+    def _broadcast_view_if_synced(self):
+        """Propagate this window's full 3-D view to others when the lock is on.
+
+        Pans/zooms in any plane (XY/XZ/ZY) funnel here; the manager reads the
+        source's RA/Dec extent (XY) and spectral extent (XZ) from the main
+        viewer, so the triggering plane does not matter.
+        """
+        if self.color_mode is not None or self.plane not in ('xy', 'xz', 'zy'):
+            return
+        source = self._resolve_root_viewer()
+        if source is None:
+            return
+        try:
+            from takefits.ui.window_sync_manager import WindowSyncManager
+            WindowSyncManager.instance().broadcast_view(source)
+        except Exception:
+            pass
+
+    def _axes_limits_snapshot(self):
+        """Current (xlim, ylim) of this toolbar's axes, or None if unavailable."""
+        ax = getattr(self, "ax", None)
+        if ax is None:
+            return None
+        try:
+            return (
+                tuple(float(v) for v in ax.get_xlim()),
+                tuple(float(v) for v in ax.get_ylim()),
+            )
+        except Exception:
+            return None
+
+    def _axes_limits_changed(self, before, after, tol=1e-7):
+        """True when the view actually moved between two limit snapshots.
+
+        Conservative: if either snapshot is missing/malformed, report a change so
+        a real navigation is never silently dropped. The tolerance only needs to
+        reject exact no-ops; a genuine pan/zoom moves the limits far more.
+        """
+        if before is None or after is None:
+            return True
+        try:
+            (bx0, bx1), (by0, by1) = before
+            (ax0, ax1), (ay0, ay1) = after
+        except Exception:
+            return True
+        return (
+            abs(ax0 - bx0) > tol
+            or abs(ax1 - bx1) > tol
+            or abs(ay0 - by0) > tol
+            or abs(ay1 - by1) > tol
+        )
 
     def _apply_cursor_for_mode(self, *, during_pan=False):
         app = QtWidgets.QApplication.instance()

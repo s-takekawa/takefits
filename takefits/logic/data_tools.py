@@ -386,18 +386,24 @@ def build_large_data_profile(
 
 
 def sanitize_slice(array: np.ndarray) -> np.ndarray:
-    """Replace invalid values (< -100000) and infinities with NaN in-place.
+    """Replace invalid values (< -100000) and infinities with NaN.
 
     Intended for per-slice use so that the full cube is never scanned at load
-    time.  Returns *array* (possibly converted to float) for convenience.
+    time.  The input is updated in-place when possible; read-only views are
+    copied only when replacement is required.
     """
-    if array is None or array.size == 0:
+    if array is None:
+        return array
+    array = np.asanyarray(array)
+    if array.size == 0:
         return array
     with np.errstate(invalid="ignore"):
         bad = (array < -100000) | ~np.isfinite(array)
     if np.any(bad):
         if not np.issubdtype(array.dtype, np.floating):
             array = array.astype(np.float32)
+        elif not array.flags.writeable:
+            array = array.copy()
         array[bad] = np.nan
     return array
 

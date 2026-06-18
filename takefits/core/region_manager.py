@@ -564,9 +564,11 @@ class RegionManager(QObject):
             elif self.region_mode == "cube":
 
                 z_min, z_max = 0, self.viewer.data.shape[0] - 1
-                if hasattr(self.viewer, 'SubWindow') and self.viewer.SubWindow.subwindow1:
+                get_owned = getattr(self.viewer, '_owned_subwindow', None)
+                xz_sub = get_owned('xz') if callable(get_owned) else None
+                if xz_sub is not None:
                     try:
-                        xz_ax = self.viewer.SubWindow.subwindow1.ax
+                        xz_ax = xz_sub.ax
                         z_min_view, z_max_view = xz_ax.get_ylim()
                         z_min = max(0, z_min_view)
                         z_max = min(self.viewer.data.shape[0] - 1, z_max_view)

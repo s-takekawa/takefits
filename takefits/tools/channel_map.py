@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (QButtonGroup, QComboBox, QDialog, QGridLayout,
                              QVBoxLayout, QMainWindow)
 
 from takefits.core.coordinate import CoordinateConverter, Format_pix_to_wcs
+from takefits.core.fonts import resolve_mpl_font_family
 from takefits.core.marker import Marker, MarkerState, marker_from_state
 from takefits.core.marker_manager import MarkerManager
 from takefits.logic.add_hpbw import AddHPBW
@@ -253,7 +254,7 @@ class ChannelMapWindow(QMainWindow):
             'figure_height': 800,
             'ax_background_color': 'white',
             'axislabel_fontsize': 12,
-            'axislabel_fontfamily': 'Arial',
+            'axislabel_fontfamily': 'DejaVu Sans',
             'axislabel_color': 'black',
             'xticklabel_position': 'b',
             'yticklabel_position': 'l',
@@ -1403,7 +1404,8 @@ class ChannelMapWindow(QMainWindow):
                 self.ch_labels.append(ax.text(self.config['pos_chlabel_x'], self.config['pos_chlabel_y'], label,
                                         transform = ax.transAxes, verticalalignment = 'bottom', horizontalalignment = 'right',
                                         fontsize=self.config.get('ch_label_size', 10),
-                                        fontfamily=self.config['ch_label_font'], color = self.config['ch_label_color']))
+                                        fontfamily=resolve_mpl_font_family(self.config.get('ch_label_font')),
+                                        color = self.config['ch_label_color']))
                 
             else:
                 ax.axis("off")
@@ -1559,30 +1561,30 @@ class ChannelMapWindow(QMainWindow):
                 coords[0].set_ticklabel_visible(True)
                 coords[1].set_ticklabel_visible(True)
                 coords[0].set_axislabel(self.xlabel, fontsize=self.config['axislabel_fontsize'],
-                                          fontfamily=self.config['axislabel_fontfamily'],
+                                          fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                           color=self.config['axislabel_color'])
                 coords[1].set_axislabel(self.ylabel, fontsize=self.config['axislabel_fontsize'],
-                                          fontfamily=self.config['axislabel_fontfamily'],
+                                          fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                           color=self.config['axislabel_color'])
         elif self.plane_num == 1:  # xz plane: horizontal = X, vertical = Z
             if len(coords) >= 2:
                 coords[0].set_ticklabel_visible(True)
                 coords[2].set_ticklabel_visible(True)
                 coords[0].set_axislabel(self.xlabel, fontsize=self.config['axislabel_fontsize'],
-                                          fontfamily=self.config['axislabel_fontfamily'],
+                                          fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                           color=self.config['axislabel_color'])
                 coords[2].set_axislabel(self.zlabel, fontsize=self.config['axislabel_fontsize'],
-                                          fontfamily=self.config['axislabel_fontfamily'],
+                                          fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                           color=self.config['axislabel_color'])
         elif self.plane_num == 2:  # zy plane: horizontal = Z, vertical = Y
             if len(coords) >= 2:  
                 coords[2].set_ticklabel_visible(True)
                 coords[1].set_ticklabel_visible(True)
                 coords[2].set_axislabel(self.zlabel, fontsize=self.config['axislabel_fontsize'],
-                                          fontfamily=self.config['axislabel_fontfamily'],
+                                          fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                           color=self.config['axislabel_color'])
                 coords[1].set_axislabel(self.ylabel, fontsize=self.config['axislabel_fontsize'],
-                                          fontfamily=self.config['axislabel_fontfamily'],
+                                          fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                           color=self.config['axislabel_color'])
 
                 coords[1].set_ticklabel_position(self.config['yticklabel_position'])
@@ -1955,7 +1957,7 @@ class ChannelMapWindow(QMainWindow):
             config.get('pos_chlabel_y', 0.02),
         )
         fontsize = config.get('ch_label_size', 10)
-        fontfamily = config.get('ch_label_font', 'Arial')
+        fontfamily = resolve_mpl_font_family(config.get('ch_label_font', 'DejaVu Sans'))
         color = config.get('ch_label_color', 'grey')
 
         for label in list(getattr(self, 'ch_labels', []) or []):
@@ -1994,7 +1996,7 @@ class ChannelMapWindow(QMainWindow):
             pad=pad,
             size=config.get('tick_labelsize'),
             color=config.get('tick_labelcolor'),
-            fontfamily=config.get('tick_font'),
+            fontfamily=resolve_mpl_font_family(config.get('tick_font')),
             exclude_overlapping=True,
         )
         coord.set_ticklabel_position(position)
@@ -2155,10 +2157,10 @@ class ChannelMapWindow(QMainWindow):
                 coords[0].set_ticklabel_visible(True)
                 coords[1].set_ticklabel_visible(True)
                 coords[0].set_axislabel(self.xlabel, fontsize=self.config['axislabel_fontsize'],
-                                        fontfamily=self.config['axislabel_fontfamily'],
+                                        fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                         color=self.config['axislabel_color'])
                 coords[1].set_axislabel(self.ylabel, fontsize=self.config['axislabel_fontsize'],
-                                        fontfamily=self.config['axislabel_fontfamily'],
+                                        fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                         color=self.config['axislabel_color'])
                 if hasattr(self, 'hpbw') and self.hpbw is not None:
                     self.hpbw.update_ax(bottom_left_ax)
@@ -2169,20 +2171,20 @@ class ChannelMapWindow(QMainWindow):
                 coords[0].set_ticklabel_visible(True)
                 coords[2].set_ticklabel_visible(True)
                 coords[0].set_axislabel(self.xlabel, fontsize=self.config['axislabel_fontsize'],
-                                        fontfamily=self.config['axislabel_fontfamily'],
+                                        fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                         color=self.config['axislabel_color'])
                 coords[2].set_axislabel(self.zlabel, fontsize=self.config['axislabel_fontsize'],
-                                        fontfamily=self.config['axislabel_fontfamily'],
+                                        fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                         color=self.config['axislabel_color'])
         elif self.plane_num == 2:
             if len(coords) >= 2:
                 coords[2].set_ticklabel_visible(True)
                 coords[1].set_ticklabel_visible(True)
                 coords[2].set_axislabel(self.zlabel, fontsize=self.config['axislabel_fontsize'],
-                                        fontfamily=self.config['axislabel_fontfamily'],
+                                        fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                         color=self.config['axislabel_color'])
                 coords[1].set_axislabel(self.ylabel, fontsize=self.config['axislabel_fontsize'],
-                                        fontfamily=self.config['axislabel_fontfamily'],
+                                        fontfamily=resolve_mpl_font_family(self.config.get('axislabel_fontfamily')),
                                         color=self.config['axislabel_color'])
                                         
                 coords[1].set_ticklabel_position(self.config['yticklabel_position'])
