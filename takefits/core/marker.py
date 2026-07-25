@@ -23,6 +23,25 @@ MarkerId = str
 PlaneId = str
 
 
+def detach_artist(artist) -> None:
+    """Drop ``artist`` from its axes, tolerating an already-detached artist.
+
+    ``Axes.clear()`` -- and therefore ``Figure.clear()`` -- orphans every child
+    it drops by setting ``_remove_method`` to ``None``, and Matplotlib then
+    answers a later ``artist.remove()`` with ``NotImplementedError('cannot
+    remove artist')``.  A second removal instead raises ``ValueError`` from the
+    child list.  Marker teardown can legitimately run after a figure has been
+    cleared (window close, channel-map relayout), so treat an artist that is
+    already off its axes as nothing left to do.
+    """
+    if artist is None:
+        return
+    try:
+        artist.remove()
+    except (NotImplementedError, ValueError):
+        pass
+
+
 @dataclass
 class MarkerStyle:
     """Rendering attributes shared across marker types."""
@@ -186,18 +205,10 @@ class Marker:
         raise NotImplementedError
 
     def remove_from_axes(self) -> None:  # pragma: no cover - requires mpl context
-        if self.artist is not None:
-            try:
-                self.artist.remove()
-            except ValueError:
-                pass
-            self.artist = None
-        if self.label_artist is not None:
-            try:
-                self.label_artist.remove()
-            except ValueError:
-                pass
-            self.label_artist = None
+        detach_artist(self.artist)
+        self.artist = None
+        detach_artist(self.label_artist)
+        self.label_artist = None
 
     def apply_new_pixel(self, pixel: Tuple[float, ...]) -> None:
         self.pixel = tuple(float(v) for v in pixel)
@@ -847,6 +858,11 @@ def deserialize_marker_states(payload: Dict[str, Any]) -> Tuple[PlaneId, Optiona
     result: Dict[MarkerId, MarkerState] = {}
     for entry in markers_payload:
         state = MarkerState.from_dict(entry)
+        # Older channel-map replication could serialize one source id into
+        # several tile entries. Preserve every entry instead of silently
+        # overwriting the earlier marker in this id-keyed mapping.
+        while state.marker_id in result:
+            state.marker_id = uuid.uuid4().hex
         result[state.marker_id] = state
     return plane, world_frame, result
 

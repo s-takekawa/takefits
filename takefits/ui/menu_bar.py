@@ -192,6 +192,32 @@ class MenuBar:
 
         self.refresh_window_switch_actions()
 
+        # View Menu (display overlays). Static checkable actions only — the
+        # macOS menu-mirror machinery is hostile to dynamic menu mutation, but
+        # toggling setChecked on a stable action is safe (same pattern as the
+        # cross-window sync lock above).
+        view_menu = menubar.addMenu("View")
+        self.coordinate_grid_action = QAction("Coordinate Grid", self.parent, checkable=True)
+        self.coordinate_grid_action.setShortcut(QKeySequence("Ctrl+G"))
+        # WindowShortcut so the key routes to the focused window's action when
+        # several MainWindows are open (Application scope would be ambiguous).
+        self.coordinate_grid_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.coordinate_grid_action.toggled.connect(self._on_coordinate_grid_toggled)
+        view_menu.addAction(self.coordinate_grid_action)
+        self.coordinate_grid_keep_native_action = QAction(
+            "Keep Native Coordinate Grid",
+            self.parent,
+            checkable=True,
+        )
+        self.coordinate_grid_keep_native_action.setStatusTip(
+            "When the XY grid follows another WCS frame, keep the native grid underneath it"
+        )
+        self.coordinate_grid_keep_native_action.toggled.connect(
+            self._on_coordinate_grid_keep_native_toggled
+        )
+        view_menu.addAction(self.coordinate_grid_keep_native_action)
+        self.refresh_coordinate_grid_action()
+
         # Tools Menu
         tools_menu = menubar.addMenu("Tools")
         tools_menu.addSeparator() # Add a visual separator in the menu
@@ -597,6 +623,41 @@ class MenuBar:
                 # The owning window was closed and its C++ QAction deleted.
                 continue
 
+    def _on_coordinate_grid_toggled(self, checked):
+        """Forward the View > Coordinate Grid toggle to the window (TF-404)."""
+        setter = getattr(self.parent, "set_coordinate_grid", None)
+        if callable(setter):
+            setter(bool(checked))
+
+    def _on_coordinate_grid_keep_native_toggled(self, checked):
+        """Apply the TF-407 native-grid layering preference."""
+        setter = getattr(self.parent, "set_coordinate_grid_keep_native", None)
+        if callable(setter):
+            setter(bool(checked))
+
+    def refresh_coordinate_grid_action(self):
+        """Mirror the window's coordinate-grid state onto View menu actions."""
+        action = getattr(self, "coordinate_grid_action", None)
+        getter = getattr(self.parent, "get_coordinate_grid_visible", None)
+        visible = bool(getter()) if callable(getter) else False
+        keep_action = getattr(self, "coordinate_grid_keep_native_action", None)
+        keep_getter = getattr(self.parent, "get_coordinate_grid_keep_native", None)
+        keep_native = bool(keep_getter()) if callable(keep_getter) else True
+        for target, checked in (
+            (action, visible),
+            (keep_action, keep_native),
+        ):
+            if target is None:
+                continue
+            try:
+                if target.isChecked() != checked:
+                    blocked = target.blockSignals(True)
+                    target.setChecked(checked)
+                    target.blockSignals(blocked)
+            except RuntimeError:
+                # The owning window was closed and its C++ QAction deleted.
+                continue
+
     def refresh_window_switch_actions(self):
         windows = self._registered_windows_for_switching()
         count = len(windows)
@@ -828,8 +889,45 @@ class MenuBar:
 
 
     def open_config_panel(self):
-        self.config_panel = ConfigPanel(self.parent.config_manager, self.parent)
-        self.config_panel.show()
+        # Preferences edits are application-wide. Reuse the one visible panel
+        # across all registered FITS roots so two stale forms cannot overwrite
+        # one another.
+        roots = [self.parent]
+        try:
+            from takefits.ui.window_registry import WindowRegistry
+
+            roots.extend(WindowRegistry.instance().windows())
+        except Exception:
+            pass
+
+        seen = set()
+        for root in roots:
+            if root is None or id(root) in seen:
+                continue
+            seen.add(id(root))
+            existing = getattr(
+                getattr(root, "menu_bar", None),
+                "config_panel",
+                None,
+            )
+            if existing is None:
+                continue
+            try:
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return existing
+            except (RuntimeError, AttributeError):
+                continue
+
+        panel = ConfigPanel(self.parent.config_manager, self.parent)
+        panel.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.config_panel = panel
+        panel.destroyed.connect(
+            lambda *_args: setattr(self, "config_panel", None)
+        )
+        panel.show()
+        return panel
         
     def open_header_panel(self):
         existing = getattr(self.parent, "header_panel", None)

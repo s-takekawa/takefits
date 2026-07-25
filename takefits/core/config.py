@@ -1,8 +1,58 @@
 import copy
+import math
 import yaml
 import os
 
 from takefits.app_paths import app_config_path
+
+
+def _normalize_grid_linestyle(value, default):
+    token = str(value or "").strip().lower()
+    mapping = {
+        "-": "solid",
+        "--": "dashed",
+        ":": "dotted",
+        "-.": "dashdot",
+        "solid": "solid",
+        "dashed": "dashed",
+        "dotted": "dotted",
+        "dash-dot": "dashdot",
+        "dashdot": "dashdot",
+        "dash dot": "dashdot",
+    }
+    return mapping.get(token, default)
+
+
+def _clamped_float(value, default, lower, upper):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = float(default)
+    if not math.isfinite(parsed):
+        parsed = float(default)
+    return min(float(upper), max(float(lower), parsed))
+
+
+def _optional_nonnegative_float(value):
+    if value is None or str(value).strip().lower() in {"", "auto", "none"}:
+        return None
+    try:
+        parsed = abs(float(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _config_bool(value, default):
+    if isinstance(value, bool):
+        return value
+    token = str(value or "").strip().lower()
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    if token in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
 
 class ConfigManager:
     def __init__(self, config_file=None):
@@ -99,7 +149,25 @@ class ConfigManager:
             'tick_ylabelrotation': 0, # Rotation angle of Y-axis tick labels
             'tick_font': 'DejaVu Sans',
             'tick_font_weight': 'normal',
-        
+
+            # Coordinate grid overlay (TF-404)
+            'grid_visible': False,       # Show the WCS coordinate grid by default
+            'grid_color': 'white',       # Grid line color
+            'grid_alpha': 0.5,           # Grid line opacity (0-1)
+            'grid_linestyle': 'solid',   # Grid line style ('solid', 'dashed', ...)
+            'grid_linewidth': 0.5,       # Grid line width
+            'grid_keep_native': True,    # Keep the native grid under a frame overlay
+            'grid_overlay_color': '#00ff66', # Non-native XY overlay grid color
+            'grid_overlay_linestyle': 'dashed', # Distinguish overlay without color alone
+            'grid_overlay_label_color': 'auto', # auto, same, or a Matplotlib color
+            'grid_overlay_show_lines': True,
+            'grid_overlay_show_ticklabels': True,
+            'grid_overlay_axislabel_placement': 'inside', # outside, inside, hidden
+            'grid_overlay_longitude_axislabel_pad': None, # None chooses a safe automatic gap
+            'grid_overlay_latitude_axislabel_pad': None,
+            'grid_overlay_right_margin_px': 96.0, # Internal space for right-side decorations
+            'grid_overlay_top_margin_px': 64.0, # Internal space for top-side decorations
+
             # Coordinate and decimal settings
             'decimal': True,            # Coordinate format (True: decimal degrees, False: sexagesimal)
             'auto_precision_digits': True,  # Auto precision based on pixel scale (1/10 pixel)
@@ -165,6 +233,29 @@ class ConfigManager:
             print(f"\033[91mFailed to load config file: {e}\033[0m")
             config = copy.deepcopy(self.default_config)
         if isinstance(config, dict):
+            # Migrate the short-lived inward-only title-offset experiment to
+            # semantic placement before defaults are merged. Existing custom
+            # files retain their visual intent under the semantic Inside
+            # placement used by current defaults.
+            legacy_lon_pad = config.pop(
+                'grid_overlay_longitude_label_minpad',
+                None,
+            )
+            legacy_lat_pad = config.pop(
+                'grid_overlay_latitude_label_minpad',
+                None,
+            )
+            if (
+                'grid_overlay_axislabel_placement' not in config
+                and (legacy_lon_pad is not None or legacy_lat_pad is not None)
+            ):
+                config['grid_overlay_axislabel_placement'] = 'inside'
+                config['grid_overlay_longitude_axislabel_pad'] = (
+                    _optional_nonnegative_float(legacy_lon_pad)
+                )
+                config['grid_overlay_latitude_axislabel_pad'] = (
+                    _optional_nonnegative_float(legacy_lat_pad)
+                )
             if 'range_file' not in config and 'region_file' in config:
                 config['range_file'] = config.pop('region_file')
             merged_config = copy.deepcopy(self.default_config)
@@ -175,6 +266,57 @@ class ConfigManager:
             if mode == 'match':
                 config['colorbar_length_mode'] = 'ratio'
                 config['colorbar_length_value'] = 1.0
+            config['grid_linestyle'] = _normalize_grid_linestyle(
+                config.get('grid_linestyle'),
+                'solid',
+            )
+            config['grid_overlay_linestyle'] = _normalize_grid_linestyle(
+                config.get('grid_overlay_linestyle'),
+                'dashed',
+            )
+            config['grid_alpha'] = _clamped_float(
+                config.get('grid_alpha'),
+                0.5,
+                0.0,
+                1.0,
+            )
+            config['grid_linewidth'] = _clamped_float(
+                config.get('grid_linewidth'),
+                0.5,
+                0.0,
+                20.0,
+            )
+            placement = str(
+                config.get('grid_overlay_axislabel_placement', 'inside')
+                or 'inside'
+            ).strip().lower()
+            if placement not in {'outside', 'inside', 'hidden'}:
+                placement = 'inside'
+            config['grid_overlay_axislabel_placement'] = placement
+            config['grid_overlay_longitude_axislabel_pad'] = (
+                _optional_nonnegative_float(
+                    config.get('grid_overlay_longitude_axislabel_pad')
+                )
+            )
+            config['grid_overlay_latitude_axislabel_pad'] = (
+                _optional_nonnegative_float(
+                    config.get('grid_overlay_latitude_axislabel_pad')
+                )
+            )
+            label_color = str(
+                config.get('grid_overlay_label_color', 'auto') or 'auto'
+            ).strip()
+            if label_color.lower() in {'auto', 'same'}:
+                label_color = label_color.lower()
+            config['grid_overlay_label_color'] = label_color
+            config['grid_overlay_show_lines'] = _config_bool(
+                config.get('grid_overlay_show_lines'),
+                True,
+            )
+            config['grid_overlay_show_ticklabels'] = _config_bool(
+                config.get('grid_overlay_show_ticklabels'),
+                True,
+            )
         else:
             config = copy.deepcopy(self.default_config)
         return config

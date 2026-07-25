@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 import math
+import uuid
 import numpy as np
 
 from astropy import units as u
@@ -208,6 +209,7 @@ class MarkerManager(QObject):
     markers_changed = pyqtSignal(str)
     selection_changed = pyqtSignal(object)
     geometry_changed = pyqtSignal(object)
+    active_plane_changed = pyqtSignal(str)
 
     def __init__(self, viewer: Optional[object] = None) -> None:
         super().__init__(viewer)
@@ -249,6 +251,7 @@ class MarkerManager(QObject):
             return
         previous_marker = self._selected_marker
         self._active_plane = plane
+        self.active_plane_changed.emit(str(plane))
         if self._pending_placement and self._pending_placement.get("plane") is not None:
             self._pending_placement["plane"] = plane
         if previous_marker is None:
@@ -262,6 +265,16 @@ class MarkerManager(QObject):
 
     def active_plane(self) -> PlaneId:
         return self._active_plane
+
+    def _active_marker_panel(self):
+        """Resolve the family inspector only when it is bound to this manager."""
+
+        try:
+            from takefits.tools.marker_panel import active_marker_panel_for_manager
+
+            return active_marker_panel_for_manager(self)
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Marker CRUD
@@ -336,6 +349,7 @@ class MarkerManager(QObject):
             if marker is None:
                 continue
             marker.remove_from_axes()
+            self._invalidate_marker_background(plane_id)
             if marker is self._selected_marker:
                 self._selected_marker = None
                 self.selection_changed.emit(None)
@@ -347,6 +361,7 @@ class MarkerManager(QObject):
             return
         for marker in layer.markers.values():
             marker.remove_from_axes()
+        self._invalidate_marker_background(plane)
         if self._selected_marker and self._selected_marker.plane == plane:
             self._selected_marker = None
             self.selection_changed.emit(None)
@@ -496,7 +511,12 @@ class MarkerManager(QObject):
 
         return serialize_marker_states(states, plane=layer.plane, world_frame=world_frame)
 
-    def import_from_dict(self, payload: Dict[str, object]) -> PlaneId:
+    def import_from_dict(
+        self,
+        payload: Dict[str, object],
+        *,
+        clear_existing: bool = True,
+    ) -> PlaneId:
         plane, world_frame, states = deserialize_marker_states(payload)
         remapper = getattr(self.viewer, "remap_loaded_marker_state", None)
         host_viewer = self.viewer
@@ -527,9 +547,32 @@ class MarkerManager(QObject):
         if not planes_to_clear:
             raise ValueError(f"No compatible marker planes for file plane '{plane}'.")
 
-        # Clear existing markers on affected planes.
-        for target_plane in planes_to_clear:
-            self.clear_plane(target_plane)
+        # Replace is the historical/default behaviour. Merge leaves existing
+        # layers intact and imports with collision-safe marker ids below.
+        if clear_existing:
+            for target_plane in planes_to_clear:
+                self.clear_plane(target_plane)
+
+        used_marker_ids = {
+            str(marker_id)
+            for layer in self._layers.values()
+            for marker_id in layer.markers
+        }
+
+        def _clone_state_for_target(
+            source_state: MarkerState,
+            *,
+            preserve_id: bool,
+        ) -> MarkerState:
+            state_payload = source_state.to_dict()
+            candidate_id = str(state_payload.get("id") or "")
+            if not preserve_id or not candidate_id or candidate_id in used_marker_ids:
+                state_payload.pop("id", None)
+            cloned = MarkerState.from_dict(state_payload)
+            while cloned.marker_id in used_marker_ids:
+                cloned.marker_id = uuid.uuid4().hex
+            used_marker_ids.add(cloned.marker_id)
+            return cloned
 
         planes_changed: set[str] = set()
         primary_plane = plane
@@ -539,10 +582,14 @@ class MarkerManager(QObject):
             if not target_planes:
                 continue
             for idx, target_plane in enumerate(target_planes):
-                state_copy = state
-                if len(target_planes) > 1 or idx > 0:
-                    # Clone to keep marker ids unique across planes
-                    state_copy = MarkerState.from_dict(state.to_dict())
+                # A marker id identifies exactly one runtime marker, even when
+                # a loaded base-plane marker is replicated across channel-map
+                # tiles. Preserve the source id for the first available target
+                # when it is unused; every replica/collision receives a fresh id.
+                state_copy = _clone_state_for_target(
+                    state,
+                    preserve_id=(idx == 0),
+                )
                 state_copy.plane = target_plane
                 layer = self.ensure_plane(target_plane)
                 if world_frame and not layer.world_frame:
@@ -715,6 +762,85 @@ class MarkerManager(QObject):
         if ax is None:
             return
         marker.add_to_axes(ax)
+        if self._viewer_uses_marker_blitting(marker.plane):
+            self._set_marker_artists_animated(marker)
+        # A marker may have been added after the current blit background was
+        # captured. Force the next overlay redraw to rebuild a marker-free
+        # background before drawing the marker dynamically.
+        self._invalidate_marker_background(marker.plane)
+
+    def _viewer_uses_marker_blitting(self, plane: PlaneId) -> bool:
+        """Return whether ``plane`` is hosted by the marker blit pipeline."""
+        viewer = self._viewer_for_plane(plane)
+        return bool(
+            viewer is not None
+            and callable(getattr(viewer, "redraw_main_overlay_and_blit", None))
+        )
+
+    @staticmethod
+    def _set_marker_artists_animated(marker: Marker) -> None:
+        """Mark each distinct Marker artist as dynamic for Matplotlib blitting."""
+        seen: set[int] = set()
+        for artist in (
+            getattr(marker, "artist", None),
+            getattr(marker, "label_artist", None),
+        ):
+            if artist is None or id(artist) in seen:
+                continue
+            seen.add(id(artist))
+            try:
+                if not artist.get_animated():
+                    artist.set_animated(True)
+            except Exception:
+                pass
+
+    def _invalidate_marker_background(self, plane: PlaneId) -> bool:
+        """Drop cached backgrounds that may contain a marker from ``plane``.
+
+        FITSViewer owns per-plane caches, while integration windows keep a
+        single legacy ``_background``.  Prefer the viewer's plane-aware hook
+        and retain a small fallback for single-canvas marker hosts.
+        """
+        viewer = self._viewer_for_plane(plane)
+        if viewer is None:
+            return False
+
+        base_plane = self._base_plane_for(plane)
+        invalidator = getattr(viewer, "_invalidate_plane_background", None)
+        if callable(invalidator):
+            try:
+                invalidator(base_plane)
+                return True
+            except Exception:
+                pass
+
+        invalidated = False
+        state = None
+        state_getter = getattr(viewer, "get_viewer_state", None)
+        if callable(state_getter):
+            try:
+                state = state_getter(base_plane)
+            except Exception:
+                state = None
+        if state is None:
+            state = getattr(viewer, "state", None)
+        if state is not None:
+            for attr in ("_background", "image_background"):
+                if hasattr(state, attr):
+                    try:
+                        setattr(state, attr, None)
+                        invalidated = True
+                    except Exception:
+                        pass
+
+        for attr, value in (("_background", None), ("_background_initialized", False)):
+            if hasattr(viewer, attr):
+                try:
+                    setattr(viewer, attr, value)
+                    invalidated = True
+                except Exception:
+                    pass
+        return invalidated
 
     def redraw_plane(self, plane: PlaneId) -> None:
         viewer = self._viewer_for_plane(plane)
@@ -909,7 +1035,7 @@ class MarkerManager(QObject):
                 self._attach_marker_to_plane(primary_marker, plane, ensure_existing=True)
                 self.set_active_plane(plane)
 
-                panel = getattr(self.viewer, "marker_panel", None)
+                panel = self._active_marker_panel()
                 if panel and hasattr(panel, "set_selection_by_id"):
                     panel.set_selection_by_id([m.marker_id for m in created_markers])
                     if isinstance(primary_marker, TextMarker):
@@ -934,7 +1060,7 @@ class MarkerManager(QObject):
 
         self.set_active_plane(plane)
 
-        panel = getattr(self.viewer, "marker_panel", None)
+        panel = self._active_marker_panel()
         current_selection = []
         if panel and hasattr(panel, "_selected_markers"):
             current_selection = panel._selected_markers()
@@ -1467,6 +1593,9 @@ class MarkerManager(QObject):
             marker._on_style_changed()
         except Exception:
             pass
+        if self._viewer_uses_marker_blitting(plane):
+            self._set_marker_artists_animated(marker)
+        self._invalidate_marker_background(plane)
 
     def _find_handle_hit(self, marker: Marker, x: float, y: float, tolerance: float) -> Optional[str]:
         handles_fn = getattr(marker, "handles", None)
@@ -1603,20 +1732,17 @@ class MarkerManager(QObject):
             if layer is None:
                 continue
             for marker in layer.markers.values():
+                self._set_marker_artists_animated(marker)
                 artist = getattr(marker, "artist", None)
                 if artist is not None:
-                    try:
-                        if not artist.get_animated():
-                            artist.set_animated(True)
-                    except Exception:
-                        pass
                     if artist.get_visible():
                         artist.set_visible(False)
                         hidden.append(artist)
                 label = getattr(marker, "label_artist", None)
-                if label is not None and label.get_visible():
-                    label.set_visible(False)
-                    hidden.append(label)
+                if label is not None:
+                    if label.get_visible():
+                        label.set_visible(False)
+                        hidden.append(label)
         return hidden
 
     def restore_after_background_capture(self, hidden: Iterable[object]) -> None:
@@ -1655,12 +1781,13 @@ class MarkerManager(QObject):
                     artist_axes = getattr(artist, "axes", None) if artist is not None else None
                 if artist is None or artist_axes is None:
                     continue
+                self._set_marker_artists_animated(marker)
                 try:
                     artist_axes.draw_artist(artist)
                 except Exception:
                     pass
                 label = getattr(marker, "label_artist", None)
-                if label is not None and label.get_visible():
+                if label is not None and label is not artist and label.get_visible():
                     label_axes = getattr(label, "axes", None)
                     if label_axes is not target_ax:
                         try:
@@ -1674,6 +1801,7 @@ class MarkerManager(QObject):
                         label = marker.label_artist
                         label_axes = getattr(label, "axes", None) if label is not None else None
                     if label_axes is not None:
+                        self._set_marker_artists_animated(marker)
                         try:
                             label_axes.draw_artist(label)
                         except Exception:

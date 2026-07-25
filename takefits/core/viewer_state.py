@@ -222,7 +222,7 @@ class ViewerState:
         if marker_manager is not None:
             if hidden_markers:
                 marker_manager.restore_after_background_capture(hidden_markers)
-            marker_manager.draw_markers_for_blit()
+            marker_manager.draw_markers_for_blit(self.plane)
             if self.plane == 'xy':
                 marker_manager.redraw_planes(['xz', 'zy'])
 

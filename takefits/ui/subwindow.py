@@ -42,6 +42,12 @@ class SubWindow(FITSViewer):
     def closeEvent(self, event):
         if self.toolbar._subplot_dialog is not None:
             self.toolbar._subplot_dialog.close()
+        try:
+            from takefits.tools.marker_panel import release_marker_viewer
+
+            release_marker_viewer(self)
+        except Exception:
+            pass
         super().closeEvent(event)
         if self.plane == 'xz':
             self.main_viewer.menu_bar.sub1_action.setChecked(False)

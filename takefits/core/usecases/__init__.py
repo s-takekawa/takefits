@@ -8,6 +8,7 @@ from typing import Callable, Optional, Tuple, Literal, Dict, Any, List, Union
 import numpy as np
 
 from takefits.core.app_state import AppState, create_app_state, MarkerSpec, RegionSpec
+from takefits.core.wcs_frames import normalize_display_frame
 from .regrid import RegridResult, compute_regrid
 from .export import export_data_fits, export_figure
 from .moment import MomentType, compute_moment, export_moment_fits, export_moment_map_fits
@@ -321,4 +322,41 @@ def set_view_range(
     if ylim is not None:
         view_state.ylim = ylim
 
+    return state
+
+
+# --------------------------------------------------------------------------
+# Display overlays (TF-404)
+# --------------------------------------------------------------------------
+
+def set_coordinate_grid(
+    state: AppState,
+    visible: bool = True,
+    frame: Optional[str] = None,
+    keep_native: Optional[bool] = None,
+) -> AppState:
+    """Configure the WCS coordinate grid overlay.
+
+    This is display state only (it does not alter the data). Headless renders
+    such as :func:`export_moment_image` read ``state.display_grid`` so a CLI/AI
+    caller produces the same gridded image the GUI shows. On an XY celestial
+    view, a non-native ``frame`` requests an additional WCSAxes coordinate
+    overlay; spectral XZ/ZY views continue to use their native grid.
+
+    Args:
+        state: The AppState to update.
+        visible: Whether the coordinate grid should be drawn.
+        frame: Display frame followed by the XY grid. ``None`` preserves the
+            current state value.
+        keep_native: Whether the native XY grid remains visible underneath a
+            non-native frame overlay. ``None`` preserves the current value.
+
+    Returns:
+        The updated AppState.
+    """
+    state.display_grid = bool(visible)
+    if frame is not None:
+        state.display_grid_frame = normalize_display_frame(frame)
+    if keep_native is not None:
+        state.display_grid_keep_native = bool(keep_native)
     return state

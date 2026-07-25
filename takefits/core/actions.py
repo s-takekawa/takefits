@@ -491,6 +491,30 @@ def register_default_actions(registry: ActionRegistry):
         }
     )
 
+    # Coordinate grid overlay (TF-404 / TF-407)
+    registry.register(
+        name="set_coordinate_grid",
+        description="Configure the WCS coordinate grid overlay (display only; "
+                    "the XY grid can follow a non-native display frame).",
+        handler=_usecase_handler("set_coordinate_grid"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "visible": {"type": "boolean", "description": "Whether the coordinate grid is drawn."},
+                "frame": {
+                    "type": "string",
+                    "enum": ["native", "icrs", "fk5", "fk4", "galactic"],
+                    "description": "Display frame followed by the XY grid."
+                },
+                "keep_native": {
+                    "type": "boolean",
+                    "description": "Keep the native XY grid beneath a non-native overlay."
+                }
+            },
+            "required": ["visible"]
+        }
+    )
+
     # Smoothing
     registry.register(
         name="apply_smoothing",
@@ -894,7 +918,17 @@ def register_default_actions(registry: ActionRegistry):
                     "items": {"type": "number"},
                     "minItems": 2, "maxItems": 2
                 },
-                "title": {"type": "string"}
+                "title": {"type": "string"},
+                "grid": {"type": "boolean", "description": "Draw the WCS coordinate grid overlay (TF-404)."},
+                "grid_frame": {
+                    "type": "string",
+                    "enum": ["native", "icrs", "fk5", "fk4", "galactic"],
+                    "description": "Display frame followed by the XY grid (TF-407)."
+                },
+                "grid_keep_native": {
+                    "type": "boolean",
+                    "description": "Keep the native grid beneath a non-native XY overlay."
+                }
             },
             "required": ["output_path"]
         }

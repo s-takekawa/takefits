@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import math
 import os
+import weakref
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Iterable
 
-from PySide6.QtCore import Qt, QTimer, Signal as pyqtSignal
-from PySide6.QtGui import QKeyEvent, QMouseEvent
+from PySide6.QtCore import QObject, Qt, QTimer, Signal as pyqtSignal
+from PySide6.QtGui import QKeyEvent, QKeySequence, QMouseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -65,6 +67,11 @@ class DeselectableListWidget(QListWidget):
             self.clearSelection()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        # Unmodified letters are swallowed by the view's type-ahead search,
+        # which is useless here and would eat the panel's Placement shortcut.
+        if not event.modifiers() and event.key() in (Qt.Key.Key_M, Qt.Key.Key_Escape):
+            event.ignore()
+            return
         super().keyPressEvent(event)
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             self.delete_pressed.emit()
@@ -96,6 +103,404 @@ class TextControls:
     font_size_spin: QDoubleSpinBox
     rotation_spin: QDoubleSpinBox
     font_combo: QComboBox
+
+
+@dataclass(frozen=True)
+class MarkerContext:
+    """One independently managed marker data scope in a FITS window family."""
+
+    key: str
+    label: str
+    viewer: object
+    kind: str
+
+
+def marker_family_root(viewer):
+    """Return the MainWindow that owns ``viewer``'s marker-tool family."""
+
+    if viewer is None:
+        return None
+    fits_viewer = getattr(viewer, "fits_viewer", None)
+    if fits_viewer is not None:
+        return getattr(fits_viewer, "main_window", None) or fits_viewer
+    main_window = getattr(viewer, "main_window", None)
+    return main_window or viewer
+
+
+class MarkerPanelHost(QObject):
+    """Own one reusable MarkerPanel while marker data stays per viewer.
+
+    The panel is intentionally a parentless top-level window.  Qt parenting a
+    shared tool dialog to MainWindow makes some window managers raise Main when
+    the dialog is activated, even while an Integ or Channel Map is its target.
+    The QObject host remains parented to MainWindow and owns the lifecycle
+    explicitly.
+    """
+
+    def __init__(self, root_viewer):
+        super().__init__(root_viewer)
+        self._root_ref = weakref.ref(root_viewer)
+        self.panel: Optional["MarkerPanel"] = None
+        self._shutting_down = False
+
+    @property
+    def root_viewer(self):
+        return self._root_ref()
+
+    @staticmethod
+    def _short_label(value: object, fallback: str) -> str:
+        text = str(value or "").strip()
+        if not text:
+            text = fallback
+        if len(text) > 58:
+            text = f"{text[:55]}..."
+        return text
+
+    def contexts(self) -> List[MarkerContext]:
+        root = self.root_viewer
+        if root is None:
+            return []
+
+        filename = os.path.basename(
+            str(
+                getattr(root, "filename", None)
+                or getattr(root, "filename_path", None)
+                or "FITS"
+            )
+        )
+        identity_getter = getattr(root, "fits_identity_prefix", None)
+        try:
+            identity = str(identity_getter() or "") if callable(identity_getter) else ""
+        except Exception:
+            identity = ""
+        family_prefix = f"{identity} · " if identity else ""
+        contexts = [
+            MarkerContext(
+                key="main",
+                label=f"{family_prefix}Main — {self._short_label(filename, 'FITS')}",
+                viewer=root,
+                kind="main",
+            )
+        ]
+
+        integration_key_counts: Dict[str, int] = {}
+        integration_getter = getattr(root, "_live_integration_windows", None)
+        integration_windows = integration_getter() if callable(integration_getter) else []
+        for index, window in enumerate(list(integration_windows or [])):
+            if window is None:
+                continue
+            key_getter = getattr(root, "_integration_window_color_key", None)
+            raw_key = (
+                str(key_getter(window) or f"idx:{index}")
+                if callable(key_getter)
+                else f"idx:{index}"
+            )
+            occurrence = integration_key_counts.get(raw_key, 0)
+            integration_key_counts[raw_key] = occurrence + 1
+            description = (
+                getattr(window, "_descriptive_window_title", None)
+                or getattr(window, "original_window_title", None)
+            )
+            if not description:
+                try:
+                    description = window.windowTitle()
+                except Exception:
+                    description = None
+            contexts.append(
+                MarkerContext(
+                    key=f"integration:{raw_key}::{occurrence}",
+                    label=(
+                        f"{family_prefix}Integ — "
+                        f"{self._short_label(description, f'Result {index + 1}')}"
+                    ),
+                    viewer=window,
+                    kind="integration",
+                )
+            )
+
+        channel_key_counts: Dict[str, int] = {}
+        for index, window in enumerate(list(getattr(root, "channel_map_windows", []) or [])):
+            if window is None:
+                continue
+            key_getter = getattr(root, "_channel_window_color_key", None)
+            raw_key = (
+                str(key_getter(window) or f"idx:{index}")
+                if callable(key_getter)
+                else f"idx:{index}"
+            )
+            occurrence = channel_key_counts.get(raw_key, 0)
+            channel_key_counts[raw_key] = occurrence + 1
+            description = getattr(window, "original_window_title", None)
+            if not description:
+                try:
+                    description = window.windowTitle()
+                except Exception:
+                    description = None
+            contexts.append(
+                MarkerContext(
+                    key=f"channel:{raw_key}::{occurrence}",
+                    label=(
+                        f"{family_prefix}Channel Map — "
+                        f"{self._short_label(description, f'Map {index + 1}')}"
+                    ),
+                    viewer=window,
+                    kind="channel",
+                )
+            )
+        return contexts
+
+    def context_for_viewer(self, viewer) -> Optional[MarkerContext]:
+        root = self.root_viewer
+        if root is None or viewer is None:
+            return None
+        data_viewer = viewer
+        if getattr(viewer, "marker_manager", None) is getattr(root, "marker_manager", None):
+            data_viewer = root
+        for context in self.contexts():
+            if context.viewer is data_viewer:
+                return context
+        return None
+
+    def context_by_key(self, key: str) -> Optional[MarkerContext]:
+        for context in self.contexts():
+            if context.key == str(key or ""):
+                return context
+        return None
+
+    def _ensure_panel(self, initial_viewer) -> "MarkerPanel":
+        panel = self.panel
+        if panel is not None:
+            try:
+                panel.isVisible()
+                return panel
+            except RuntimeError:
+                panel = None
+        panel = MarkerPanel(
+            initial_viewer,
+            getattr(initial_viewer, "marker_manager"),
+            host=self,
+        )
+        self.panel = panel
+        root = self.root_viewer
+        if root is not None:
+            root.marker_panel = panel
+        return panel
+
+    def open_for(self, viewer, *, plane: Optional[str] = None) -> Optional["MarkerPanel"]:
+        context = self.context_for_viewer(viewer)
+        if context is None:
+            return None
+        panel = self._ensure_panel(context.viewer)
+        preferred_plane = plane or getattr(viewer, "plane", None)
+        if not preferred_plane:
+            getter = getattr(viewer, "default_marker_plane", None)
+            if callable(getter):
+                try:
+                    preferred_plane = getter()
+                except Exception:
+                    preferred_plane = None
+        panel.set_context(
+            context.viewer,
+            context_key=context.key,
+            context_label=context.label,
+            preferred_plane=preferred_plane,
+            explicit=True,
+        )
+        panel.refresh_target_combo()
+        panel.show()
+        if not bool(panel.property("_marker_panel_positioned")):
+            positioner = getattr(viewer, "_position_marker_panel", None)
+            if not callable(positioner):
+                positioner = getattr(self.root_viewer, "_position_marker_panel", None)
+            if callable(positioner):
+                try:
+                    positioner(panel)
+                except Exception:
+                    pass
+            panel.setProperty("_marker_panel_positioned", True)
+        panel.raise_()
+        panel.activateWindow()
+        return panel
+
+    def bind_context_by_key(
+        self,
+        key: str,
+        *,
+        preferred_plane: Optional[str] = None,
+        explicit: bool = True,
+    ) -> bool:
+        context = self.context_by_key(key)
+        panel = self.panel
+        if context is None or panel is None:
+            return False
+        return panel.set_context(
+            context.viewer,
+            context_key=context.key,
+            context_label=context.label,
+            preferred_plane=preferred_plane,
+            explicit=explicit,
+        )
+
+    def follow_viewer(self, viewer, *, plane: Optional[str] = None) -> bool:
+        panel = self.panel
+        if panel is None:
+            return False
+        try:
+            if not panel.isVisible():
+                return False
+        except RuntimeError:
+            return False
+        context = self.context_for_viewer(viewer)
+        if context is None:
+            return False
+        panel.refresh_target_combo()
+        return panel.set_context(
+            context.viewer,
+            context_key=context.key,
+            context_label=context.label,
+            preferred_plane=plane or getattr(viewer, "plane", None),
+            explicit=False,
+        )
+
+    def panel_for_manager(self, marker_manager: MarkerManager) -> Optional["MarkerPanel"]:
+        panel = self.panel
+        if panel is None:
+            return None
+        try:
+            if panel.marker_manager is marker_manager:
+                return panel
+        except RuntimeError:
+            return None
+        return None
+
+    def release_viewer(self, viewer) -> None:
+        panel = self.panel
+        if panel is None:
+            return
+        context = self.context_for_viewer(viewer)
+        active_context = getattr(panel, "_context_viewer", None)
+        try:
+            active_owner = panel.owner_window_for_activation()
+        except RuntimeError:
+            active_owner = None
+        if active_owner is viewer or active_context is viewer or (
+            context is not None and context.viewer is active_context and context.kind != "main"
+        ):
+            root_context = self.context_by_key("main")
+            if root_context is not None:
+                panel.set_context(
+                    root_context.viewer,
+                    context_key=root_context.key,
+                    context_label=root_context.label,
+                    preferred_plane=getattr(root_context.viewer, "plane", "xy"),
+                    explicit=True,
+                )
+        panel.refresh_target_combo()
+
+    def shutdown(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        panel = self.panel
+        self.panel = None
+        root = self.root_viewer
+        if root is not None:
+            root.marker_panel = None
+        if panel is not None:
+            panel.shutdown()
+
+
+def marker_panel_host_for(viewer, *, create: bool = False) -> Optional[MarkerPanelHost]:
+    root = marker_family_root(viewer)
+    if root is None:
+        return None
+    host = getattr(root, "_marker_panel_host", None)
+    if host is None and create:
+        host = MarkerPanelHost(root)
+        root._marker_panel_host = host
+    return host
+
+
+def open_marker_panel_for(viewer, *, plane: Optional[str] = None) -> Optional["MarkerPanel"]:
+    host = marker_panel_host_for(viewer, create=True)
+    return host.open_for(viewer, plane=plane) if host is not None else None
+
+
+def active_marker_panel_for_manager(marker_manager: MarkerManager) -> Optional["MarkerPanel"]:
+    viewer = getattr(marker_manager, "viewer", None)
+    host = marker_panel_host_for(viewer, create=False)
+    return host.panel_for_manager(marker_manager) if host is not None else None
+
+
+def active_marker_panel_for_viewer(viewer) -> Optional["MarkerPanel"]:
+    host = marker_panel_host_for(viewer, create=False)
+    panel = host.panel if host is not None else None
+    if panel is None:
+        return None
+    try:
+        if panel.owner_window_for_activation() is viewer:
+            return panel
+    except RuntimeError:
+        return None
+    return None
+
+
+def notify_marker_viewer_activated(viewer, *, plane: Optional[str] = None) -> bool:
+    host = marker_panel_host_for(viewer, create=False)
+    return host.follow_viewer(viewer, plane=plane) if host is not None else False
+
+
+PLACEMENT_TOGGLE_KEY = "m"
+PLACEMENT_CANCEL_KEY = "escape"
+
+
+def toggle_marker_placement(viewer, *, enabled: Optional[bool] = None) -> bool:
+    """Flip the family panel's Placement mode from a viewer's canvas.
+
+    Lets ``m``/``Esc`` over the image do what the checkbox does, so arming and
+    disarming does not mean travelling to the panel between every marker.
+    Returns True when the toggle actually changed.
+    """
+
+    host = marker_panel_host_for(viewer, create=False)
+    panel = host.panel if host is not None else None
+    if panel is None:
+        return False
+    try:
+        if not panel.isVisible():
+            return False
+        current = panel.placement_toggle.isChecked()
+    except RuntimeError:
+        return False
+    target = (not current) if enabled is None else bool(enabled)
+    if target == current:
+        return False
+    panel.placement_toggle.setChecked(target)
+    return True
+
+
+def handle_marker_placement_key(viewer, event) -> bool:
+    """Route a canvas key event to Placement mode. True when consumed."""
+
+    key = str(getattr(event, "key", "") or "").lower()
+    if key == PLACEMENT_TOGGLE_KEY:
+        return toggle_marker_placement(viewer)
+    if key == PLACEMENT_CANCEL_KEY:
+        # Escape only ever disarms, so it stays a safe "get me out of here".
+        return toggle_marker_placement(viewer, enabled=False)
+    return False
+
+
+def release_marker_viewer(viewer) -> None:
+    host = marker_panel_host_for(viewer, create=False)
+    if host is not None:
+        host.release_viewer(viewer)
+
+
+def shutdown_marker_panel_host(viewer) -> None:
+    host = marker_panel_host_for(viewer, create=False)
+    if host is not None:
+        host.shutdown()
 
 
 class MarkerPanel(QDialog):
@@ -145,8 +550,21 @@ class MarkerPanel(QDialog):
         ("Text", {"kind": "text"}),
     ]
 
-    def __init__(self, viewer, marker_manager: MarkerManager):
-        super().__init__(viewer)
+    def __init__(
+        self,
+        viewer,
+        marker_manager: MarkerManager,
+        *,
+        host: Optional[MarkerPanelHost] = None,
+    ):
+        super().__init__(None if host is not None else viewer)
+        self._host = host
+        self._context_viewer = viewer
+        self._context_key = "main"
+        self._context_label = "Main"
+        self._context_generation = 0
+        self._manager_signals_connected = False
+        self._shutdown_requested = False
         self.viewer = viewer
         self.marker_manager = marker_manager
         self._current_plane = getattr(viewer, "plane", "xy")
@@ -174,17 +592,31 @@ class MarkerPanel(QDialog):
 
         self.setWindowTitle(self._window_title_for_viewer())
         self.setModal(False)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # Closing a family-level inspector hides it so reopening reuses the
+        # same signal connections and editor state.
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
 
         self._build_ui()
         self._connect_signals()
         self._precompute_detail_group_heights()
         self._on_type_changed(self.type_combo.currentIndex())
+        # Opening the panel almost always means "I want to drop markers", so
+        # start armed.  Note this suppresses Follow until placement is
+        # unchecked (see _auto_follow_allowed).
         self.placement_toggle.setChecked(True)
-        self._configure_placement()
         self._refresh_marker_list()
+        if self._host is not None:
+            context = self._host.context_for_viewer(viewer)
+            if context is not None:
+                self._context_key = context.key
+                self._context_label = context.label
+            self.refresh_target_combo()
+            self._refresh_plane_combo()
+            self.refresh_context_labels()
 
     def _window_title_for_viewer(self) -> str:
+        if getattr(self, "_host", None) is not None:
+            return f"Markers — {getattr(self, '_context_label', 'Main')}"
         viewer = getattr(self, "viewer", None)
         class_name = str(getattr(viewer, "__class__", type(viewer)).__name__ or "").lower()
         if class_name == "channelmapwindow":
@@ -196,11 +628,491 @@ class MarkerPanel(QDialog):
         return "Markers"
 
     # ------------------------------------------------------------------
+    # Family context management
+    def _connect_manager_signals(self) -> None:
+        if self._manager_signals_connected or self.marker_manager is None:
+            return
+        self.marker_manager.markers_changed.connect(self._on_markers_changed)
+        self.marker_manager.selection_changed.connect(self._on_manager_selection_changed)
+        self.marker_manager.geometry_changed.connect(self._on_marker_geometry_changed)
+        active_plane_signal = getattr(self.marker_manager, "active_plane_changed", None)
+        if active_plane_signal is not None:
+            try:
+                active_plane_signal.connect(self._on_manager_active_plane_changed)
+            except Exception:
+                pass
+        self._manager_signals_connected = True
+
+    def _disconnect_manager_signals(self) -> None:
+        if not self._manager_signals_connected or self.marker_manager is None:
+            return
+        for signal_name, slot in (
+            ("markers_changed", self._on_markers_changed),
+            ("selection_changed", self._on_manager_selection_changed),
+            ("geometry_changed", self._on_marker_geometry_changed),
+            ("active_plane_changed", self._on_manager_active_plane_changed),
+        ):
+            signal = getattr(self.marker_manager, signal_name, None)
+            if signal is None:
+                continue
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        self._manager_signals_connected = False
+
+    def _available_planes(self, viewer=None, marker_manager=None) -> List[str]:
+        target = viewer or self._context_viewer or self.viewer
+        manager = marker_manager or self.marker_manager
+        candidates: List[str] = []
+
+        channel_planes = list(getattr(target, "_marker_planes", []) or [])
+        if channel_planes:
+            candidates.extend(str(plane) for plane in channel_planes if plane)
+        else:
+            for plane in ("xy", "xz", "zy"):
+                has_plane = getattr(target, "has_marker_plane", None)
+                if callable(has_plane):
+                    try:
+                        if has_plane(plane):
+                            candidates.append(plane)
+                    except Exception:
+                        pass
+            default_getter = getattr(target, "default_marker_plane", None)
+            if callable(default_getter):
+                try:
+                    default_plane = default_getter()
+                except Exception:
+                    default_plane = None
+                if default_plane:
+                    candidates.append(str(default_plane))
+            elif getattr(target, "plane", None):
+                candidates.append(str(target.plane))
+
+        if not channel_planes:
+            active_getter = getattr(manager, "active_plane", None)
+            if callable(active_getter):
+                try:
+                    active_plane = active_getter()
+                except Exception:
+                    active_plane = None
+                if active_plane:
+                    candidates.append(str(active_plane))
+
+            layers = getattr(manager, "_layers", {}) or {}
+            candidates.extend(str(plane) for plane in layers.keys() if plane)
+        return list(dict.fromkeys(candidates))
+
+    def _plane_display_label(self, plane: str) -> str:
+        target = self._context_viewer or self.viewer
+        label_getter = getattr(target, "marker_plane_display_label", None)
+        if callable(label_getter):
+            try:
+                label = label_getter(plane)
+            except Exception:
+                label = None
+            if label:
+                return str(label)
+        base = str(plane or "").lower()
+        base_labels = {"xy": "X–Y", "xz": "X–Z", "zy": "Z–Y"}
+        if base in base_labels:
+            return base_labels[base]
+        resolver = getattr(target, "marker_plane_base", None)
+        base_plane = None
+        if callable(resolver):
+            try:
+                base_plane = str(resolver(plane) or "").lower()
+            except Exception:
+                base_plane = None
+        if str(plane).startswith("channel_"):
+            suffix = str(plane).rsplit("_", 1)[-1]
+            try:
+                channel_number = int(suffix) + 1
+            except Exception:
+                channel_number = None
+            base_label = base_labels.get(base_plane or "", (base_plane or "tile").upper())
+            if channel_number is not None:
+                return f"{base_label} · Channel {channel_number}"
+        return str(plane).upper()
+
+    def _default_plane_for_context(self, viewer, preferred_plane: Optional[str]) -> str:
+        planes = self._available_planes(viewer, getattr(viewer, "marker_manager", None))
+        if preferred_plane and str(preferred_plane) in planes:
+            return str(preferred_plane)
+        active_getter = getattr(getattr(viewer, "marker_manager", None), "active_plane", None)
+        if callable(active_getter):
+            try:
+                active_plane = active_getter()
+            except Exception:
+                active_plane = None
+            if active_plane in planes:
+                return str(active_plane)
+        default_getter = getattr(viewer, "default_marker_plane", None)
+        if callable(default_getter):
+            try:
+                default_plane = default_getter()
+            except Exception:
+                default_plane = None
+            if default_plane in planes:
+                return str(default_plane)
+        own_plane = getattr(viewer, "plane", None)
+        if own_plane in planes:
+            return str(own_plane)
+        return planes[0] if planes else str(preferred_plane or own_plane or "xy")
+
+    def _set_viewer_marker_mode_raw(self, viewer, enabled: bool) -> None:
+        if viewer is None:
+            return
+        try:
+            viewer.marker_mode_enabled = bool(enabled)
+        except Exception:
+            pass
+        if not enabled:
+            manager = getattr(viewer, "marker_manager", None)
+            if manager is not None:
+                try:
+                    manager.cancel_placement()
+                except Exception:
+                    pass
+
+    def _interaction_viewer_for_plane(self, plane: str):
+        """The window whose canvas actually receives clicks for ``plane``.
+
+        The manager reports the MainWindow for every plane in its family, but
+        XZ/ZY are drawn in subwindows and each window only handles marker
+        clicks while it is armed itself.
+        """
+
+        owner = self._viewer_for_plane(plane)
+        base = str(plane or "")
+        resolver = getattr(owner, "marker_plane_base", None)
+        if callable(resolver):
+            try:
+                base = str(resolver(plane) or plane)
+            except Exception:
+                base = str(plane or "")
+        if getattr(owner, "plane", None) == base:
+            return owner
+        lookup = getattr(owner, "_owned_subwindow", None)
+        if callable(lookup):
+            try:
+                subwindow = lookup(base)
+            except Exception:
+                subwindow = None
+            if subwindow is not None:
+                return subwindow
+        return owner
+
+    def _interaction_viewers(self) -> List[object]:
+        """Every window of the current target that can place markers."""
+
+        viewers: List[object] = []
+        for plane in self._available_planes():
+            viewer = self._interaction_viewer_for_plane(plane)
+            if viewer is None:
+                continue
+            if not any(existing is viewer for existing in viewers):
+                viewers.append(viewer)
+        return viewers
+
+    def _auto_follow_allowed(self) -> bool:
+        if not self.follow_checkbox.isChecked() or self.pin_checkbox.isChecked():
+            return False
+        # Placement mode does not block following: set_context re-arms the
+        # newly bound viewer, so Follow keeps working while armed.
+        manager = self.marker_manager
+        dragging = getattr(manager, "is_dragging", None)
+        if callable(dragging):
+            try:
+                if dragging():
+                    return False
+            except Exception:
+                pass
+        # Don't retarget out from under an edit in progress.  This only counts
+        # while the panel itself is the active window: focusWidget() keeps
+        # naming a panel field long after the user has moved to a view, which
+        # would otherwise block Follow permanently.
+        try:
+            panel_is_active = self.isActiveWindow()
+        except RuntimeError:
+            return False
+        if panel_is_active:
+            app = QApplication.instance()
+            focus = app.focusWidget() if app is not None else None
+            if focus is not None:
+                try:
+                    if self.isAncestorOf(focus) and isinstance(
+                        focus, (QLineEdit, QDoubleSpinBox, QComboBox)
+                    ):
+                        return False
+                except RuntimeError:
+                    return False
+        return True
+
+    def set_context(
+        self,
+        viewer,
+        *,
+        context_key: str,
+        context_label: str,
+        preferred_plane: Optional[str] = None,
+        explicit: bool = False,
+    ) -> bool:
+        """Bind the inspector to one viewer/manager without mixing their data."""
+
+        if viewer is None or getattr(viewer, "marker_manager", None) is None:
+            return False
+        if not explicit and not self._auto_follow_allowed():
+            return False
+
+        new_manager = viewer.marker_manager
+        new_plane = self._default_plane_for_context(viewer, preferred_plane)
+        same_context = (
+            new_manager is self.marker_manager
+            and str(context_key) == self._context_key
+            and new_plane == self._current_plane
+        )
+        if same_context:
+            self._context_viewer = viewer
+            self._context_label = str(context_label)
+            self.refresh_target_combo()
+            self._refresh_plane_combo()
+            self.refresh_context_labels()
+            return True
+
+        old_manager = self.marker_manager
+        old_viewers = self._interaction_viewers() if old_manager is not None else [self.viewer]
+        flush = getattr(self._context_viewer, "_flush_pending_annotation_commits", None)
+        if callable(flush):
+            try:
+                flush()
+            except Exception:
+                pass
+
+        # Placement is a panel-level mode, so it survives a target switch: the
+        # old viewer is disarmed here and the new one re-armed at the end.
+        was_armed = self.placement_toggle.isChecked()
+        self.placement_toggle.blockSignals(True)
+        self.placement_toggle.setChecked(False)
+        self.placement_toggle.blockSignals(False)
+        if old_manager is not None:
+            try:
+                old_manager.cancel_placement()
+            except Exception:
+                pass
+        for old_viewer in old_viewers:
+            self._set_viewer_marker_mode_raw(old_viewer, False)
+        self._disconnect_manager_signals()
+
+        self._context_generation += 1
+        self._context_viewer = viewer
+        self.viewer = viewer
+        self.marker_manager = new_manager
+        self._context_key = str(context_key)
+        self._context_label = str(context_label)
+        self._current_plane = new_plane
+        self._current_marker_id = None
+        self._pending_selection_id = None
+        self._connect_manager_signals()
+        try:
+            self.marker_manager.set_active_plane(new_plane)
+        except Exception:
+            pass
+
+        self._populate_world_frame_combo()
+        self.link_all_checkbox.blockSignals(True)
+        self.link_all_checkbox.setChecked(self._viewer_link_all_enabled())
+        self.link_all_checkbox.blockSignals(False)
+        self.link_all_checkbox.setVisible(self._viewer_supports_link_all())
+        self.refresh_target_combo()
+        self._refresh_plane_combo()
+        self.refresh_context_labels()
+        self._refresh_marker_list()
+        if was_armed:
+            self.placement_toggle.blockSignals(True)
+            self.placement_toggle.setChecked(True)
+            self.placement_toggle.blockSignals(False)
+            self._configure_placement()
+        return True
+
+    def refresh_target_combo(self) -> None:
+        host = self._host
+        if host is None or not hasattr(self, "target_combo"):
+            return
+        contexts = host.contexts()
+        self.target_combo.blockSignals(True)
+        self.target_combo.clear()
+        selected_index = -1
+        for index, context in enumerate(contexts):
+            self.target_combo.addItem(context.label, context.key)
+            self.target_combo.setItemData(
+                index, context.label, Qt.ItemDataRole.ToolTipRole
+            )
+            if context.key == self._context_key:
+                selected_index = index
+        if selected_index < 0 and contexts:
+            selected_index = 0
+        if selected_index >= 0:
+            self.target_combo.setCurrentIndex(selected_index)
+        self.target_combo.blockSignals(False)
+        self._widen_combo_popup(self.target_combo)
+        current_label = self.target_combo.currentText()
+        self.target_combo.setToolTip(
+            f"{current_label}\nChoose which open viewer's markers this panel edits"
+            if current_label
+            else "Choose which open viewer's markers this panel edits"
+        )
+
+    @staticmethod
+    def _widen_combo_popup(combo: QComboBox) -> None:
+        """Keep the dropdown readable after the closed combo was narrowed."""
+
+        view = combo.view()
+        if view is None:
+            return
+        try:
+            width = int(view.sizeHintForColumn(0))
+        except Exception:
+            return
+        if width > 0:
+            view.setMinimumWidth(width + 24)
+
+    def _refresh_plane_combo(self) -> None:
+        if not hasattr(self, "plane_combo"):
+            return
+        planes = self._available_planes()
+        if self._current_plane not in planes:
+            planes.insert(0, self._current_plane)
+        self.plane_combo.blockSignals(True)
+        self.plane_combo.clear()
+        for index, plane in enumerate(planes):
+            label = self._plane_display_label(plane)
+            self.plane_combo.addItem(label, plane)
+            self.plane_combo.setItemData(index, label, Qt.ItemDataRole.ToolTipRole)
+        index = self.plane_combo.findData(self._current_plane)
+        if index >= 0:
+            self.plane_combo.setCurrentIndex(index)
+        self.plane_combo.setEnabled(self.plane_combo.count() > 1)
+        self.plane_combo.blockSignals(False)
+        self._widen_combo_popup(self.plane_combo)
+        current_label = self.plane_combo.currentText()
+        self.plane_combo.setToolTip(
+            f"{current_label}\nChoose the marker plane or visible channel tile"
+            if current_label
+            else "Choose the marker plane or visible channel tile"
+        )
+
+    @staticmethod
+    def _elide_title(text: str, limit: int = 34) -> str:
+        """Group-box titles set the dialog's minimum width, so cap them."""
+
+        text = str(text or "")
+        if len(text) <= limit:
+            return text
+        return f"{text[: max(1, limit - 1)]}…"
+
+    def refresh_context_labels(self) -> None:
+        self.setWindowTitle(self._window_title_for_viewer())
+        target = self._context_label or "current target"
+        marker_list_group = getattr(self, "marker_list_group", None)
+        if marker_list_group is not None:
+            marker_list_group.setTitle(f"Markers in {self._elide_title(target)}")
+            marker_list_group.setToolTip(f"Markers in {target}")
+        self.delete_all_button.setToolTip(
+            f"Delete every marker listed for {target}; markers in other targets are unchanged"
+        )
+        self.save_button.setToolTip(f"Save markers from {target}")
+        self.load_button.setToolTip(f"Load markers into {target}")
+
+    def owner_window_for_activation(self):
+        return self._viewer_for_plane(self._current_plane) or self._context_viewer or self.viewer
+
+    @property
+    def action_session(self):
+        return getattr(self._context_viewer, "action_session", None)
+
+    def undo_last_action(self):
+        action = getattr(self._context_viewer, "undo_last_action", None)
+        return action() if callable(action) else False
+
+    def redo_last_action(self):
+        action = getattr(self._context_viewer, "redo_last_action", None)
+        return action() if callable(action) else False
+
+    def export_workspace_state(self) -> dict:
+        return {
+            "target": self._context_key,
+            "plane": self._current_plane,
+            "follow_active_view": bool(self.follow_checkbox.isChecked()),
+            "pinned": bool(self.pin_checkbox.isChecked()),
+        }
+
+    def restore_workspace_state(self, state) -> bool:
+        if not isinstance(state, dict):
+            return False
+        target_key = str(state.get("target") or "main")
+        plane = state.get("plane")
+        restored = False
+        if self._host is not None:
+            restored = self._host.bind_context_by_key(
+                target_key,
+                preferred_plane=str(plane) if plane else None,
+                explicit=True,
+            )
+        pinned = bool(state.get("pinned", False))
+        follow = bool(state.get("follow_active_view", True)) and not pinned
+        self.follow_checkbox.blockSignals(True)
+        self.pin_checkbox.blockSignals(True)
+        self.follow_checkbox.setChecked(follow)
+        self.pin_checkbox.setChecked(pinned)
+        self.follow_checkbox.blockSignals(False)
+        self.pin_checkbox.blockSignals(False)
+        return restored
+
+    # ------------------------------------------------------------------
     # UI construction
     def _build_ui(self) -> None:
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
+
+        context_row = QHBoxLayout()
+        context_row.setSpacing(6)
+        context_row.addWidget(QLabel("Target", self))
+        self.target_combo = QComboBox(self)
+        self.target_combo.setToolTip("Choose which open viewer's markers this panel edits")
+        # Target labels carry the window title, so let the combo shrink well
+        # below its longest entry instead of stretching the whole panel.
+        self.target_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.target_combo.setMinimumContentsLength(14)
+        context_row.addWidget(self.target_combo, stretch=2)
+        context_row.addWidget(QLabel("Plane", self))
+        self.plane_combo = QComboBox(self)
+        self.plane_combo.setToolTip("Choose the marker plane or visible channel tile")
+        self.plane_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.plane_combo.setMinimumContentsLength(6)
+        context_row.addWidget(self.plane_combo, stretch=1)
+        main_layout.addLayout(context_row)
+
+        # Follow/Pin get their own row.  Sharing the combo row added ~220px to
+        # the dialog's minimum width, well past what its content needs.
+        follow_row = QHBoxLayout()
+        follow_row.setSpacing(6)
+        self.follow_checkbox = QCheckBox("Follow active view", self)
+        self.follow_checkbox.setChecked(True)
+        self.follow_checkbox.setToolTip(
+            "Switch target when another Main, Integ, or Channel Map view becomes active"
+        )
+        follow_row.addWidget(self.follow_checkbox)
+        self.pin_checkbox = QCheckBox("Pin target", self)
+        self.pin_checkbox.setToolTip("Keep the current target and plane until changed explicitly")
+        follow_row.addWidget(self.pin_checkbox)
+        follow_row.addStretch()
+        main_layout.addLayout(follow_row)
 
         type_row = QHBoxLayout()
         type_row.setSpacing(6)
@@ -217,14 +1129,26 @@ class MarkerPanel(QDialog):
         type_row.addWidget(self.type_combo, stretch=1)
 
         self.placement_toggle = QCheckBox("Placement mode", self)
+        self.placement_toggle.setToolTip(
+            "Click the image to place markers.\n"
+            "M toggles this from the image or this panel; Esc turns it off."
+        )
         type_row.addWidget(self.placement_toggle)
-        if self._viewer_supports_link_all():
-            self.link_all_checkbox = QCheckBox("All tiles", self)
-            self.link_all_checkbox.setToolTip("Place markers on every channel tile")
-            self.link_all_checkbox.setChecked(self._viewer_link_all_enabled())
-            type_row.addWidget(self.link_all_checkbox)
         type_row.addStretch()
         main_layout.addLayout(type_row)
+
+        # Channel-map only, and on its own row so it does not widen the dialog
+        # past the button row when it is visible.
+        link_all_row = QHBoxLayout()
+        link_all_row.setSpacing(6)
+        link_all_row.addSpacing(40)
+        self.link_all_checkbox = QCheckBox("All visible tiles", self)
+        self.link_all_checkbox.setToolTip("Place a corresponding marker on every visible channel tile")
+        self.link_all_checkbox.setChecked(self._viewer_link_all_enabled())
+        self.link_all_checkbox.setVisible(self._viewer_supports_link_all())
+        link_all_row.addWidget(self.link_all_checkbox)
+        link_all_row.addStretch()
+        main_layout.addLayout(link_all_row)
 
         detail_group = QGroupBox("Properties", self)
         self.detail_group = detail_group
@@ -351,12 +1275,24 @@ class MarkerPanel(QDialog):
         main_layout.addWidget(detail_group)
 
         list_group = QGroupBox("Markers", self)
+        self.marker_list_group = list_group
         list_layout = QVBoxLayout(list_group)
         list_layout.setContentsMargins(8, 8, 8, 8)
         list_layout.setSpacing(6)
 
         self.marker_list = DeselectableListWidget(self)
         self.marker_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        copy_hint = QKeySequence(QKeySequence.StandardKey.Copy).toString(
+            QKeySequence.SequenceFormat.NativeText
+        )
+        paste_hint = QKeySequence(QKeySequence.StandardKey.Paste).toString(
+            QKeySequence.SequenceFormat.NativeText
+        )
+        self.marker_list.setToolTip(
+            f"{copy_hint} copies the selected markers (all listed ones if none are "
+            f"selected); {paste_hint} adds them to the current target at the same "
+            "world position"
+        )
         list_layout.addWidget(self.marker_list)
 
         list_button_row = QHBoxLayout()
@@ -585,10 +1521,13 @@ class MarkerPanel(QDialog):
     # ------------------------------------------------------------------
     # Signal wiring
     def _connect_signals(self) -> None:
+        self.target_combo.currentIndexChanged.connect(self._on_target_changed)
+        self.plane_combo.currentIndexChanged.connect(self._on_plane_changed)
+        self.follow_checkbox.toggled.connect(self._on_follow_toggled)
+        self.pin_checkbox.toggled.connect(self._on_pin_toggled)
         self.type_combo.currentIndexChanged.connect(self._on_type_changed)
         self.placement_toggle.toggled.connect(self._on_placement_toggled)
-        if self.link_all_checkbox is not None:
-            self.link_all_checkbox.toggled.connect(self._on_link_all_toggled)
+        self.link_all_checkbox.toggled.connect(self._on_link_all_toggled)
 
         self.marker_list.itemSelectionChanged.connect(self._on_marker_list_selection)
         self.marker_list.delete_pressed.connect(self._on_delete_marker)
@@ -624,9 +1563,7 @@ class MarkerPanel(QDialog):
         self.text_controls.rotation_spin.valueChanged.connect(lambda _: self._apply_text_style())
         self.text_controls.font_combo.currentTextChanged.connect(lambda _: self._apply_text_style())
 
-        self.marker_manager.markers_changed.connect(self._on_markers_changed)
-        self.marker_manager.selection_changed.connect(self._on_manager_selection_changed)
-        self.marker_manager.geometry_changed.connect(self._on_marker_geometry_changed)
+        self._connect_manager_signals()
 
     # ------------------------------------------------------------------
     # Marker list and selection helpers
@@ -734,7 +1671,7 @@ class MarkerPanel(QDialog):
         elif label:
             detail = f' "{label}"'
 
-        plane = marker.plane.upper()
+        plane = self._plane_display_label(marker.plane)
         viewer = self._viewer_for_marker(marker)
         converter = getattr(viewer, "converter", None) if viewer else None
         wcs = getattr(converter, "wcs", None) if converter is not None else getattr(viewer, "wcs", None)
@@ -1461,8 +2398,14 @@ class MarkerPanel(QDialog):
         marker = self.marker_manager.marker_for_id(pending_id)
         if marker is None:
             return
+        generation = self._context_generation
+        manager = self.marker_manager
+
         def _restore():
+            if generation != self._context_generation or manager is not self.marker_manager:
+                return
             self._ensure_marker_selected(marker, preserve_existing=True)
+
         QTimer.singleShot(0, _restore)
 
     def _viewer_for_marker(self, marker: Marker):
@@ -1588,6 +2531,48 @@ class MarkerPanel(QDialog):
 
     # ------------------------------------------------------------------
     # Signal handlers
+    def _on_target_changed(self, index: int) -> None:
+        if self._host is None or index < 0:
+            return
+        key = self.target_combo.itemData(index)
+        if key is None or str(key) == self._context_key:
+            return
+        self._host.bind_context_by_key(str(key), explicit=True)
+
+    def _on_plane_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        plane = self.plane_combo.itemData(index)
+        if not plane or str(plane) == self._current_plane:
+            return
+        self._current_plane = str(plane)
+        try:
+            self.marker_manager.set_active_plane(self._current_plane)
+        except Exception:
+            pass
+        # Every window of this target stays armed, so switching planes only has
+        # to retarget the pending placement.
+        self._update_placement_if_enabled()
+        self.refresh_context_labels()
+
+    def _on_follow_toggled(self, checked: bool) -> None:
+        if checked and self.pin_checkbox.isChecked():
+            self.pin_checkbox.blockSignals(True)
+            self.pin_checkbox.setChecked(False)
+            self.pin_checkbox.blockSignals(False)
+
+    def _on_pin_toggled(self, checked: bool) -> None:
+        if checked and self.follow_checkbox.isChecked():
+            self.follow_checkbox.blockSignals(True)
+            self.follow_checkbox.setChecked(False)
+            self.follow_checkbox.blockSignals(False)
+
+    def _on_manager_active_plane_changed(self, plane: str) -> None:
+        if not plane:
+            return
+        self._current_plane = str(plane)
+        self._refresh_plane_combo()
+
     def _on_marker_list_selection(self) -> None:
         if self._suspend_selection_sync:
             return
@@ -1900,12 +2885,11 @@ class MarkerPanel(QDialog):
     def _on_placement_toggled(self, enabled: bool) -> None:
         if enabled:
             self._configure_placement()
-            if hasattr(self.viewer, "set_marker_mode"):
-                self.viewer.set_marker_mode(True)
-        else:
-            self.marker_manager.cancel_placement()
-            if hasattr(self.viewer, "set_marker_mode"):
-                self.viewer.set_marker_mode(False)
+            return
+        self.marker_manager.cancel_placement()
+        for viewer in self._interaction_viewers():
+            if hasattr(viewer, "set_marker_mode"):
+                viewer.set_marker_mode(False)
 
     def _on_label_changed(self) -> None:
         if self._suspend_updates:
@@ -2101,25 +3085,47 @@ class MarkerPanel(QDialog):
         for plane in planes:
             self.marker_manager.redraw_plane(plane)
 
-    def _on_delete_all(self) -> None:
-        planes = list(self.marker_manager._layers.keys())
-        if not planes:
-            self._show_info("No markers to delete.")
-            return
-        any_removed = False
-        for plane in planes:
-            layer = self.marker_manager._layers.get(plane)
-            if layer is None or not layer.markers:
+    def _listed_markers(self) -> List[Marker]:
+        """Markers the Markers list is showing, in list order."""
+
+        markers: List[Marker] = []
+        for row in range(self.marker_list.count()):
+            item = self.marker_list.item(row)
+            marker_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if not marker_id:
                 continue
-            any_removed = True
-            self.marker_manager.clear_plane(plane)
-            self.marker_manager.redraw_plane(plane)
-        if not any_removed:
+            marker = self.marker_manager.marker_for_id(marker_id)
+            if marker is not None:
+                markers.append(marker)
+        return markers
+
+    def _on_delete_all(self) -> None:
+        # "Delete All" clears exactly what the list shows, so its scope always
+        # matches the selected target and plane.
+        markers = self._listed_markers()
+        if not markers:
             self._show_info("No markers to delete.")
             return
+        target = self._context_label or "the current target"
+        answer = QMessageBox.question(
+            self,
+            "Delete All Markers",
+            f"Delete all {len(markers)} listed marker(s) in {target}?\n"
+            "Markers in other targets will not be changed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        planes: set[str] = set()
+        for marker in markers:
+            planes.add(marker.plane)
+            self.marker_manager.remove_marker(marker.marker_id, marker.plane)
         self._current_marker_id = None
         self.marker_manager.select_marker(None)
         self._refresh_marker_list()
+        for plane in planes:
+            self.marker_manager.redraw_plane(plane)
 
     def _on_deselect_markers(self) -> None:
         self._pending_selection_id = None
@@ -2197,6 +3203,90 @@ class MarkerPanel(QDialog):
         except Exception as exc:
             self._show_error(f"Failed to save markers: {exc}")
 
+    # ------------------------------------------------------------------
+    # Clipboard
+    def _clipboard_states(self) -> Tuple[str, Dict[str, MarkerState]]:
+        """States for the selected markers, or every listed one if none are."""
+
+        markers = self._selected_markers() or self._listed_markers()
+        if not markers:
+            return "", {}
+        wanted = {marker.marker_id for marker in markers}
+        planes = list(dict.fromkeys(marker.plane for marker in markers))
+        states: Dict[str, MarkerState] = {}
+        for plane in planes:
+            # _collect_states refreshes world coordinates, which is what lets a
+            # paste land on the same sky position in another target.
+            for marker_id, state in self._collect_states(plane).items():
+                if marker_id in wanted:
+                    states[marker_id] = state
+        return (planes[0] if len(planes) == 1 else "all"), states
+
+    def _copy_markers_to_clipboard(self) -> bool:
+        plane, states = self._clipboard_states()
+        if not states:
+            return False
+        world_frame = None
+        try:
+            world_frame = self.marker_manager.world_frame_for_plane(
+                next(iter(states.values())).plane
+            )
+        except Exception:
+            world_frame = None
+        try:
+            payload = marker_states_to_json(states, plane=plane, world_frame=world_frame)
+        except Exception as exc:
+            self._show_error(f"Failed to copy markers: {exc}")
+            return True
+        app = QApplication.instance()
+        clipboard = app.clipboard() if app is not None else None
+        if clipboard is None:
+            return False
+        clipboard.setText(payload)
+        return True
+
+    @staticmethod
+    def _marker_payload_from_text(text) -> Optional[dict]:
+        """Parse clipboard text, or None when it is not a marker payload.
+
+        Anything else on the clipboard has to fall through untouched so the
+        shortcut does not swallow ordinary pastes.
+        """
+
+        text = str(text or "").strip()
+        if not text.startswith("{"):
+            return None
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("format") != "takefits.marker":
+            return None
+        if not isinstance(payload.get("markers"), list) or not payload["markers"]:
+            return None
+        return payload
+
+    def _paste_markers_from_clipboard(self) -> bool:
+        app = QApplication.instance()
+        clipboard = app.clipboard() if app is not None else None
+        payload = self._marker_payload_from_text(
+            clipboard.text() if clipboard is not None else ""
+        )
+        if payload is None:
+            return False
+        try:
+            plane = self.marker_manager.import_from_dict(payload, clear_existing=False)
+        except Exception as exc:
+            self._show_error(f"Failed to paste markers: {exc}")
+            return True
+        self.marker_manager.redraw_plane(plane)
+        self._current_plane = plane
+        self._refresh_plane_combo()
+        self._refresh_marker_list()
+        return True
+
     def _on_load_json(self) -> None:
         default_dir = os.path.dirname(getattr(self.viewer, "filename_path", "")) or os.getcwd()
         path, _ = QFileDialog.getOpenFileName(
@@ -2210,9 +3300,34 @@ class MarkerPanel(QDialog):
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-            plane = self.marker_manager.import_from_dict(payload)
+            has_existing = any(
+                layer is not None and bool(layer.markers)
+                for layer in self.marker_manager._layers.values()
+            )
+            clear_existing = False
+            if has_existing:
+                options = [
+                    "Merge with existing markers",
+                    "Replace markers on affected planes",
+                ]
+                choice, accepted = QInputDialog.getItem(
+                    self,
+                    "Load Markers",
+                    f"How should markers be loaded into {self._context_label}?",
+                    options,
+                    0,
+                    False,
+                )
+                if not accepted:
+                    return
+                clear_existing = choice == options[1]
+            plane = self.marker_manager.import_from_dict(
+                payload,
+                clear_existing=clear_existing,
+            )
             self.marker_manager.redraw_plane(plane)
             self._current_plane = plane
+            self._refresh_plane_combo()
             self._refresh_marker_list()
             # self._show_info(f"Loaded markers for plane '{plane.upper()}'.")
         except Exception as exc:
@@ -2257,9 +3372,29 @@ class MarkerPanel(QDialog):
         kwargs = dict(self._style_configuration_for_kind(kind))
         if kind == "symbol":
             kwargs.setdefault("symbol", config.get("symbol", "o"))
+        # Arm every window of this target, not just the current plane's: a
+        # click is only handled by the window it lands in, so XZ/ZY subwindows
+        # need arming too.  The manager retargets the pending placement to
+        # whichever plane is clicked, so all three stay usable at once.
+        armed = False
+        for viewer in self._interaction_viewers():
+            if not hasattr(viewer, "set_marker_mode"):
+                continue
+            if getattr(viewer, "marker_mode_enabled", False):
+                continue
+            viewer.set_marker_mode(True)
+            armed = True
+        if armed:
+            # Arming snaps the manager to the armed window's own plane, and a
+            # channel map reports its default tile rather than the tile the
+            # panel selected.  Claim the panel's plane back.
+            try:
+                if self.marker_manager.active_plane() != current_plane:
+                    self.marker_manager.set_active_plane(current_plane)
+            except Exception:
+                pass
+            self._current_plane = current_plane
         self.marker_manager.begin_placement(kind, plane=current_plane, continuous=True, **kwargs)
-        if hasattr(self.viewer, "set_marker_mode") and not getattr(self.viewer, "marker_mode_enabled", False):
-            self.viewer.set_marker_mode(True)
 
     # ------------------------------------------------------------------
     # Utility helpers
@@ -2419,10 +3554,61 @@ class MarkerPanel(QDialog):
 
     # ------------------------------------------------------------------
     # Qt overrides
+    def showEvent(self, event) -> None:
+        if self._host is not None:
+            self.refresh_target_combo()
+            self._refresh_plane_combo()
+            self.refresh_context_labels()
+        super().showEvent(event)
+
     def closeEvent(self, event) -> None:
         if self.placement_toggle.isChecked():
             self.placement_toggle.setChecked(False)
         super().closeEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        # Only unhandled keys reach the dialog, so the line edits and spin
+        # boxes keep their own Copy/Paste and this fires for the marker list,
+        # the checkboxes, and the panel background.
+        if event.matches(QKeySequence.StandardKey.Copy):
+            if self._copy_markers_to_clipboard():
+                event.accept()
+                return
+        elif event.matches(QKeySequence.StandardKey.Paste):
+            if self._paste_markers_from_clipboard():
+                event.accept()
+                return
+        elif event.key() == Qt.Key.Key_M and not event.modifiers():
+            self.placement_toggle.setChecked(not self.placement_toggle.isChecked())
+            event.accept()
+            return
+        elif event.key() == Qt.Key.Key_Escape:
+            # Disarm rather than close the panel, matching Esc over the image.
+            if self.placement_toggle.isChecked():
+                self.placement_toggle.setChecked(False)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def shutdown(self) -> None:
+        """Permanently dispose the inspector when its MainWindow closes."""
+
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        if self.placement_toggle.isChecked():
+            self.placement_toggle.blockSignals(True)
+            self.placement_toggle.setChecked(False)
+            self.placement_toggle.blockSignals(False)
+        try:
+            self.marker_manager.cancel_placement()
+        except Exception:
+            pass
+        self._set_viewer_marker_mode_raw(self.owner_window_for_activation(), False)
+        self._disconnect_manager_signals()
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self.close()
+        self.deleteLater()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         self._on_deselect_markers()

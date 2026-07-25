@@ -225,6 +225,11 @@ class AppState:
     pv_y1: Optional[float] = None
     pv_width: float = 0.0
 
+    # Display overlays (TF-404 / TF-407): WCS coordinate-grid state.
+    display_grid: bool = False
+    display_grid_frame: str = "native"
+    display_grid_keep_native: bool = True
+
     def get_view_state(self, plane: str) -> ViewState:
         """Get view state for a specific plane."""
         if plane == 'xy':

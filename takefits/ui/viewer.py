@@ -857,10 +857,18 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         panel = getattr(menu_bar, "config_panel", None) if menu_bar is not None else None
         if panel is not None and panel.isVisible():
             try:
-                panel.cbar_x_input.setValue(pos_x)
-                panel.cbar_y_input.setValue(pos_y)
-                panel.cbar_width_input.setValue(width)
-                panel.cbar_height_input.setValue(height)
+                sync_geometry = getattr(
+                    panel,
+                    "sync_colorbar_geometry",
+                    None,
+                )
+                if callable(sync_geometry):
+                    sync_geometry(pos_x, pos_y, width, height)
+                else:
+                    panel.cbar_x_input.setValue(pos_x)
+                    panel.cbar_y_input.setValue(pos_y)
+                    panel.cbar_width_input.setValue(width)
+                    panel.cbar_height_input.setValue(height)
             except Exception:
                 pass
 
@@ -1106,6 +1114,89 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             placement,
             fallback=config.get("colorbar_orientation", "vertical"),
         )
+
+        def _colorbar_decoration_overhang(state):
+            left_overhang = 0.0
+            right_overhang = 64.0
+            bottom_overhang = 0.0
+            top_overhang = 32.0
+            cax = getattr(state, "cax", None)
+            fig = getattr(state, "fig", None)
+            if cax is None or fig is None:
+                return (
+                    left_overhang,
+                    right_overhang,
+                    bottom_overhang,
+                    top_overhang,
+                )
+            try:
+                renderer = fig.canvas.get_renderer()
+                tight_bbox = cax.get_tightbbox(renderer)
+                axes_bbox = cax.bbox
+                left_overhang = max(
+                    0.0, float(axes_bbox.x0) - float(tight_bbox.x0)
+                )
+                right_overhang = max(
+                    0.0, float(tight_bbox.x1) - float(axes_bbox.x1)
+                )
+                bottom_overhang = max(
+                    0.0, float(axes_bbox.y0) - float(tight_bbox.y0)
+                )
+                top_overhang = max(
+                    0.0, float(tight_bbox.y1) - float(axes_bbox.y1)
+                )
+            except Exception:
+                pass
+            return (
+                left_overhang,
+                right_overhang,
+                bottom_overhang,
+                top_overhang,
+            )
+
+        def _prepare_grid_overlay_layout():
+            # Non-native WCS overlays place longitude ticks above the image and
+            # latitude ticks to its right. Reserve those strips plus the
+            # colorbar's own outward tick/label extent before deriving geometry.
+            for plane in ("xy", "xz", "zy"):
+                state = self.get_viewer_state(plane)
+                viewer = getattr(state, "viewer", None) if state is not None else None
+                displaymap = getattr(viewer, "displaymap", None) if viewer is not None else None
+                update_label_layout = getattr(
+                    displaymap, "update_grid_overlay_label_layout", None
+                )
+                if callable(update_label_layout):
+                    try:
+                        update_label_layout(placement)
+                    except Exception:
+                        pass
+                update_grid_layout = getattr(
+                    displaymap, "update_grid_overlay_layout", None
+                )
+                if not callable(update_grid_layout):
+                    continue
+                (
+                    left_decoration,
+                    right_decoration,
+                    bottom_decoration,
+                    top_decoration,
+                ) = _colorbar_decoration_overhang(state)
+                try:
+                    update_grid_layout(
+                        colorbar_placement=placement,
+                        colorbar_gap_x_px=gap_x_px,
+                        colorbar_gap_y_px=gap_y_px,
+                        colorbar_thickness_px=thickness_px,
+                        colorbar_left_decoration_px=left_decoration,
+                        colorbar_right_decoration_px=right_decoration,
+                        colorbar_bottom_decoration_px=bottom_decoration,
+                        colorbar_top_decoration_px=top_decoration,
+                    )
+                except Exception:
+                    continue
+
+        _prepare_grid_overlay_layout()
+
         def _collect_targets():
             targets = {}
             for plane in ("xy", "xz", "zy"):
@@ -1129,6 +1220,59 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 if fig_h_px <= 0.0:
                     fig_h_px = 1.0
 
+                target_gap_x_px = gap_x_px
+                target_gap_y_px = gap_y_px
+                viewer = getattr(state, "viewer", None)
+                displaymap = getattr(viewer, "displaymap", None) if viewer is not None else None
+                if bool(getattr(displaymap, "grid_overlay_active", False)):
+                    (
+                        left_decoration,
+                        right_decoration,
+                        bottom_decoration,
+                        top_decoration,
+                    ) = _colorbar_decoration_overhang(state)
+                    normalized_placement = str(placement).strip().lower()
+                    if normalized_placement == "right":
+                        target_gap_x_px = (
+                            float(gap_x_px)
+                            + float(getattr(displaymap, "grid_overlay_right_margin_px", 96.0))
+                            + left_decoration
+                        )
+                    elif normalized_placement == "top":
+                        target_gap_y_px = (
+                            float(gap_y_px)
+                            + float(getattr(displaymap, "grid_overlay_top_margin_px", 64.0))
+                            + bottom_decoration
+                        )
+                    elif normalized_placement == "inside-right":
+                        target_gap_x_px = (
+                            float(gap_x_px)
+                            + max(
+                                float(
+                                    getattr(
+                                        displaymap,
+                                        "grid_overlay_right_margin_px",
+                                        96.0,
+                                    )
+                                ),
+                                right_decoration,
+                            )
+                        )
+                    elif normalized_placement == "inside-top":
+                        target_gap_y_px = (
+                            float(gap_y_px)
+                            + max(
+                                float(
+                                    getattr(
+                                        displaymap,
+                                        "grid_overlay_top_margin_px",
+                                        64.0,
+                                    )
+                                ),
+                                top_decoration,
+                            )
+                        )
+
                 target_x, target_y, target_w, target_h, _ = compute_colorbar_geometry(
                     ax_bounds,
                     fig_w_px,
@@ -1136,8 +1280,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                     placement=placement,
                     align=align,
                     gap_px=gap_px,
-                    gap_x_px=gap_x_px,
-                    gap_y_px=gap_y_px,
+                    gap_x_px=target_gap_x_px,
+                    gap_y_px=target_gap_y_px,
                     thickness_px=thickness_px,
                     length_mode=length_mode,
                     length_value=length_value,
@@ -1174,6 +1318,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             if orientation_changed:
                 self._set_colorbar_orientation_config(target_orientation)
                 self._rebuild_colorbars()
+                _prepare_grid_overlay_layout()
                 targets = _collect_targets()
                 if not targets:
                     return False
@@ -1480,7 +1625,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             if marker_manager is not None:
                 if hidden_markers:
                     marker_manager.restore_after_background_capture(hidden_markers)
-                marker_manager.draw_markers_for_blit()
+                marker_manager.draw_markers_for_blit(self.plane)
                 if self.plane == 'xy':
                     marker_manager.redraw_planes(['xz', 'zy'])
 
@@ -1514,6 +1659,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         )
         self.im, self.ax = self.displaymap.display(self.fig, plane)
         self.ax.format_coord = self.formatter
+        # Coordinate grid (TF-404): mirror the state DisplayMap applied from config.
+        self.grid_visible = bool(getattr(self.displaymap, 'grid_visible', False))
         self.overlay_ax = self.displaymap.overlay_ax
         # draw_event/motion handlers are attached after FigureCanvas is created
         
@@ -2077,10 +2224,19 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         print("\n".join(lines))
 
     
-    def reload_viewer(self):
+    def reload_viewer(self, *, apply_geometry=True):
         """Reload the viewer based on the updated configuration settings for all windows."""
         crosshair_snapshot = self._snapshot_crosshair_state()
         config = self.config_manager.config
+        for viewer in [self] + list(getattr(self, "subwindows", []) or []):
+            displaymap = getattr(viewer, "displaymap", None)
+            restore_grid_layout = getattr(
+                displaymap,
+                "restore_grid_overlay_layout",
+                None,
+            )
+            if callable(restore_grid_layout):
+                restore_grid_layout()
         colorscale = config.get('colorscale')
         bad_color = config.get('bad_color')
         self.format_pix.decimal = config.get('decimal')
@@ -2125,12 +2281,13 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self.beam_pos_y = config.get('beam_pos_y', 0.1)
         
         
-        self.figure_pos_x = config.get('figure_pos_x', 100)
-        self.figure_pos_y = config.get('figure_pos_y', 100)
-        self.figure_width = config.get('figure_width', 640)
-        self.figure_height = config.get('figure_height', 640)
-        self.move(self.figure_pos_x, self.figure_pos_y)
-        self.resize(self.figure_width, self.figure_height)
+        if apply_geometry:
+            self.figure_pos_x = config.get('figure_pos_x', 100)
+            self.figure_pos_y = config.get('figure_pos_y', 100)
+            self.figure_width = config.get('figure_width', 640)
+            self.figure_height = config.get('figure_height', 640)
+            self.move(self.figure_pos_x, self.figure_pos_y)
+            self.resize(self.figure_width, self.figure_height)
         self.fig.subplots_adjust( left = config.get('ax_pos_l'), 
                                 right = config.get('ax_pos_r'),
                                 bottom = config.get('ax_pos_b'), 
@@ -2142,7 +2299,11 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                                 right = config.get('ax_pos_r'),
                                 bottom = config.get('ax_pos_b'), 
                                 top = config.get('ax_pos_t'))
-                subwindow.resize(config.get('figure_width'), config.get('figure_height'))
+                if apply_geometry:
+                    subwindow.resize(
+                        config.get('figure_width'),
+                        config.get('figure_height'),
+                    )
                 subwindow.format_pix.decimal = config.get('decimal')
                 subwindow.auto_precision_digits = bool(config.get('auto_precision_digits', True))
                 subwindow.format_pix.auto_precision_digits = bool(config.get('auto_precision_digits', True))
@@ -2178,7 +2339,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 continue
             apply_preferences = getattr(window, "apply_preferences", None)
             if callable(apply_preferences):
-                apply_preferences()
+                apply_preferences(apply_geometry=apply_geometry)
         for window in list(getattr(self, "channel_map_windows", []) or []):
             apply_preferences = getattr(window, "apply_preferences", None)
             if callable(apply_preferences):
@@ -2187,6 +2348,24 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             apply_labels = getattr(window, "apply_channel_label_settings", None)
             if callable(apply_labels):
                 apply_labels()
+        grid_setter = getattr(self, "set_coordinate_grid", None)
+        grid_visible_getter = getattr(self, "get_coordinate_grid_visible", None)
+        grid_frame_getter = getattr(self, "get_wcs_display_frame", None)
+        grid_native_getter = getattr(self, "get_coordinate_grid_keep_native", None)
+        if all(
+            callable(callback)
+            for callback in (
+                grid_setter,
+                grid_visible_getter,
+                grid_frame_getter,
+                grid_native_getter,
+            )
+        ):
+            grid_setter(
+                grid_visible_getter(),
+                frame=grid_frame_getter(),
+                keep_native=grid_native_getter(),
+            )
         self._restore_crosshair_state(crosshair_snapshot)
 
     def _rebuild_colorbars(self):
@@ -2228,6 +2407,18 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 state.colorbar = state.fig.colorbar(state.im, cax=state.cax, orientation=orientation)
                 ColorSettingsPanel.apply_colorbar_settings(state.cax, state.colorbar, config)
                 self._set_colorbar_zorder_for_state(state)
+                viewer = getattr(state, "viewer", None)
+                displaymap = getattr(viewer, "displaymap", None) if viewer is not None else None
+                if displaymap is not None:
+                    displaymap.cax = state.cax
+                    displaymap.colorbar = state.colorbar
+                    update_label_layout = getattr(
+                        displaymap,
+                        "update_grid_overlay_label_layout",
+                        None,
+                    )
+                    if callable(update_label_layout):
+                        update_label_layout(config.get("colorbar_placement"))
             except Exception:
                 continue
 
@@ -3883,8 +4074,13 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                                 self._set_plane_image_data('xz', self._blank_plane('xz'))
                         if update_slices and subwindow1 and (xz_needs_refresh or self._get_plane_background('xz') is None):
                             xz_refreshed = self._update_slice_image(subwindow1, fast_blit=fast_blit)
+                    # Coordinate grid (TF-404): when the grid is on, force a fresh
+                    # full-draw background (image + grid composited by WCSAxes) and
+                    # skip the manual image redraw below, which would otherwise
+                    # paint the image over the grid and hide it.
+                    xz_grid_on = self._plane_grid_visible(self.get_viewer_state('xz'))
                     # Blit xz plane (correct order: restore -> draw image -> draw overlays -> blit)
-                    xz_bg = self._refresh_overlay_background('xz') if (update_slices and not fast_blit and not xz_refreshed) else self._get_plane_background('xz')
+                    xz_bg = self._refresh_overlay_background('xz') if (update_slices and not fast_blit and (not xz_refreshed or xz_grid_on)) else self._get_plane_background('xz')
                     xz_ax = self._get_plane_ax('xz')
                     if xz_canvas and xz_overlay:
                         skip_restore = fast_blit and (xz_needs_refresh or self._get_plane_background('xz') is None)
@@ -3893,7 +4089,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
                         # During fast drag updates, _update_slice_image() has already rendered
                         # image/contours/axis for xz when needed; only draw overlays here.
-                        if not fast_blit and xz_ax and xz_im:
+                        if not fast_blit and xz_ax and xz_im and not xz_grid_on:
                             xz_ax.draw_artist(xz_im)
 
                             # Draw contour artists after image
@@ -4367,6 +4563,41 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         super().resizeEvent(event)
         if self._is_colorbar_auto_layout_enabled():
             self._schedule_colorbar_auto_layout_if_anchor_changed(force=False)
+        else:
+            displaymap = getattr(self, "displaymap", None)
+            if (
+                bool(getattr(displaymap, "grid_overlay_active", False))
+                and not bool(getattr(self, "_grid_overlay_resize_pending", False))
+            ):
+                # The reserved overlay margin is expressed in pixels. Defer
+                # until Qt has resized the child canvas, then recompute it even
+                # when the user intentionally disabled colorbar auto-layout.
+                self._grid_overlay_resize_pending = True
+                QTimer.singleShot(0, self._refresh_grid_overlay_layout_after_resize)
+
+    def _refresh_grid_overlay_layout_after_resize(self):
+        self._grid_overlay_resize_pending = False
+        if self._is_colorbar_auto_layout_enabled():
+            return
+        displaymap = getattr(self, "displaymap", None)
+        if not bool(getattr(displaymap, "grid_overlay_active", False)):
+            return
+        update_layout = getattr(displaymap, "update_grid_overlay_layout", None)
+        if not callable(update_layout):
+            return
+        try:
+            changed = bool(update_layout())
+        except Exception:
+            return
+        if not changed:
+            return
+        try:
+            self._invalidate_plane_background(self.plane)
+        except Exception:
+            pass
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.draw_idle()
 
 
     def redraw_main_overlay_and_blit(self, *, lightweight: bool = False):
@@ -4604,20 +4835,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
 
     def open_marker_panel(self):
-        if self.marker_panel is None or not self.marker_panel.isVisible():
-            from takefits.tools.marker_panel import MarkerPanel
-            self.marker_panel = MarkerPanel(self, self.marker_manager)
-            try:
-                self.marker_panel.destroyed.connect(lambda: setattr(self, 'marker_panel', None))
-            except Exception:
-                pass
-            self.marker_panel.setProperty("_marker_panel_positioned", False)
-        self.marker_panel.show()
-        if not bool(self.marker_panel.property("_marker_panel_positioned")):
-            self._position_marker_panel(self.marker_panel)
-            self.marker_panel.setProperty("_marker_panel_positioned", True)
-        self.marker_panel.raise_()
-        self.marker_panel.activateWindow()
+        from takefits.tools.marker_panel import open_marker_panel_for
+
+        return open_marker_panel_for(self, plane=getattr(self, "plane", None))
 
     # Marker plane helpers -------------------------------------------------
     def has_marker_plane(self, plane: str) -> bool:
@@ -4750,14 +4970,18 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
     def set_marker_mode(self, enabled: bool = True):
         enabled = bool(enabled)
-        previous = getattr(self, 'marker_mode_enabled', False)
         self.marker_mode_enabled = enabled
         marker_manager = getattr(self, 'marker_manager', None)
         plane = getattr(self, 'plane', 'xy')
         if not enabled:
             if marker_manager is not None:
                 marker_manager.cancel_placement()
-            panel = getattr(self, 'marker_panel', None)
+            try:
+                from takefits.tools.marker_panel import active_marker_panel_for_viewer
+
+                panel = active_marker_panel_for_viewer(self)
+            except Exception:
+                panel = None
             if panel is not None and getattr(panel, 'placement_toggle', None) is not None:
                 if panel.placement_toggle.isChecked():
                     panel.placement_toggle.blockSignals(True)
@@ -4775,15 +4999,6 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self._reset_navigation_mode()
         if enabled and self.toolbar.mode in ('zoom rect', 'pan/zoom'):
             self._reset_navigation_mode()
-        if previous != enabled:
-            subwindows = getattr(self, 'subwindows', None)
-            if subwindows:
-                for subwindow in subwindows:
-                    if subwindow is not None and subwindow is not self:
-                        try:
-                            subwindow.set_marker_mode(enabled)
-                        except Exception:
-                            pass
 
 
 
@@ -4794,6 +5009,14 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         key = str(getattr(event, 'key', '') or '').lower()
         if key == 'f' and self._toggle_magnifier_lock():
             return
+
+        try:
+            from takefits.tools.marker_panel import handle_marker_placement_key
+
+            if handle_marker_placement_key(self, event):
+                return
+        except Exception:
+            pass
 
         region_manager = getattr(self, 'region_manager', None)
         if region_manager is not None:
@@ -5210,8 +5433,9 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             elif self.plane == 'xz':
                 x_min = self._get_range_input('xz', 'xmin')
                 x_max = self._get_range_input('xz', 'xmax')
-                y_min = self._get_range_input('zy', 'ymin')
-                y_max = self._get_range_input('zy', 'ymax')
+                y_anchor = self._resolve_world_anchor('y')
+                y_min = y_anchor
+                y_max = y_anchor
 
             z_anchor = self._resolve_world_anchor('z')
             if self.original_zval is None:
@@ -5594,6 +5818,52 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         if hasattr(self, '_full_world_limits'):
             self._full_world_limits.clear()
         self.canvas.draw_idle()
+
+    def apply_coordinate_grid(
+        self,
+        visible: bool,
+        *,
+        frame: str = None,
+        keep_native: bool = None,
+    ) -> bool:
+        """Configure the WCS coordinate grid for THIS plane and repaint.
+
+        The grid lines belong to the WCSAxes background that the blit pipeline
+        caches, so the cached background is invalidated to force a clean rebuild
+        on the next draw.
+        """
+        dm = getattr(self, 'displaymap', None)
+        if dm is None:
+            return False
+        refresh_style = getattr(dm, 'refresh_grid_style', None)
+        if callable(refresh_style):
+            # SubWindow owns a legacy per-viewer ConfigManager, but live
+            # Preferences belong to its MainWindow family.  Reading the owner
+            # here prevents a stale subwindow config from undoing a grid style
+            # change during MainWindow.set_coordinate_grid() fan-out.
+            owner = getattr(self, 'main_window', None) or self
+            config_manager = getattr(owner, 'config_manager', None)
+            if config_manager is None:
+                config_manager = getattr(self, 'config_manager', None)
+            refresh_style(
+                getattr(config_manager, 'config', None)
+            )
+        applied = dm.set_grid(
+            visible,
+            frame=frame,
+            keep_native=keep_native,
+        )
+        self.grid_visible = bool(visible)
+        if not applied:
+            return False
+        try:
+            self._invalidate_plane_background(self.plane)
+        except Exception:
+            pass
+        canvas = getattr(self, 'canvas', None)
+        if canvas is not None:
+            canvas.draw_idle()
+        return True
     
     def _format_significant_digits(self, value, digits=4):
         """
@@ -5641,6 +5911,20 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
         # Get state for current plane
         state = self.state
+
+        # Coordinate grid (TF-404): the manual image/contour blit below would
+        # cover or leak the grid that sits above the image. When the grid is on,
+        # take a clean full draw instead so WCSAxes composites image, contours
+        # and grid correctly; invalidate the cached background so the next
+        # crosshair blit rebuilds it without the grid being duplicated.
+        if self._plane_grid_visible(state):
+            self._draw_canvas_with_image(state)
+            try:
+                self._invalidate_plane_background(plane)
+            except Exception:
+                pass
+            self._perf_end(perf_token)
+            return
 
         artists_to_hide: List[object] = []
         if state.vline:

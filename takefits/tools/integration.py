@@ -18,7 +18,7 @@ from matplotlib.figure import Figure
 from takefits.tools.color_scale import ColorSettingsPanel, ColorMode
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from takefits.ui.navigation_toolbar import MyNavigationToolbar
-from takefits.core.plotting.display_map import TransparentOverlayAxes
+from takefits.core.plotting.display_map import DisplayMap, TransparentOverlayAxes
 from takefits.core.coordinate import Format_pix_to_wcs
 from takefits.core.colorbar_layout import compute_colorbar_geometry, orientation_for_placement
 from takefits.core.click_label_layout import compute_click_label_geometry
@@ -799,41 +799,43 @@ class IntegSettingsPanel(QDialog):
         z_min_text = str(self.z_min_input.text() or "").strip()
         z_max_text = str(self.z_max_input.text() or "").strip()
 
-        def _optional_float(text: str, fallback: float) -> float:
-            if not text:
-                return float(fallback)
-            try:
-                return float(text)
-            except ValueError:
-                return float(fallback)
+        # Return the raw world-coordinate value (string or number) rather than a
+        # float: CoordinateConverter.world_to_pix() parses sexagesimal strings
+        # (e.g. "-00d06m39.7s") via astropy Angle, so forcing float() here would
+        # break in sexagesimal display mode. Only emptiness is validated; an
+        # unparseable value raises inside world_to_pix and is handled below.
+        def _optional_world(text: str, fallback):
+            return text if text else fallback
 
-        def _required_float(text: str) -> float:
+        def _required_world(text: str):
             if not text:
                 raise ValueError
-            return float(text)
+            return text
 
         try:
-            # For coordinate conversion context, non-selected axis values are optional.
-            x_anchor = _optional_float(x_min_text, getattr(self, "xmin_val", 0.0))
-            y_anchor = _optional_float(y_min_text, getattr(self, "ymin_val", 0.0))
-            z_anchor = _optional_float(z_min_text, getattr(self, "zmin_val", 0.0))
+            # For coordinate conversion context, non-selected axis values are
+            # optional and fall back to the stored full-range anchors (which may
+            # themselves be sexagesimal strings).
+            x_anchor = _optional_world(x_min_text, getattr(self, "xmin_val", 0.0))
+            y_anchor = _optional_world(y_min_text, getattr(self, "ymin_val", 0.0))
+            z_anchor = _optional_world(z_min_text, getattr(self, "zmin_val", 0.0))
 
             if self.fits_viewer.data.ndim == 3:
                 if axis == 2:
-                    x_min = _required_float(x_min_text)
-                    x_max = _required_float(x_max_text)
+                    x_min = _required_world(x_min_text)
+                    x_max = _required_world(x_max_text)
                     min_pixel_float = float(self.converter.world_to_pix(x_min, y_anchor, z_anchor)[0])
                     max_pixel_float = float(self.converter.world_to_pix(x_max, y_anchor, z_anchor)[0])
                     self.min_input, self.max_input = x_min_text, x_max_text
                 elif axis == 1:
-                    y_min = _required_float(y_min_text)
-                    y_max = _required_float(y_max_text)
+                    y_min = _required_world(y_min_text)
+                    y_max = _required_world(y_max_text)
                     min_pixel_float = float(self.converter.world_to_pix(x_anchor, y_min, z_anchor)[1])
                     max_pixel_float = float(self.converter.world_to_pix(x_anchor, y_max, z_anchor)[1])
                     self.min_input, self.max_input = y_min_text, y_max_text
                 elif axis == 0:
-                    z_min = _required_float(z_min_text)
-                    z_max = _required_float(z_max_text)
+                    z_min = _required_world(z_min_text)
+                    z_max = _required_world(z_max_text)
                     min_pixel_float = float(self.converter.world_to_pix(x_anchor, y_anchor, z_min)[2])
                     max_pixel_float = float(self.converter.world_to_pix(x_anchor, y_anchor, z_max)[2])
                     self.min_input, self.max_input = z_min_text, z_max_text
@@ -841,20 +843,20 @@ class IntegSettingsPanel(QDialog):
                     raise ValueError
             elif self.fits_viewer.data.ndim == 4:
                 if axis == 2:
-                    x_min = _required_float(x_min_text)
-                    x_max = _required_float(x_max_text)
+                    x_min = _required_world(x_min_text)
+                    x_max = _required_world(x_max_text)
                     min_pixel_float = float(self.converter.world_to_pix(x_min, y_anchor, z_anchor, 0)[0])
                     max_pixel_float = float(self.converter.world_to_pix(x_max, y_anchor, z_anchor, 0)[0])
                     self.min_input, self.max_input = x_min_text, x_max_text
                 elif axis == 1:
-                    y_min = _required_float(y_min_text)
-                    y_max = _required_float(y_max_text)
+                    y_min = _required_world(y_min_text)
+                    y_max = _required_world(y_max_text)
                     min_pixel_float = float(self.converter.world_to_pix(x_anchor, y_min, z_anchor, 0)[1])
                     max_pixel_float = float(self.converter.world_to_pix(x_anchor, y_max, z_anchor, 0)[1])
                     self.min_input, self.max_input = y_min_text, y_max_text
                 elif axis == 0:
-                    z_min = _required_float(z_min_text)
-                    z_max = _required_float(z_max_text)
+                    z_min = _required_world(z_min_text)
+                    z_max = _required_world(z_max_text)
                     min_pixel_float = float(self.converter.world_to_pix(x_anchor, y_anchor, z_min, 0)[2])
                     max_pixel_float = float(self.converter.world_to_pix(x_anchor, y_anchor, z_max, 0)[2])
                     self.min_input, self.max_input = z_min_text, z_max_text
@@ -1066,6 +1068,7 @@ class IntegResultWindow(QMainWindow):
         self._colorbar_sync_redraw_in_progress = False
         self._colorbar_sync_redraw_pending = False
         self._colorbar_auto_anchor_sig = None
+        self.displaymap = None
         self._setup_marker_action_bridge()
 
         self.color_pattern = (
@@ -1085,6 +1088,8 @@ class IntegResultWindow(QMainWindow):
         self.xnpix = self.data.shape[2]-1
         
         self.initUI(config)
+        self._initialize_coordinate_grid_controller()
+        self._inherit_coordinate_grid_state()
         self._set_bunit()
 
         self.region_manager = RegionManager(self)
@@ -1446,6 +1451,130 @@ class IntegResultWindow(QMainWindow):
 
     def formatter(self, x, y):
         return self._toolbar_message_text(x, y)
+
+    def _initialize_coordinate_grid_controller(self):
+        """Bind the shared DisplayMap grid engine to this result's WCSAxes."""
+        header = getattr(self.fits_viewer, "header", None)
+        if header is None and self.wcs is not None:
+            try:
+                header = self.wcs.to_header()
+            except Exception:
+                header = {}
+        controller = DisplayMap(
+            self.integrated_data,
+            header or {},
+            self.wcs,
+            self.config,
+            defer_colorbar=True,
+        )
+        controller.fig = self.fig
+        controller.ax = self.ax
+        controller.overlay_ax = self.overlay_ax
+        controller.cax = self.cax
+        controller.colorbar = self.colorbar
+        controller.im = self.im
+        controller.plane = self.plane
+        controller.slices = self.integ_slice
+        controller._install_safe_grid_contour_clear()
+        self.displaymap = controller
+
+    def _inherit_coordinate_grid_state(self):
+        owner = getattr(self, "fits_viewer", None)
+        visible_getter = getattr(owner, "get_coordinate_grid_visible", None)
+        frame_getter = getattr(owner, "get_wcs_display_frame", None)
+        keep_native_getter = getattr(
+            owner,
+            "get_coordinate_grid_keep_native",
+            None,
+        )
+        visible = (
+            bool(visible_getter())
+            if callable(visible_getter)
+            else bool(self.config.get("grid_visible", False))
+        )
+        frame = (
+            frame_getter()
+            if callable(frame_getter)
+            else self.config.get("grid_frame", "native")
+        )
+        keep_native = (
+            bool(keep_native_getter())
+            if callable(keep_native_getter)
+            else bool(self.config.get("grid_keep_native", True))
+        )
+        self.apply_coordinate_grid(
+            visible,
+            frame=frame,
+            keep_native=keep_native,
+        )
+
+    def _sync_coordinate_grid_controller_axes(self):
+        controller = getattr(self, "displaymap", None)
+        if controller is None:
+            return None
+        controller.fig = self.fig
+        controller.ax = self.ax
+        controller.overlay_ax = self.overlay_ax
+        controller.cax = self.cax
+        controller.colorbar = self.colorbar
+        controller.im = self.im
+        controller.plane = self.plane
+        controller.slices = self.integ_slice
+        return controller
+
+    def apply_coordinate_grid(
+        self,
+        visible: bool,
+        *,
+        frame: str = None,
+        keep_native: bool = None,
+    ) -> bool:
+        controller = self._sync_coordinate_grid_controller_axes()
+        if controller is None:
+            return False
+        controller.refresh_grid_style(self._get_colorbar_config())
+        applied = controller.set_grid(
+            bool(visible),
+            frame=frame,
+            keep_native=keep_native,
+        )
+        self.grid_visible = bool(visible)
+        self._prepare_coordinate_grid_layout()
+        self.overlay_ax.set_position(self.ax.get_position())
+        self._background = None
+        canvas = getattr(self, "canvas", None)
+        if canvas is not None:
+            canvas.draw_idle()
+        return bool(applied)
+
+    def refresh_coordinate_format(self, *, redraw: bool = True):
+        controller = self._sync_coordinate_grid_controller_axes()
+        if controller is None:
+            return
+        config = self._get_colorbar_config()
+        controller.refresh_grid_style(config)
+        self.decimal = bool(config.get("decimal", True))
+        self.auto_precision_digits = bool(
+            config.get("auto_precision_digits", True)
+        )
+        self.number_decimals = config.get("number_decimals", 6)
+        self.coord_wrap = config.get("coord_wrap", 180)
+        if getattr(self, "format_pix", None) is not None:
+            self.format_pix.decimal = self.decimal
+            self.format_pix.auto_precision_digits = self.auto_precision_digits
+            self.format_pix.number_decimals = self.number_decimals
+            self.format_pix.coord_wrap = self.coord_wrap
+        controller.update_axes_format()
+        controller.set_grid(
+            bool(getattr(controller, "grid_visible", False)),
+            frame=getattr(controller, "grid_frame", "native"),
+            keep_native=getattr(controller, "grid_keep_native", True),
+        )
+        self._prepare_coordinate_grid_layout()
+        self.overlay_ax.set_position(self.ax.get_position())
+        self._background = None
+        if redraw and getattr(self, "canvas", None) is not None:
+            self.canvas.draw_idle()
 
 
     def initUI(self, config):
@@ -1891,12 +2020,26 @@ class IntegResultWindow(QMainWindow):
         if self._is_colorbar_auto_layout_enabled():
             self._schedule_colorbar_auto_layout_if_anchor_changed(force=True)
 
-    def apply_preferences(self, redraw: bool = True):
+    def apply_preferences(
+        self,
+        redraw: bool = True,
+        *,
+        apply_geometry: bool = True,
+    ):
         """Apply the shared Preferences config to an open integration result window."""
         config = getattr(getattr(self, "fits_viewer", None), "config_manager", None)
         config = getattr(config, "config", None) if config is not None else self.config
         if not isinstance(config, dict):
             return
+        controller = getattr(self, "displaymap", None)
+        grid_state = None
+        if controller is not None:
+            grid_state = (
+                bool(getattr(controller, "grid_visible", False)),
+                getattr(controller, "grid_frame", "native"),
+                bool(getattr(controller, "grid_keep_native", True)),
+            )
+            controller.restore_grid_overlay_layout()
         self.config = config
         self.decimal = config.get('decimal', True)
         self.auto_precision_digits = bool(config.get('auto_precision_digits', True))
@@ -1908,7 +2051,11 @@ class IntegResultWindow(QMainWindow):
             self.format_pix.number_decimals = self.number_decimals
             self.format_pix.coord_wrap = self.coord_wrap
 
-        self.resize(config.get('figure_width', self.width()), config.get('figure_height', self.height()))
+        if apply_geometry:
+            self.resize(
+                config.get('figure_width', self.width()),
+                config.get('figure_height', self.height()),
+            )
         self.fig.subplots_adjust(
             left=config.get('ax_pos_l'),
             right=config.get('ax_pos_r'),
@@ -1988,6 +2135,23 @@ class IntegResultWindow(QMainWindow):
             self._position_click_label()
 
         self._apply_colorbar_preferences(config)
+        controller = self._sync_coordinate_grid_controller_axes()
+        if controller is not None:
+            controller.refresh_grid_style(config)
+            if grid_state is None:
+                grid_state = (
+                    bool(config.get("grid_visible", False)),
+                    config.get("grid_frame", "native"),
+                    bool(config.get("grid_keep_native", True)),
+                )
+            controller.set_grid(
+                grid_state[0],
+                frame=grid_state[1],
+                keep_native=grid_state[2],
+            )
+            self.grid_visible = grid_state[0]
+            self._prepare_coordinate_grid_layout()
+            self.overlay_ax.set_position(self.ax.get_position())
         self._background = None
         if redraw and getattr(self, "canvas", None) is not None:
             self.canvas.draw_idle()
@@ -2049,20 +2213,9 @@ class IntegResultWindow(QMainWindow):
             pass
 
     def open_marker_panel(self):
-        if self.marker_panel is None or not self.marker_panel.isVisible():
-            from takefits.tools.marker_panel import MarkerPanel
-            self.marker_panel = MarkerPanel(self, self.marker_manager)
-            try:
-                self.marker_panel.destroyed.connect(lambda: setattr(self, 'marker_panel', None))
-            except Exception:
-                pass
-            self.marker_panel.setProperty("_marker_panel_positioned", False)
-        self.marker_panel.show()
-        if not bool(self.marker_panel.property("_marker_panel_positioned")):
-            self._position_marker_panel(self.marker_panel)
-            self.marker_panel.setProperty("_marker_panel_positioned", True)
-        self.marker_panel.raise_()
-        self.marker_panel.activateWindow()
+        from takefits.tools.marker_panel import open_marker_panel_for
+
+        return open_marker_panel_for(self, plane=getattr(self, "plane", "xy"))
 
     # Marker plane helpers -------------------------------------------------
     def has_marker_plane(self, plane: str) -> bool:
@@ -2446,7 +2599,12 @@ class IntegResultWindow(QMainWindow):
         if not enabled:
             if marker_manager is not None:
                 marker_manager.cancel_placement()
-            panel = getattr(self, 'marker_panel', None)
+            try:
+                from takefits.tools.marker_panel import active_marker_panel_for_viewer
+
+                panel = active_marker_panel_for_viewer(self)
+            except Exception:
+                panel = None
             if panel is not None and getattr(panel, 'placement_toggle', None) is not None:
                 if panel.placement_toggle.isChecked():
                     panel.placement_toggle.blockSignals(True)
@@ -2835,6 +2993,60 @@ class IntegResultWindow(QMainWindow):
         self.colorbar.ax.minorticks_on()
         ColorSettingsPanel.apply_colorbar_settings(cax=self.cax, colorbar=self.colorbar, config=config)
         self._set_colorbar_zorder()
+        controller = getattr(self, "displaymap", None)
+        if controller is not None:
+            controller.cax = self.cax
+            controller.colorbar = self.colorbar
+
+    def _colorbar_decoration_overhang(self):
+        cax = getattr(self, "cax", None)
+        fig = getattr(self, "fig", None)
+        if cax is None or fig is None:
+            return (0.0, 0.0, 0.0, 0.0)
+        try:
+            renderer = fig.canvas.get_renderer()
+            tight_bbox = cax.get_tightbbox(renderer)
+            axes_bbox = cax.bbox
+            return (
+                max(0.0, float(axes_bbox.x0) - float(tight_bbox.x0)),
+                max(0.0, float(tight_bbox.x1) - float(axes_bbox.x1)),
+                max(0.0, float(axes_bbox.y0) - float(tight_bbox.y0)),
+                max(0.0, float(tight_bbox.y1) - float(axes_bbox.y1)),
+            )
+        except Exception:
+            return (0.0, 0.0, 0.0, 0.0)
+
+    def _prepare_coordinate_grid_layout(self) -> bool:
+        controller = self._sync_coordinate_grid_controller_axes()
+        if controller is None:
+            return False
+        config = self._get_colorbar_config()
+        placement = str(config.get("colorbar_placement", "right") or "right")
+        gap_px = config.get("colorbar_gap_px", 24.0)
+        gap_x_px = config.get("colorbar_gap_x_px", gap_px)
+        gap_y_px = config.get("colorbar_gap_y_px", gap_px)
+        thickness_px = config.get("colorbar_thickness_px", 24.0)
+        (
+            left_decoration,
+            right_decoration,
+            bottom_decoration,
+            top_decoration,
+        ) = self._colorbar_decoration_overhang()
+        controller.update_grid_overlay_label_layout(placement)
+        changed = controller.update_grid_overlay_layout(
+            colorbar_placement=placement,
+            colorbar_gap_x_px=gap_x_px,
+            colorbar_gap_y_px=gap_y_px,
+            colorbar_thickness_px=thickness_px,
+            colorbar_left_decoration_px=left_decoration,
+            colorbar_right_decoration_px=right_decoration,
+            colorbar_bottom_decoration_px=bottom_decoration,
+            colorbar_top_decoration_px=top_decoration,
+        )
+        if changed and getattr(self, "overlay_ax", None) is not None:
+            self.overlay_ax.set_position(self.ax.get_position())
+            self._background = None
+        return bool(changed)
 
     def _apply_colorbar_auto_layout(self, force: bool = False, *, redraw: bool = True) -> bool:
         if not force and not self._is_colorbar_auto_layout_enabled():
@@ -2845,6 +3057,17 @@ class IntegResultWindow(QMainWindow):
         ax = getattr(self, "ax", None)
         if cax is None or ax is None:
             return False
+
+        config = self._get_colorbar_config()
+        placement = str(config.get("colorbar_placement", "right") or "right")
+        align = str(config.get("colorbar_align", "center") or "center")
+        gap_px = config.get("colorbar_gap_px", 24.0)
+        gap_x_px = config.get("colorbar_gap_x_px", gap_px)
+        gap_y_px = config.get("colorbar_gap_y_px", gap_px)
+        thickness_px = config.get("colorbar_thickness_px", 24.0)
+        length_mode = str(config.get("colorbar_length_mode", "ratio") or "ratio")
+        length_value = config.get("colorbar_length_value", 1.0)
+        self._prepare_coordinate_grid_layout()
 
         try:
             ax_bounds = tuple(float(v) for v in ax.get_position().bounds)
@@ -2863,15 +3086,6 @@ class IntegResultWindow(QMainWindow):
         if fig_h_px <= 0.0:
             fig_h_px = 1.0
 
-        config = self._get_colorbar_config()
-        placement = str(config.get("colorbar_placement", "right") or "right")
-        align = str(config.get("colorbar_align", "center") or "center")
-        gap_px = config.get("colorbar_gap_px", 24.0)
-        gap_x_px = config.get("colorbar_gap_x_px", gap_px)
-        gap_y_px = config.get("colorbar_gap_y_px", gap_px)
-        thickness_px = config.get("colorbar_thickness_px", 24.0)
-        length_mode = str(config.get("colorbar_length_mode", "ratio") or "ratio")
-        length_value = config.get("colorbar_length_value", 1.0)
         current_orientation = self._current_colorbar_orientation()
         target_orientation = orientation_for_placement(
             placement,
@@ -2889,6 +3103,66 @@ class IntegResultWindow(QMainWindow):
                 cbar_bounds = tuple(float(v) for v in cax.get_position().bounds)
             except Exception:
                 return False
+
+        controller = getattr(self, "displaymap", None)
+        if bool(getattr(controller, "grid_overlay_active", False)):
+            (
+                _left_decoration,
+                right_decoration,
+                _bottom_decoration,
+                top_decoration,
+            ) = self._colorbar_decoration_overhang()
+            normalized_placement = placement.strip().lower()
+            if normalized_placement == "right":
+                gap_x_px = (
+                    float(gap_x_px)
+                    + float(
+                        getattr(
+                            controller,
+                            "grid_overlay_right_margin_px",
+                            96.0,
+                        )
+                    )
+                )
+            elif normalized_placement == "top":
+                gap_y_px = (
+                    float(gap_y_px)
+                    + float(
+                        getattr(
+                            controller,
+                            "grid_overlay_top_margin_px",
+                            64.0,
+                        )
+                    )
+                )
+            elif normalized_placement == "inside-right":
+                gap_x_px = (
+                    float(gap_x_px)
+                    + max(
+                        float(
+                            getattr(
+                                controller,
+                                "grid_overlay_right_margin_px",
+                                96.0,
+                            )
+                        ),
+                        right_decoration,
+                    )
+                )
+            elif normalized_placement == "inside-top":
+                gap_y_px = (
+                    float(gap_y_px)
+                    + max(
+                        float(
+                            getattr(
+                                controller,
+                                "grid_overlay_top_margin_px",
+                                64.0,
+                            )
+                        ),
+                        top_decoration,
+                    )
+                )
 
         target = compute_colorbar_geometry(
             ax_bounds,
@@ -3500,6 +3774,27 @@ class IntegResultWindow(QMainWindow):
             self.toolbar._subplot_dialog.width_spin.setValue(int(self.window().width()))
             self.toolbar._subplot_dialog.height_spin.setValue(int(self.window().height()))
         self._schedule_colorbar_auto_layout_if_anchor_changed(force=False)
+        if bool(
+            getattr(
+                getattr(self, "displaymap", None),
+                "grid_overlay_active",
+                False,
+            )
+        ):
+            QTimer.singleShot(0, self._refresh_coordinate_grid_layout_after_resize)
+
+    def _refresh_coordinate_grid_layout_after_resize(self):
+        if not bool(
+            getattr(
+                getattr(self, "displaymap", None),
+                "grid_overlay_active",
+                False,
+            )
+        ):
+            return
+        changed = self._prepare_coordinate_grid_layout()
+        if changed and getattr(self, "canvas", None) is not None:
+            self.canvas.draw_idle()
 
     
     def closeEvent(self, event):
@@ -3516,6 +3811,36 @@ class IntegResultWindow(QMainWindow):
             finally:
                 self.cutout_dialog = None
 
+        controller = getattr(self, "displaymap", None)
+        if controller is not None:
+            try:
+                controller.restore_grid_overlay_layout()
+                controller._grid_overlay_cache.clear()
+            except Exception:
+                pass
+            for attr in (
+                "fig",
+                "ax",
+                "overlay_ax",
+                "cax",
+                "colorbar",
+                "im",
+            ):
+                try:
+                    setattr(controller, attr, None)
+                except Exception:
+                    pass
+            self.displaymap = None
+
+        # Clear the marker plane while the figure still owns its artists.
+        # Figure.clear() orphans every child artist it drops, and Matplotlib
+        # then refuses to remove them, so this has to precede the teardown
+        # below.  Releasing the shared panel stays after the owner prunes its
+        # window list, so the panel does not repopulate a stale target.
+        marker_manager = getattr(self, 'marker_manager', None)
+        if marker_manager is not None:
+            marker_manager.clear_plane(self.plane)
+
         # Cleanup canvas and figure
         if self.canvas is not None:
             self.canvas.close()
@@ -3528,21 +3853,30 @@ class IntegResultWindow(QMainWindow):
         
         # Cleanup contour layer
         self._unregister_contour_layer()
-        
-        # Cleanup marker panel
-        marker_panel = getattr(self, 'marker_panel', None)
-        if marker_panel is not None:
-            try:
-                marker_panel.close()
-            except Exception:
-                pass
-            self.marker_panel = None
-        
-        # Clear marker manager plane
-        marker_manager = getattr(self, 'marker_manager', None)
-        if marker_manager is not None:
-            marker_manager.clear_plane(self.plane)
-        
+
+        owner = getattr(self, "fits_viewer", None)
+        if owner is not None:
+            live_refs = []
+            for window_ref in list(getattr(owner, "integ_result_windows", []) or []):
+                try:
+                    window = window_ref() if callable(window_ref) else window_ref
+                except Exception:
+                    window = None
+                if window is None or window is self:
+                    continue
+                live_refs.append(window_ref)
+            owner.integ_result_windows = live_refs
+
+        # The shared marker inspector belongs to the MainWindow family.  If
+        # this result was its target, retarget it safely instead of closing it.
+        try:
+            from takefits.tools.marker_panel import release_marker_viewer
+
+            release_marker_viewer(self)
+        except Exception:
+            pass
+        self.marker_panel = None
+
         super().closeEvent(event)
         try:
             self.destroyed.emit()
@@ -4209,6 +4543,14 @@ class IntegResultWindow(QMainWindow):
                         return
                 except Exception:
                     pass
+
+        try:
+            from takefits.tools.marker_panel import handle_marker_placement_key
+
+            if handle_marker_placement_key(self, event):
+                return
+        except Exception:
+            pass
 
         region_manager = getattr(self, 'region_manager', None)
         if region_manager is not None:

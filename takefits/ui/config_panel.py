@@ -39,11 +39,42 @@ class ConfigPanel(QWidget):
         ("dotted", ":"),
         ("dash-dot", "-."),
     )
+    GRID_LINESTYLE_OPTIONS = (
+        ("Solid", "solid"),
+        ("Dashed", "dashed"),
+        ("Dotted", "dotted"),
+        ("Dash-dot", "dashdot"),
+    )
+    GRID_STYLE_KEYS = frozenset(
+        {
+            "grid_color",
+            "grid_alpha",
+            "grid_linestyle",
+            "grid_linewidth",
+            "grid_overlay_color",
+            "grid_overlay_linestyle",
+            "grid_overlay_label_color",
+            "grid_overlay_show_lines",
+            "grid_overlay_show_ticklabels",
+            "grid_overlay_axislabel_placement",
+            "grid_overlay_longitude_axislabel_pad",
+            "grid_overlay_latitude_axislabel_pad",
+        }
+    )
+    AUTO_COLORBAR_GEOMETRY_KEYS = frozenset(
+        {
+            "cbar_pos_x",
+            "cbar_pos_y",
+            "cbar_width",
+            "cbar_height",
+        }
+    )
 
     def __init__(self, config_manager, fits_viewer):
         super().__init__()
         self.config_manager = config_manager
         self.fits_viewer = fits_viewer
+        self._session_authoritative_updates = {}
         self.initUI()
 
     @staticmethod
@@ -80,6 +111,204 @@ class ConfigPanel(QWidget):
         if index < 0:
             index = 0
         self.click_linestyle_input.setCurrentIndex(index)
+
+    @staticmethod
+    def _normalize_grid_linestyle(value, default="solid"):
+        token = str(value or "").strip().lower()
+        mapping = {
+            "-": "solid",
+            "--": "dashed",
+            ":": "dotted",
+            "-.": "dashdot",
+            "solid": "solid",
+            "dashed": "dashed",
+            "dotted": "dotted",
+            "dashdot": "dashdot",
+            "dash-dot": "dashdot",
+            "dash dot": "dashdot",
+        }
+        return mapping.get(token, default)
+
+    def _create_grid_linestyle_combo(self, value, default="solid"):
+        combo = QComboBox()
+        for label, token in self.GRID_LINESTYLE_OPTIONS:
+            combo.addItem(label, token)
+        self._set_grid_linestyle_combo(combo, value, default)
+        return combo
+
+    def _set_grid_linestyle_combo(self, combo, value, default="solid"):
+        token = self._normalize_grid_linestyle(value, default)
+        index = combo.findData(token)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _grid_linestyle_value(self, combo, default="solid"):
+        return self._normalize_grid_linestyle(
+            combo.currentData() or combo.currentText(),
+            default,
+        )
+
+    def _on_grid_advanced_toggled(self, checked):
+        self.grid_advanced_widget.setVisible(bool(checked))
+        self.grid_advanced_button.setText(
+            "Advanced ▾" if checked else "Advanced ▸"
+        )
+
+    def _on_grid_label_color_policy_changed(self, *_args):
+        is_custom = self.grid_overlay_label_color_policy_input.currentData() == "custom"
+        self.grid_overlay_label_color_input.setEnabled(is_custom)
+
+    def _on_grid_axislabel_gap_mode_changed(self, *_args):
+        is_custom = self.grid_overlay_axislabel_gap_mode_input.currentData() == "custom"
+        self.grid_overlay_longitude_axislabel_pad_input.setEnabled(is_custom)
+        self.grid_overlay_latitude_axislabel_pad_input.setEnabled(is_custom)
+
+    def _load_grid_controls(self, source_config):
+        config = source_config if isinstance(source_config, dict) else {}
+        self.grid_color_input.setCurrentText(
+            str(config.get("grid_color", "white"))
+        )
+        self._set_grid_linestyle_combo(
+            self.grid_linestyle_input,
+            config.get("grid_linestyle", "solid"),
+            "solid",
+        )
+        self.grid_overlay_color_input.setCurrentText(
+            str(config.get("grid_overlay_color", "#00ff66"))
+        )
+        self._set_grid_linestyle_combo(
+            self.grid_overlay_linestyle_input,
+            config.get("grid_overlay_linestyle", "dashed"),
+            "dashed",
+        )
+        placement = str(
+            config.get("grid_overlay_axislabel_placement", "inside")
+            or "inside"
+        ).strip().lower()
+        if placement not in {"outside", "inside", "hidden"}:
+            placement = "inside"
+        placement_index = self.grid_overlay_axislabel_placement_input.findData(
+            placement
+        )
+        self.grid_overlay_axislabel_placement_input.setCurrentIndex(
+            placement_index if placement_index >= 0 else 0
+        )
+
+        self.grid_linewidth_input.setValue(
+            float(config.get("grid_linewidth", 0.5))
+        )
+        self.grid_alpha_input.setValue(float(config.get("grid_alpha", 0.5)))
+        label_color = str(
+            config.get("grid_overlay_label_color", "auto") or "auto"
+        ).strip()
+        normalized_label_color = label_color.lower()
+        if normalized_label_color in {"auto", "same"}:
+            policy = normalized_label_color
+        else:
+            policy = "custom"
+            self.grid_overlay_label_color_input.setCurrentText(label_color)
+        policy_index = self.grid_overlay_label_color_policy_input.findData(
+            policy
+        )
+        self.grid_overlay_label_color_policy_input.setCurrentIndex(
+            policy_index if policy_index >= 0 else 0
+        )
+        if policy != "custom":
+            self.grid_overlay_label_color_input.setCurrentText(
+                str(config.get("grid_overlay_color", "#00ff66"))
+            )
+        self.grid_overlay_show_lines_checkbox.setChecked(
+            bool(config.get("grid_overlay_show_lines", True))
+        )
+        self.grid_overlay_show_ticklabels_checkbox.setChecked(
+            bool(config.get("grid_overlay_show_ticklabels", True))
+        )
+
+        longitude_pad = config.get(
+            "grid_overlay_longitude_axislabel_pad",
+            None,
+        )
+        latitude_pad = config.get(
+            "grid_overlay_latitude_axislabel_pad",
+            None,
+        )
+        gap_mode = (
+            "auto"
+            if longitude_pad is None and latitude_pad is None
+            else "custom"
+        )
+        gap_index = self.grid_overlay_axislabel_gap_mode_input.findData(gap_mode)
+        self.grid_overlay_axislabel_gap_mode_input.setCurrentIndex(
+            gap_index if gap_index >= 0 else 0
+        )
+        if longitude_pad is not None:
+            self.grid_overlay_longitude_axislabel_pad_input.setValue(
+                abs(float(longitude_pad))
+            )
+        if latitude_pad is not None:
+            self.grid_overlay_latitude_axislabel_pad_input.setValue(
+                abs(float(latitude_pad))
+            )
+        self._on_grid_label_color_policy_changed()
+        self._on_grid_axislabel_gap_mode_changed()
+
+    def _grid_config_updates(self):
+        label_policy = (
+            self.grid_overlay_label_color_policy_input.currentData() or "auto"
+        )
+        label_color = (
+            self.grid_overlay_label_color_input.currentText()
+            if label_policy == "custom"
+            else label_policy
+        )
+        custom_gap = (
+            self.grid_overlay_axislabel_gap_mode_input.currentData() == "custom"
+        )
+        return [
+            ("grid_color", self.grid_color_input.currentText()),
+            (
+                "grid_linestyle",
+                self._grid_linestyle_value(
+                    self.grid_linestyle_input,
+                    "solid",
+                ),
+            ),
+            ("grid_overlay_color", self.grid_overlay_color_input.currentText()),
+            (
+                "grid_overlay_linestyle",
+                self._grid_linestyle_value(
+                    self.grid_overlay_linestyle_input,
+                    "dashed",
+                ),
+            ),
+            (
+                "grid_overlay_axislabel_placement",
+                self.grid_overlay_axislabel_placement_input.currentData()
+                or "inside",
+            ),
+            ("grid_linewidth", self.grid_linewidth_input.value()),
+            ("grid_alpha", self.grid_alpha_input.value()),
+            ("grid_overlay_label_color", label_color),
+            (
+                "grid_overlay_show_lines",
+                self.grid_overlay_show_lines_checkbox.isChecked(),
+            ),
+            (
+                "grid_overlay_show_ticklabels",
+                self.grid_overlay_show_ticklabels_checkbox.isChecked(),
+            ),
+            (
+                "grid_overlay_longitude_axislabel_pad",
+                self.grid_overlay_longitude_axislabel_pad_input.value()
+                if custom_gap
+                else None,
+            ),
+            (
+                "grid_overlay_latitude_axislabel_pad",
+                self.grid_overlay_latitude_axislabel_pad_input.value()
+                if custom_gap
+                else None,
+            ),
+        ]
 
     def _is_inside_colorbar_placement(self, value):
         placement = self._normalize_colorbar_placement(value)
@@ -194,6 +423,13 @@ class ConfigPanel(QWidget):
         elif placement == "inside-left":
             self.cbar_tick_y_label_side_combo.setCurrentText("right")
 
+    def _update_colorbar_inside_preset_enabled(self, value=None):
+        if value is None:
+            value = self.cbar_placement_combo.currentText()
+        button = getattr(self, "cbar_inside_preset_button", None)
+        if button is not None:
+            button.setEnabled(self._is_inside_colorbar_placement(value))
+
     def initUI(self):
         layout = QVBoxLayout()
 
@@ -242,6 +478,13 @@ class ConfigPanel(QWidget):
 
         self.setLayout(layout)
         self.setWindowTitle('Configuration Settings')
+        # Compare future Apply operations with the values the form could
+        # actually represent when it opened. This prevents untouched
+        # QDoubleSpinBox rounding (and None-to-empty text normalization) from
+        # turning a grid-only edit into an unrelated full viewer reload.
+        self._form_baseline_values = dict(
+            self._collect_preference_updates()
+        )
 
     def create_general_tab(self):
         """Create the general settings tab."""
@@ -458,6 +701,189 @@ class ConfigPanel(QWidget):
         axis_layout.addWidget(self.axis_bottom_spinbox, 6, 1)
         axis_group.setLayout(axis_layout)
 
+        grid_group = QGroupBox("Coordinate Grid")
+        grid_layout = QGridLayout()
+        self.grid_color_input = self.create_color_combobox(
+            self.config_manager.config.get('grid_color', 'white')
+        )
+        self.grid_color_input.setFixedWidth(100)
+        grid_layout.addWidget(QLabel("Native Line Color:"), 0, 0)
+        grid_layout.addWidget(self.grid_color_input, 0, 1)
+
+        self.grid_linestyle_input = self._create_grid_linestyle_combo(
+            self.config_manager.config.get("grid_linestyle", "solid"),
+            "solid",
+        )
+        self.grid_linestyle_input.setFixedWidth(100)
+        grid_layout.addWidget(QLabel("Native Line Style:"), 1, 0)
+        grid_layout.addWidget(self.grid_linestyle_input, 1, 1)
+
+        self.grid_overlay_color_input = self.create_color_combobox(
+            self.config_manager.config.get('grid_overlay_color', '#00ff66')
+        )
+        self.grid_overlay_color_input.setFixedWidth(100)
+        grid_layout.addWidget(QLabel("Overlay Line Color:"), 2, 0)
+        grid_layout.addWidget(self.grid_overlay_color_input, 2, 1)
+
+        self.grid_overlay_linestyle_input = self._create_grid_linestyle_combo(
+            self.config_manager.config.get(
+                "grid_overlay_linestyle",
+                "dashed",
+            ),
+            "dashed",
+        )
+        self.grid_overlay_linestyle_input.setFixedWidth(100)
+        grid_layout.addWidget(QLabel("Overlay Line Style:"), 3, 0)
+        grid_layout.addWidget(self.grid_overlay_linestyle_input, 3, 1)
+
+        self.grid_overlay_axislabel_placement_input = QComboBox()
+        self.grid_overlay_axislabel_placement_input.addItem("Inside", "inside")
+        self.grid_overlay_axislabel_placement_input.addItem("Outside", "outside")
+        self.grid_overlay_axislabel_placement_input.addItem("Hidden", "hidden")
+        self.grid_overlay_axislabel_placement_input.setFixedWidth(100)
+        grid_layout.addWidget(QLabel("Overlay Axis Titles:"), 4, 0)
+        grid_layout.addWidget(
+            self.grid_overlay_axislabel_placement_input,
+            4,
+            1,
+        )
+
+        self.grid_advanced_button = QPushButton("Advanced ▸")
+        self.grid_advanced_button.setCheckable(True)
+        self.grid_advanced_button.setChecked(False)
+        fit_button_to_text(self.grid_advanced_button, minimum_width=100)
+        grid_layout.addWidget(self.grid_advanced_button, 5, 0, 1, 2)
+
+        self.grid_advanced_widget = QWidget()
+        advanced_layout = QGridLayout()
+        advanced_layout.setContentsMargins(0, 4, 0, 0)
+
+        self.grid_linewidth_input = QDoubleSpinBox()
+        self.grid_linewidth_input.setRange(0.0, 20.0)
+        self.grid_linewidth_input.setDecimals(2)
+        self.grid_linewidth_input.setSingleStep(0.1)
+        self.grid_linewidth_input.setFixedWidth(100)
+        advanced_layout.addWidget(QLabel("Shared Grid Line Width:"), 0, 0)
+        advanced_layout.addWidget(self.grid_linewidth_input, 0, 1)
+
+        self.grid_alpha_input = QDoubleSpinBox()
+        self.grid_alpha_input.setRange(0.0, 1.0)
+        self.grid_alpha_input.setDecimals(2)
+        self.grid_alpha_input.setSingleStep(0.05)
+        self.grid_alpha_input.setFixedWidth(100)
+        advanced_layout.addWidget(QLabel("Shared Grid Line Opacity:"), 1, 0)
+        advanced_layout.addWidget(self.grid_alpha_input, 1, 1)
+
+        self.grid_overlay_label_color_policy_input = QComboBox()
+        self.grid_overlay_label_color_policy_input.addItem("Auto contrast", "auto")
+        self.grid_overlay_label_color_policy_input.addItem("Same as line", "same")
+        self.grid_overlay_label_color_policy_input.addItem("Custom", "custom")
+        self.grid_overlay_label_color_policy_input.setFixedWidth(120)
+        advanced_layout.addWidget(QLabel("Overlay Label Color:"), 2, 0)
+        advanced_layout.addWidget(
+            self.grid_overlay_label_color_policy_input,
+            2,
+            1,
+        )
+
+        self.grid_overlay_label_color_input = self.create_color_combobox(
+            self.config_manager.config.get(
+                "grid_overlay_label_color",
+                self.config_manager.config.get(
+                    "grid_overlay_color",
+                    "#00ff66",
+                ),
+            )
+        )
+        self.grid_overlay_label_color_input.setFixedWidth(120)
+        advanced_layout.addWidget(QLabel("Custom Label Color:"), 3, 0)
+        advanced_layout.addWidget(
+            self.grid_overlay_label_color_input,
+            3,
+            1,
+        )
+
+        self.grid_overlay_show_lines_checkbox = QCheckBox(
+            "Show overlay grid lines"
+        )
+        advanced_layout.addWidget(
+            self.grid_overlay_show_lines_checkbox,
+            4,
+            0,
+            1,
+            2,
+        )
+        self.grid_overlay_show_ticklabels_checkbox = QCheckBox(
+            "Show overlay ticks and numeric labels"
+        )
+        advanced_layout.addWidget(
+            self.grid_overlay_show_ticklabels_checkbox,
+            5,
+            0,
+            1,
+            2,
+        )
+
+        self.grid_overlay_axislabel_gap_mode_input = QComboBox()
+        self.grid_overlay_axislabel_gap_mode_input.addItem("Auto", "auto")
+        self.grid_overlay_axislabel_gap_mode_input.addItem("Custom", "custom")
+        self.grid_overlay_axislabel_gap_mode_input.setFixedWidth(100)
+        advanced_layout.addWidget(QLabel("Axis Title Gap:"), 6, 0)
+        advanced_layout.addWidget(
+            self.grid_overlay_axislabel_gap_mode_input,
+            6,
+            1,
+        )
+
+        self.grid_overlay_longitude_axislabel_pad_input = QDoubleSpinBox()
+        self.grid_overlay_longitude_axislabel_pad_input.setRange(0.0, 30.0)
+        self.grid_overlay_longitude_axislabel_pad_input.setSingleStep(0.5)
+        self.grid_overlay_longitude_axislabel_pad_input.setValue(2.0)
+        self.grid_overlay_longitude_axislabel_pad_input.setFixedWidth(100)
+        self.grid_overlay_longitude_axislabel_pad_input.setToolTip(
+            "Gap for the horizontal (top) overlay-axis title."
+        )
+        advanced_layout.addWidget(QLabel("Top Title Gap:"), 7, 0)
+        advanced_layout.addWidget(
+            self.grid_overlay_longitude_axislabel_pad_input,
+            7,
+            1,
+        )
+
+        self.grid_overlay_latitude_axislabel_pad_input = QDoubleSpinBox()
+        self.grid_overlay_latitude_axislabel_pad_input.setRange(0.0, 30.0)
+        self.grid_overlay_latitude_axislabel_pad_input.setSingleStep(0.5)
+        self.grid_overlay_latitude_axislabel_pad_input.setValue(5.0)
+        self.grid_overlay_latitude_axislabel_pad_input.setFixedWidth(100)
+        self.grid_overlay_latitude_axislabel_pad_input.setToolTip(
+            "Gap for the vertical (right) overlay-axis title."
+        )
+        advanced_layout.addWidget(QLabel("Right Title Gap:"), 8, 0)
+        advanced_layout.addWidget(
+            self.grid_overlay_latitude_axislabel_pad_input,
+            8,
+            1,
+        )
+        advanced_layout.setColumnStretch(0, 1)
+        advanced_layout.setColumnStretch(1, 1)
+        self.grid_advanced_widget.setLayout(advanced_layout)
+        grid_layout.addWidget(self.grid_advanced_widget, 6, 0, 1, 2)
+
+        self.grid_advanced_button.toggled.connect(
+            self._on_grid_advanced_toggled
+        )
+        self.grid_overlay_label_color_policy_input.currentIndexChanged.connect(
+            self._on_grid_label_color_policy_changed
+        )
+        self.grid_overlay_axislabel_gap_mode_input.currentIndexChanged.connect(
+            self._on_grid_axislabel_gap_mode_changed
+        )
+        self._load_grid_controls(self.config_manager.config)
+        self._on_grid_advanced_toggled(False)
+        grid_layout.setColumnStretch(0, 1)
+        grid_layout.setColumnStretch(1, 1)
+        grid_group.setLayout(grid_layout)
+
         beam_group = QGroupBox("Beam")
         beam_layout = QGridLayout()
         self.beam_facecolor_input = self.create_color_combobox(self.config_manager.config.get('beam_facecolor', 'white'))
@@ -493,6 +919,7 @@ class ConfigPanel(QWidget):
 
         page_layout.addWidget(color_group)
         page_layout.addWidget(axis_group)
+        page_layout.addWidget(grid_group)
         page_layout.addWidget(beam_group)
         page_layout.addStretch(1)
 
@@ -919,6 +1346,20 @@ class ConfigPanel(QWidget):
         auto_layout.addWidget(self.cbar_placement_combo, auto_row, 1)
         auto_row += 1
 
+        self.cbar_inside_preset_button = QPushButton("Apply inside preset")
+        self.cbar_inside_preset_button.setToolTip(
+            "Apply TakeFits' compact, high-contrast defaults for an inside colorbar."
+        )
+        fit_button_to_text(self.cbar_inside_preset_button, minimum_width=120)
+        auto_layout.addWidget(
+            self.cbar_inside_preset_button,
+            auto_row,
+            0,
+            1,
+            2,
+        )
+        auto_row += 1
+
         self.cbar_align_label = QLabel("Align:")
         self.cbar_align_combo = QComboBox()
         self.cbar_align_combo.addItems(["center", "start", "end"])
@@ -1166,11 +1607,20 @@ class ConfigPanel(QWidget):
         tick_layout.setColumnStretch(1, 1)
         tick_group.setLayout(tick_layout)
 
-        self.cbar_placement_combo.currentTextChanged.connect(self._on_colorbar_placement_changed)
+        self.cbar_placement_combo.currentTextChanged.connect(
+            self._update_colorbar_inside_preset_enabled
+        )
+        self.cbar_inside_preset_button.clicked.connect(
+            lambda: self._on_colorbar_placement_changed(
+                self.cbar_placement_combo.currentText()
+            )
+        )
         self.cbar_fit_now_button.clicked.connect(self._fit_colorbar_now)
         self.cbar_auto_layout_checkbox.toggled.connect(self._on_colorbar_auto_layout_toggled)
         self._on_colorbar_auto_layout_toggled(self.cbar_auto_layout_checkbox.isChecked())
-        self._on_colorbar_placement_changed(self.cbar_placement_combo.currentText())
+        self._update_colorbar_inside_preset_enabled(
+            self.cbar_placement_combo.currentText()
+        )
 
         page_layout.addWidget(auto_group)
         page_layout.addWidget(self.cbar_manual_group)
@@ -1239,6 +1689,48 @@ class ConfigPanel(QWidget):
         else:
             self.sexagesimal_radio.setChecked(True)
 
+    def sync_colorbar_geometry(self, pos_x, pos_y, width, height):
+        """Mirror live colorbar geometry without making Preferences dirty."""
+        values = {
+            "cbar_pos_x": float(pos_x),
+            "cbar_pos_y": float(pos_y),
+            "cbar_width": float(width),
+            "cbar_height": float(height),
+        }
+        widgets = {
+            "cbar_pos_x": self.cbar_x_input,
+            "cbar_pos_y": self.cbar_y_input,
+            "cbar_width": self.cbar_width_input,
+            "cbar_height": self.cbar_height_input,
+        }
+        for key, value in values.items():
+            widgets[key].setValue(value)
+        represented_values = {
+            key: widget.value()
+            for key, widget in widgets.items()
+        }
+        baseline = getattr(self, "_form_baseline_values", None)
+        if isinstance(baseline, dict):
+            baseline.update(represented_values)
+        session_updates = getattr(
+            self,
+            "_session_authoritative_updates",
+            None,
+        )
+        if isinstance(session_updates, dict):
+            if bool(
+                self.config_manager.config.get(
+                    "colorbar_auto_layout",
+                    True,
+                )
+            ):
+                for key in values:
+                    session_updates.pop(key, None)
+            else:
+                for key, value in values.items():
+                    if key in session_updates:
+                        session_updates[key] = value
+
     def _on_auto_precision_toggled(self, enabled: bool):
         """When auto precision is enabled, manual precision digits are read-only."""
         self.number_decimals_input.setEnabled(not bool(enabled))
@@ -1260,6 +1752,147 @@ class ConfigPanel(QWidget):
         self.config_manager.config[key] = value
         changed_keys.add(key)
 
+    def _preference_roots(self):
+        roots = [self.fits_viewer]
+        try:
+            from takefits.ui.window_registry import WindowRegistry
+
+            roots.extend(WindowRegistry.instance().windows())
+        except Exception:
+            pass
+        deduped = []
+        seen = set()
+        for root in roots:
+            if root is None or id(root) in seen:
+                continue
+            seen.add(id(root))
+            if getattr(root, "config_manager", None) is None:
+                continue
+            deduped.append(root)
+        return deduped
+
+    def _validate_grid_colors(self):
+        candidates = [
+            ("Native line color", self.grid_color_input.currentText()),
+            ("Overlay line color", self.grid_overlay_color_input.currentText()),
+        ]
+        if (
+            self.grid_overlay_label_color_policy_input.currentData()
+            == "custom"
+        ):
+            candidates.append(
+                (
+                    "Overlay label color",
+                    self.grid_overlay_label_color_input.currentText(),
+                )
+            )
+        invalid = [
+            label
+            for label, color in candidates
+            if str(color).strip().lower() == "none"
+            or not mpl.colors.is_color_like(color)
+        ]
+        if not invalid:
+            return True
+        QMessageBox.critical(
+            self,
+            "Invalid Grid Color",
+            "Please enter a valid Matplotlib color for: "
+            + ", ".join(invalid),
+        )
+        return False
+
+    def _propagate_preference_updates(self, updates, roots):
+        """Copy the form values to every registered top-level config."""
+        changed_keys = set()
+        for root in roots:
+            manager = getattr(root, "config_manager", None)
+            config = getattr(manager, "config", None)
+            if not isinstance(config, dict):
+                continue
+            for key, value in updates:
+                current = config.get(key)
+                if self._values_equivalent(current, value):
+                    continue
+                config[key] = value
+                changed_keys.add(key)
+        return changed_keys
+
+    def _apply_grid_preferences_to_roots(self, roots):
+        failed = []
+        for root in roots:
+            refresh = getattr(
+                root,
+                "refresh_coordinate_grid_preferences",
+                None,
+            )
+            if callable(refresh):
+                try:
+                    if refresh() is False:
+                        failed.append(root)
+                except Exception:
+                    failed.append(root)
+        if not failed:
+            return True
+        QMessageBox.critical(
+            self,
+            "Coordinate Grid Error",
+            "The grid style could not be refreshed in one or more open "
+            "FITS windows. The settings were kept so Apply can be retried.",
+        )
+        return False
+
+    def _apply_full_preferences_to_roots(self, roots, updated_keys):
+        coordinate_keys = {
+            "decimal",
+            "auto_precision_digits",
+            "number_decimals",
+            "coord_wrap",
+        }
+        geometry_keys = {
+            "figure_pos_x",
+            "figure_pos_y",
+            "figure_width",
+            "figure_height",
+        }
+        coordinate_changed = bool(updated_keys.intersection(coordinate_keys))
+        geometry_changed = bool(updated_keys.intersection(geometry_keys))
+        decimal = bool(self.config_manager.config.get("decimal", True))
+        first_error = None
+        for root in roots:
+            # reload_viewer() historically reapplies the configured geometry.
+            # With application-wide Preferences that would move every open FITS
+            # window onto the same rectangle even for a Decimal/Ticks edit.
+            # Only an explicit geometry edit may move/resize a live window,
+            # and it applies to the FITS root that owns this panel. Other roots
+            # retain their current independent layouts.
+            apply_geometry = (
+                root is self.fits_viewer and geometry_changed
+            )
+            if coordinate_changed:
+                set_decimal = getattr(root, "set_wcs_decimal_mode", None)
+                if callable(set_decimal):
+                    try:
+                        set_decimal(decimal, refresh=False)
+                    except TypeError:
+                        set_decimal(decimal)
+            try:
+                root.reload_viewer(apply_geometry=apply_geometry)
+            except ValueError as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            msg_box = QMessageBox()
+            msg_box.setIcon(QMessageBox.Icon.Critical)
+            msg_box.setText(
+                "Error: Invalid config parameter(s) detected.\n"
+                f"Details: {first_error}"
+            )
+            msg_box.setWindowTitle("Parameter Error")
+            msg_box.exec()
+            return False
+        return True
+
     def keyPressEvent(self, event):
         """Allow pressing Enter/Return anywhere in the panel to trigger Apply."""
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -1268,10 +1901,8 @@ class ConfigPanel(QWidget):
             return
         super().keyPressEvent(event)
 
-    def apply_changes(self):
-        """Apply the changes to all open FITS viewers."""
-        updated_keys = set()
-
+    def _collect_preference_updates(self):
+        """Return normalized values currently represented by the form."""
         updates = [
             # General settings
             ('colorscale', self.colorscale_input.currentText()),
@@ -1384,38 +2015,60 @@ class ConfigPanel(QWidget):
             # ('pos_chlabel_h', self.pos_chlabel_h_input.value()),
         ]
 
+        updates.extend(self._grid_config_updates())
         updates.extend(self._read_colorbar_tick_side_values().items())
+        return updates
+
+    def apply_changes(self):
+        """Apply user-edited preferences to all open FITS viewers."""
+        if not self._validate_grid_colors():
+            return False
+
+        all_updates = self._collect_preference_updates()
+        baseline = getattr(self, "_form_baseline_values", {})
+        updates = [
+            (key, value)
+            for key, value in all_updates
+            if key not in baseline
+            or not self._values_equivalent(baseline.get(key), value)
+        ]
+        updated_keys = set()
 
         for key, value in updates:
             self._update_config_value(key, value, updated_keys)
+            self._session_authoritative_updates[key] = copy.deepcopy(
+                self.config_manager.config.get(key, value)
+            )
 
+        roots = self._preference_roots()
+        # The panel may outlive the moment when another FITS root is opened.
+        # Reapply only values explicitly changed during this panel session so
+        # late roots catch up without treating per-window auto-layout geometry
+        # as a global preference edit.
+        source_updates = [
+            (key, copy.deepcopy(value))
+            for key, value in self._session_authoritative_updates.items()
+        ]
+        updated_keys.update(
+            self._propagate_preference_updates(source_updates, roots)
+        )
         if not updated_keys:
-            return
+            return True
 
-        if updated_keys.intersection({'decimal', 'auto_precision_digits', 'number_decimals', 'coord_wrap'}):
-            self.fits_viewer.refresh_coordinate_format()
-            refresh_strings = getattr(self.fits_viewer, "_refresh_wcs_display_strings", None)
-            if callable(refresh_strings):
-                try:
-                    refresh_strings()
-                except Exception:
-                    pass
-
-        # Apply the changes to all currently open FITS viewers
-        try:
-            self.fits_viewer.reload_viewer()
-        except ValueError as e:
-            msg_box = QMessageBox()
-            msg_box.setIcon(QMessageBox.Icon.Critical)
-            msg_box.setText(f"Error: Invalid config parameter(s) detected.\nDetails: {e}")
-            msg_box.setWindowTitle("Parameter Error")
-            msg_box.exec()
+        if updated_keys.issubset(self.GRID_STYLE_KEYS):
+            applied = self._apply_grid_preferences_to_roots(roots)
+            if applied:
+                self._form_baseline_values = dict(all_updates)
+            return applied
+        applied = self._apply_full_preferences_to_roots(roots, updated_keys)
+        if applied:
+            self._form_baseline_values = dict(all_updates)
+        return applied
         
 
 
 
     def save_config(self):
-        self.apply_changes()
         """Save the current config to the config.yaml file."""
         if os.path.exists(self.config_manager.config_file):
             reply = QMessageBox.question(self, 'Overwrite Confirmation',
@@ -1424,10 +2077,31 @@ class ConfigPanel(QWidget):
                                         QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.No:
                 return
+        if not self.apply_changes():
+            return
         try:
-            with open(self.config_manager.config_file, 'w') as f:
+            with open(self.config_manager.config_file, 'w', encoding='utf-8') as f:
                 yaml.safe_dump(self.config_manager.config, f, default_flow_style=False, sort_keys=False)
-            self.config_manager.config_bu = copy.deepcopy(self.config_manager.config)
+            saved_path = os.path.abspath(self.config_manager.config_file)
+            managers = [self.config_manager]
+            managers.extend(
+                getattr(root, "config_manager", None)
+                for root in self._preference_roots()
+            )
+            seen = set()
+            for manager in managers:
+                if manager is None or id(manager) in seen:
+                    continue
+                seen.add(id(manager))
+                manager_path = os.path.abspath(
+                    getattr(manager, "config_file", "")
+                )
+                if manager_path != saved_path:
+                    continue
+                manager.config_bu = copy.deepcopy(
+                    self.config_manager.config
+                )
+            self._session_authoritative_updates.clear()
             QMessageBox.information(self, 'Success', 'Configuration saved successfully.')
         except Exception as e:
             QMessageBox.critical(self, 'Error', f'Failed to save configuration: {str(e)}')
@@ -1476,6 +2150,7 @@ class ConfigPanel(QWidget):
         self.axislabel_fontsize_input.setValue(self.config_manager.config_bu.get('axislabel_fontsize'))
         self.axislabel_fontfamily_input.setCurrentText(self.config_manager.config_bu.get('axislabel_fontfamily'))
         self.axislabel_color_input.setCurrentText(self.config_manager.config_bu.get('axislabel_color'))
+        self._load_grid_controls(self.config_manager.config_bu)
         
         # Axis positions
         self.axis_left_spinbox.setValue(self.config_manager.config_bu.get('ax_pos_l'))
@@ -1526,7 +2201,9 @@ class ConfigPanel(QWidget):
         self.cbar_tick_label_color_input.setCurrentText(self.config_manager.config_bu.get('colorbar_tick_labelcolor'))
         self._load_colorbar_tick_side_comboboxes(self.config_manager.config_bu)
         self._on_colorbar_auto_layout_toggled(self.cbar_auto_layout_checkbox.isChecked())
-        self._on_colorbar_placement_changed(self.cbar_placement_combo.currentText())
+        self._update_colorbar_inside_preset_enabled(
+            self.cbar_placement_combo.currentText()
+        )
         
         # Ticks settings
         self.tick_labelsize_input.setValue(self.config_manager.config_bu.get('tick_labelsize'))
@@ -1612,6 +2289,7 @@ class ConfigPanel(QWidget):
         self.axislabel_fontsize_input.setValue(self.config_manager.default_config.get('axislabel_fontsize'))
         self.axislabel_fontfamily_input.setCurrentText(self.config_manager.default_config.get('axislabel_fontfamily'))
         self.axislabel_color_input.setCurrentText(self.config_manager.default_config.get('axislabel_color'))
+        self._load_grid_controls(self.config_manager.default_config)
         
         # Axis positions
         self.axis_left_spinbox.setValue(self.config_manager.default_config.get('ax_pos_l'))
@@ -1662,7 +2340,9 @@ class ConfigPanel(QWidget):
         self.cbar_tick_label_color_input.setCurrentText(self.config_manager.default_config.get('colorbar_tick_labelcolor'))
         self._load_colorbar_tick_side_comboboxes(self.config_manager.default_config)
         self._on_colorbar_auto_layout_toggled(self.cbar_auto_layout_checkbox.isChecked())
-        self._on_colorbar_placement_changed(self.cbar_placement_combo.currentText())
+        self._update_colorbar_inside_preset_enabled(
+            self.cbar_placement_combo.currentText()
+        )
         
         
         # Ticks settings

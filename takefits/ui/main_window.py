@@ -114,7 +114,14 @@ class MainWindow(FITSViewer):
         self.filename = os.path.basename(filename)
 
         self.menu_bar = MenuBar(self) #Make menubar
-    
+        # Coordinate grid (TF-404): window-level toggle, seeded from config and
+        # applied to every plane (XY + XZ/ZY subwindows).
+        self.coordinate_grid_visible = bool(getattr(self, 'grid_visible', False))
+        self.coordinate_grid_keep_native = bool(
+            getattr(getattr(self, 'displaymap', None), 'grid_keep_native', True)
+        )
+        self.menu_bar.refresh_coordinate_grid_action()
+
         self.region_mode_enabled = False
         self.region_shape = None
 
@@ -210,6 +217,9 @@ class MainWindow(FITSViewer):
             filepath=filename,
             spectral_metadata=spectral_metadata or {},
         )
+        self.app_state.display_grid = self.get_coordinate_grid_visible()
+        self.app_state.display_grid_frame = self.get_wcs_display_frame()
+        self.app_state.display_grid_keep_native = self.get_coordinate_grid_keep_native()
         self.report_large_data_mode()
         # Keep app_state in sync with viewer position changes
         self.position_updated.connect(lambda x, y, z: self.sync_app_state())
@@ -339,6 +349,12 @@ class MainWindow(FITSViewer):
         self.subwindow1.ax.set_ylim(*z_limits)
         self.subwindow1.overlay_ax.set_position(self.subwindow1.ax.get_position())
         self._sync_color_to_subwindow(self.subwindow1)
+        # Mirror the window's coordinate-grid state into the new subwindow (TF-404).
+        self.subwindow1.apply_coordinate_grid(
+            self.get_coordinate_grid_visible(),
+            frame=self.get_wcs_display_frame(),
+            keep_native=self.get_coordinate_grid_keep_native(),
+        )
         self.subwindow1.canvas.draw_idle()
         self.update_ranges('xz', x_limits, z_limits)
 
@@ -397,6 +413,12 @@ class MainWindow(FITSViewer):
         self.subwindow2.ax.set_ylim(*y_limits)
         self.subwindow2.overlay_ax.set_position(self.subwindow2.ax.get_position())
         self._sync_color_to_subwindow(self.subwindow2)
+        # Mirror the window's coordinate-grid state into the new subwindow (TF-404).
+        self.subwindow2.apply_coordinate_grid(
+            self.get_coordinate_grid_visible(),
+            frame=self.get_wcs_display_frame(),
+            keep_native=self.get_coordinate_grid_keep_native(),
+        )
         self.subwindow2.canvas.draw_idle()
         self.update_ranges('zy', z_limits, y_limits)
 
@@ -598,12 +620,19 @@ class MainWindow(FITSViewer):
             ("range_panel", "Range Control"),
             ("magnifier_panel", "Magnifier"),
             ("header_panel", "Header"),
-            ("marker_panel", "Markers"),
         ):
             panel = getattr(self, attr, None)
             if panel is None:
                 continue
             self._set_window_title_if_changed(panel, self._identity_title(prefix, label, basename))
+
+        marker_panel = getattr(self, "marker_panel", None)
+        marker_title_refresher = getattr(marker_panel, "refresh_context_labels", None)
+        if callable(marker_title_refresher):
+            try:
+                marker_title_refresher()
+            except Exception:
+                pass
 
         # Integration result windows belong to this FITS too; let them re-stamp
         # their own (descriptive) titles so they show the owner and renumber.
@@ -623,10 +652,11 @@ class MainWindow(FITSViewer):
             self._suppress_owner_raise_until = 0.0
 
     def _bring_owner_window_to_front(self, activated_widget=None):
-        """Raise this FITS's main window when one of its panels is activated.
+        """Raise the image window currently driven by an activated panel.
 
         The activated panel is re-raised afterwards so it stays on top of its
-        own main window and remains usable; only *other* FITS windows recede.
+        target and remains usable.  The shared Marker Panel may target an
+        Integ or Channel Map, in which case MainWindow must not jump forward.
         """
         if getattr(self, "_is_app_closing", False):
             return
@@ -635,21 +665,33 @@ class MainWindow(FITSViewer):
                 return
         except Exception:
             pass
-        try:
-            if not self.isVisible() or self.isMinimized():
-                return
-        except Exception:
-            return
-        try:
-            self.raise_()
-        except Exception:
-            pass
-        # Keep the panel the user just touched above its main window.
         panel = activated_widget
         try:
             if isinstance(panel, QWidget) and not panel.isWindow():
                 panel = panel.window()
-            if panel is not None and panel is not self:
+        except Exception:
+            panel = activated_widget
+
+        owner = self
+        if panel is getattr(self, "marker_panel", None):
+            owner_getter = getattr(panel, "owner_window_for_activation", None)
+            if callable(owner_getter):
+                try:
+                    owner = owner_getter() or self
+                except Exception:
+                    owner = self
+        try:
+            if not owner.isVisible() or owner.isMinimized():
+                return
+        except Exception:
+            return
+        try:
+            owner.raise_()
+        except Exception:
+            pass
+        # Keep the panel the user just touched above the selected image window.
+        try:
+            if panel is not None and panel is not owner:
                 panel.raise_()
         except Exception:
             pass
@@ -936,6 +978,13 @@ class MainWindow(FITSViewer):
         session = getattr(active_window, "action_session", None)
         undo_fn = getattr(active_window, "undo_last_action", None)
         redo_fn = getattr(active_window, "redo_last_action", None)
+        if (
+            active_window is getattr(self, "marker_panel", None)
+            and session is not None
+            and callable(undo_fn)
+            and callable(redo_fn)
+        ):
+            return active_window
         if session is not None and callable(undo_fn) and callable(redo_fn):
             try:
                 has_history = bool(session.can_undo() or session.can_redo())
@@ -1618,7 +1667,6 @@ class MainWindow(FITSViewer):
             integration_key_counts[raw_key] = occurrence + 1
             key = f"{raw_key}::{occurrence}"
             _add(f"integration:{key}", window)
-            _add(f"integration_marker:{key}", getattr(window, "marker_panel", None))
 
         channel_key_counts = {}
         for idx, window in enumerate(list(getattr(self, "channel_map_windows", []) or [])):
@@ -1629,7 +1677,6 @@ class MainWindow(FITSViewer):
             channel_key_counts[raw_key] = occurrence + 1
             key = f"{raw_key}::{occurrence}"
             _add(f"channel:{key}", window)
-            _add(f"channel_marker:{key}", getattr(window, "marker_panel", None))
 
         return windows
 
@@ -1670,11 +1717,9 @@ class MainWindow(FITSViewer):
             opener = getattr(window, "open_marker_panel", None)
             if callable(opener):
                 try:
-                    opener()
+                    panel = opener()
                 except Exception:
                     panel = None
-                else:
-                    panel = getattr(window, "marker_panel", None)
         elif should_show and panel is not None:
             try:
                 panel.show()
@@ -1694,7 +1739,7 @@ class MainWindow(FITSViewer):
                 panel.activateWindow()
             except Exception:
                 pass
-        else:
+        elif panel is getattr(window, "marker_panel", None):
             try:
                 panel.hide()
             except Exception:
@@ -2704,6 +2749,31 @@ class MainWindow(FITSViewer):
                     # Catch panels created elsewhere (e.g. markers) and keep the
                     # "FITS N" identity on their titles up to date.
                     self.refresh_fits_identity_labels()
+                if event_type == QEvent.Type.WindowActivate and (
+                    token == "main_window"
+                    or token.startswith("subwindow:")
+                    or token.startswith("integration:")
+                    or token.startswith("channel:")
+                ):
+                    target_window = _obj
+                    if isinstance(target_window, QWidget):
+                        try:
+                            target_window = (
+                                target_window
+                                if target_window.isWindow()
+                                else target_window.window()
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        from takefits.tools.marker_panel import notify_marker_viewer_activated
+
+                        notify_marker_viewer_activated(
+                            target_window,
+                            plane=getattr(target_window, "plane", None),
+                        )
+                    except Exception:
+                        pass
                 # Activating one of this FITS's panels brings the owning main
                 # window forward so the user sees the image the panel drives
                 # (the panel itself is kept on top so it stays usable).
@@ -3428,6 +3498,12 @@ class MainWindow(FITSViewer):
                     format_pix.decimal = decimal
             except Exception:
                 pass
+            refresh_format = getattr(window, "refresh_coordinate_format", None)
+            if callable(refresh_format):
+                try:
+                    refresh_format(redraw=False)
+                except Exception:
+                    pass
         for window in list(getattr(self, "channel_map_windows", []) or []):
             if window is None:
                 continue
@@ -3447,6 +3523,29 @@ class MainWindow(FITSViewer):
                 menu_bar.set_wcs_decimal_checked(decimal)
             except Exception:
                 pass
+        # Preferences is application-wide and may have been opened from a
+        # different registered FITS window. Keep its coordinate-format radio
+        # buttons synchronized with the WCS menu without creating a second
+        # panel or changing any other pending widget values.
+        preference_roots = [self]
+        try:
+            preference_roots.extend(WindowRegistry.instance().windows())
+        except Exception:
+            pass
+        seen_roots = set()
+        for root in preference_roots:
+            if root is None or id(root) in seen_roots:
+                continue
+            seen_roots.add(id(root))
+            panel = getattr(getattr(root, "menu_bar", None), "config_panel", None)
+            if panel is None:
+                continue
+            setter = getattr(panel, "set_coordinate_format", None)
+            if callable(setter):
+                try:
+                    setter(decimal)
+                except Exception:
+                    pass
         if refresh:
             try:
                 self.refresh_coordinate_format()
@@ -3652,6 +3751,14 @@ class MainWindow(FITSViewer):
             range_snapshot = self._snapshot_wcs_range_inputs()
             self._refresh_wcs_display_strings()
             self._restore_wcs_range_inputs(range_snapshot)
+        # TF-407: the XY grid follows the same frame as the coordinate read-out.
+        # Reapply even for deferred/same-frame calls so config-enabled grids and
+        # newly-created viewers cannot retain an older overlay.
+        self.set_coordinate_grid(
+            self.get_coordinate_grid_visible(),
+            frame=normalized,
+            keep_native=self.get_coordinate_grid_keep_native(),
+        )
 
     def _capture_view_limits(self) -> dict:
         payload = {}
@@ -4430,6 +4537,13 @@ class MainWindow(FITSViewer):
             "marker_panel_visible": bool(getattr(self, "marker_panel", None) and self.marker_panel.isVisible()),
             "regrid_panel_visible": bool(getattr(self, "_regrid_panel", None) and self._regrid_panel.isVisible()),
         }
+        marker_panel = getattr(self, "marker_panel", None)
+        marker_state_getter = getattr(marker_panel, "export_workspace_state", None)
+        if callable(marker_state_getter):
+            try:
+                panel_state["marker_inspector"] = marker_state_getter()
+            except Exception:
+                pass
 
         if self.data.ndim > 2:
             panel_state["subwindows"] = {
@@ -6529,6 +6643,8 @@ class MainWindow(FITSViewer):
                 "colorbar_state": self._capture_workspace_colorbar_state(),
                 "annotation_state": self._capture_workspace_annotation_state(),
                 "window_sync": self._capture_window_sync_state(),
+                "coordinate_grid": self._capture_coordinate_grid_state(),
+                "coordinate_grid_keep_native": self._capture_coordinate_grid_keep_native_state(),
             },
         }
 
@@ -6554,6 +6670,151 @@ class MainWindow(FITSViewer):
                 refresh()
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # Coordinate grid overlay (TF-404 / TF-407)
+    # ------------------------------------------------------------------
+    def _coordinate_grid_targets(self):
+        """All plane viewers in this window that should mirror the grid state."""
+        targets = [self]
+        for attr in ("subwindow1", "subwindow2"):
+            sub = getattr(self, attr, None)
+            if sub is not None:
+                targets.append(sub)
+        targets.extend(self._live_integration_windows())
+        deduped = []
+        seen = set()
+        for target in targets:
+            marker = id(target)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            deduped.append(target)
+        return deduped
+
+    def get_coordinate_grid_visible(self) -> bool:
+        return bool(getattr(self, "coordinate_grid_visible", getattr(self, "grid_visible", False)))
+
+    def get_coordinate_grid_keep_native(self) -> bool:
+        dm = getattr(self, "displaymap", None)
+        fallback = bool(getattr(dm, "grid_keep_native", True))
+        return bool(getattr(self, "coordinate_grid_keep_native", fallback))
+
+    def refresh_coordinate_grid_preferences(self) -> bool:
+        """Restyle this FITS family without replacing its live grid state."""
+        visible = self.get_coordinate_grid_visible()
+        frame = self.get_wcs_display_frame()
+        keep_native = self.get_coordinate_grid_keep_native()
+        self.set_coordinate_grid(
+            visible,
+            frame=frame,
+            keep_native=keep_native,
+        )
+        return not bool(getattr(self, "coordinate_grid_apply_failures", ()))
+
+    def _sync_coordinate_grid_app_state(
+        self,
+        *,
+        visible: bool,
+        frame: str,
+        keep_native: bool,
+    ):
+        states = []
+        for candidate in (
+            getattr(self, "app_state", None),
+            getattr(getattr(self, "action_session", None), "state", None),
+        ):
+            if candidate is None or any(candidate is existing for existing in states):
+                continue
+            states.append(candidate)
+        for state in states:
+            state.display_grid = bool(visible)
+            state.display_grid_frame = normalize_display_frame(frame)
+            state.display_grid_keep_native = bool(keep_native)
+
+    def set_coordinate_grid(
+        self,
+        visible: bool,
+        *,
+        frame: str = None,
+        keep_native: bool = None,
+    ) -> bool:
+        """Configure the WCS grid consistently across GUI and headless state."""
+        visible = bool(visible)
+        target_frame = normalize_display_frame(
+            self.get_wcs_display_frame() if frame is None else frame
+        )
+        if keep_native is None:
+            keep_native = self.get_coordinate_grid_keep_native()
+        keep_native = bool(keep_native)
+
+        self.coordinate_grid_visible = visible
+        self.coordinate_grid_keep_native = keep_native
+        self._sync_coordinate_grid_app_state(
+            visible=visible,
+            frame=target_frame,
+            keep_native=keep_native,
+        )
+        failures = []
+        for viewer in self._coordinate_grid_targets():
+            applier = getattr(viewer, "apply_coordinate_grid", None)
+            if callable(applier):
+                try:
+                    applied = applier(
+                        visible,
+                        frame=target_frame,
+                        keep_native=keep_native,
+                    )
+                except Exception:
+                    applied = False
+                if not applied and getattr(viewer, "wcs", None) is not None:
+                    failures.append(str(getattr(viewer, "plane", "?")))
+        self.coordinate_grid_apply_failures = tuple(failures)
+        menu_bar = getattr(self, "menu_bar", None)
+        refresh = getattr(menu_bar, "refresh_coordinate_grid_action", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
+        return visible
+
+    def set_coordinate_grid_keep_native(self, keep_native: bool) -> bool:
+        keep_native = bool(keep_native)
+        self.set_coordinate_grid(
+            self.get_coordinate_grid_visible(),
+            frame=self.get_wcs_display_frame(),
+            keep_native=keep_native,
+        )
+        return keep_native
+
+    def _capture_coordinate_grid_state(self) -> bool:
+        return self.get_coordinate_grid_visible()
+
+    def _capture_coordinate_grid_keep_native_state(self) -> bool:
+        return self.get_coordinate_grid_keep_native()
+
+    def _restore_coordinate_grid_state(self, payload, keep_native_payload=None):
+        if payload is None:
+            return
+        if isinstance(payload, dict):
+            keep_native_payload = payload.get("keep_native", keep_native_payload)
+            payload = payload.get("visible")
+        if payload is None:
+            return
+        keep_native = (
+            self.get_coordinate_grid_keep_native()
+            if keep_native_payload is None
+            else bool(keep_native_payload)
+        )
+        try:
+            self.set_coordinate_grid(
+                bool(payload),
+                frame=self.get_wcs_display_frame(),
+                keep_native=keep_native,
+            )
+        except Exception:
+            return
 
     def _log_workspace_restore_diagnostics(self, diagnostics: dict):
         if not isinstance(diagnostics, dict):
@@ -6647,9 +6908,16 @@ class MainWindow(FITSViewer):
             open_marker = getattr(self, "open_marker_panel", None)
             if callable(open_marker):
                 try:
-                    open_marker()
+                    marker_panel = open_marker()
                 except Exception:
-                    pass
+                    marker_panel = None
+                marker_state = panel_state.get("marker_inspector")
+                restore_marker = getattr(marker_panel, "restore_workspace_state", None)
+                if callable(restore_marker) and isinstance(marker_state, dict):
+                    try:
+                        restore_marker(marker_state)
+                    except Exception:
+                        pass
         if bool(panel_state.get("regrid_panel_visible")):
             open_regrid = getattr(self, "open_regrid_panel", None)
             if callable(open_regrid):
@@ -7179,7 +7447,13 @@ class MainWindow(FITSViewer):
         self._flush_pending_annotation_commits()
         try:
             self.action_session.load_history(path, replay=True, replace=True)
-            self._apply_action_session_state_to_viewers()
+            apply_grid_state = any(
+                str(getattr(record, "action", "") or "") == "set_coordinate_grid"
+                for record in self.action_session.history
+            )
+            self._apply_action_session_state_to_viewers(
+                apply_coordinate_grid_state=apply_grid_state,
+            )
             restored = self._restore_analysis_windows_from_history()
             self._resync_analysis_windows_after_restore()
             QMessageBox.information(
@@ -7314,6 +7588,15 @@ class MainWindow(FITSViewer):
             )
             restored_ui_widgets = self._restore_workspace_ui_state(workspace_state.get("ui_state"))
             self._restore_window_sync_state(workspace_state.get("window_sync"))
+            # Workspace display state is authoritative over any visual actions
+            # found in the replayed recipe history. The sibling key preserves
+            # the legacy boolean ``coordinate_grid`` payload unchanged.
+            if isinstance(saved_display_frame, str):
+                self.set_wcs_display_frame(saved_display_frame, refresh=False)
+            self._restore_coordinate_grid_state(
+                workspace_state.get("coordinate_grid"),
+                workspace_state.get("coordinate_grid_keep_native"),
+            )
             restored_view = False
             restored_world = False
             restore_mode = compute_range_restore_mode(
@@ -7568,8 +7851,17 @@ class MainWindow(FITSViewer):
             self._refresh_undo_redo_actions()
             return
         try:
+            cursor_before = int(session.cursor)
             session.undo()
-            self._apply_action_session_state_to_viewers(preferred_cursor=preserve_cursor)
+            crossed_records = session.history[int(session.cursor) : cursor_before]
+            apply_grid_state = any(
+                str(getattr(record, "action", "") or "") == "set_coordinate_grid"
+                for record in crossed_records
+            )
+            self._apply_action_session_state_to_viewers(
+                preferred_cursor=preserve_cursor,
+                apply_coordinate_grid_state=apply_grid_state,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "Undo", f"Failed to undo action: {exc}")
         finally:
@@ -7602,8 +7894,17 @@ class MainWindow(FITSViewer):
             self._refresh_undo_redo_actions()
             return
         try:
+            cursor_before = int(session.cursor)
             session.redo()
-            self._apply_action_session_state_to_viewers(preferred_cursor=preserve_cursor)
+            crossed_records = session.history[cursor_before : int(session.cursor)]
+            apply_grid_state = any(
+                str(getattr(record, "action", "") or "") == "set_coordinate_grid"
+                for record in crossed_records
+            )
+            self._apply_action_session_state_to_viewers(
+                preferred_cursor=preserve_cursor,
+                apply_coordinate_grid_state=apply_grid_state,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "Redo", f"Failed to redo action: {exc}")
         finally:
@@ -7751,7 +8052,12 @@ class MainWindow(FITSViewer):
         marker_specs = list(getattr(state, "markers", []) or []) if state is not None else []
         return build_marker_payload_from_specs(marker_specs)
 
-    def _apply_action_session_state_to_viewers(self, preferred_cursor=None):
+    def _apply_action_session_state_to_viewers(
+        self,
+        preferred_cursor=None,
+        *,
+        apply_coordinate_grid_state: bool = False,
+    ):
         state = getattr(self.action_session, "state", None)
         if state is None or getattr(state, "data", None) is None:
             return
@@ -7982,6 +8288,30 @@ class MainWindow(FITSViewer):
                             except Exception:
                                 continue
 
+            if apply_coordinate_grid_state:
+                desired_grid_visible = bool(getattr(state, "display_grid", False))
+                desired_grid_frame = normalize_display_frame(
+                    getattr(state, "display_grid_frame", self.get_wcs_display_frame())
+                )
+                desired_grid_keep_native = bool(
+                    getattr(state, "display_grid_keep_native", True)
+                )
+                self.set_wcs_display_frame(desired_grid_frame, refresh=True)
+                self.set_coordinate_grid(
+                    desired_grid_visible,
+                    frame=desired_grid_frame,
+                    keep_native=desired_grid_keep_native,
+                )
+            else:
+                # Display-only GUI changes are not analysis-history entries.
+                # Preserve them across an unrelated Undo/Redo while keeping the
+                # replayed AppState usable for subsequent headless exports.
+                self._sync_coordinate_grid_app_state(
+                    visible=self.get_coordinate_grid_visible(),
+                    frame=self.get_wcs_display_frame(),
+                    keep_native=self.get_coordinate_grid_keep_native(),
+                )
+
             self._last_regions_fingerprint = json.dumps(
                 self._region_specs_snapshot(), sort_keys=True, separators=(",", ":")
             )
@@ -8126,6 +8456,18 @@ class MainWindow(FITSViewer):
             for window in list(family.values())
             if window is not None and window is not self
         ]
+        # Preferences is a top-level, application-wide panel rather than a Qt
+        # child, so it is not part of the normal document-family collection.
+        # The MenuBar that created it remains its logical owner. Close it with
+        # that owner to avoid leaving an orphan that the remaining registered
+        # FITS windows cannot discover (and hence duplicating Preferences).
+        config_panel = getattr(
+            getattr(self, "menu_bar", None),
+            "config_panel",
+            None,
+        )
+        if config_panel is not None and config_panel not in windows:
+            windows.append(config_panel)
         windows.sort(key=lambda window: not self._owned_window_may_prompt_on_close(window))
         for window in windows:
             if window is None or window is self:
@@ -8208,6 +8550,13 @@ class MainWindow(FITSViewer):
                 except Exception:
                     pass
             return
+
+        try:
+            from takefits.tools.marker_panel import shutdown_marker_panel_host
+
+            shutdown_marker_panel_host(self)
+        except Exception:
+            pass
 
         menu_bar = getattr(self, "menu_bar", None)
         dispose_menu = getattr(menu_bar, "dispose", None)

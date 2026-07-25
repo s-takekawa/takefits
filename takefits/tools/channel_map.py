@@ -204,6 +204,7 @@ class ChannelMapWindow(QMainWindow):
         self._marker_axes: Dict[str, object] = {}
         self._axes_marker_plane: Dict[object, str] = {}
         self._marker_formats: Dict[str, Format_pix_to_wcs] = {}
+        self._marker_format_by_axes: Dict[object, Format_pix_to_wcs] = {}
         self._marker_planes: List[str] = []
         self._marker_plane_base: Dict[str, str] = {}
         self.marker_link_all = False
@@ -591,6 +592,7 @@ class ChannelMapWindow(QMainWindow):
         self._marker_axes.clear()
         self._axes_marker_plane.clear()
         self._marker_formats.clear()
+        self._marker_format_by_axes.clear()
         self._marker_planes.clear()
         self._marker_plane_base.clear()
 
@@ -601,7 +603,6 @@ class ChannelMapWindow(QMainWindow):
         for i in range(self.tiles_x):
             for j in range(self.tiles_y):
                 ax = self.fig.add_subplot(gs[i, j], projection=self.wcs, slices=self.projection_slices)
-                plane_id = f"{self.marker_plane_prefix}_{len(self._marker_planes)}"
                 converter = Format_pix_to_wcs(
                     self.wcs,
                     self.projection_slices,
@@ -613,16 +614,20 @@ class ChannelMapWindow(QMainWindow):
                     fits_viewer=self.fits_viewer,
                     auto_precision_digits=self.auto_precision_digits,
                 )
-                self._marker_formats[plane_id] = converter
-                self._marker_axes[plane_id] = ax
-                self._axes_marker_plane[ax] = plane_id
-                self._marker_plane_base[plane_id] = self.plane
-                self._marker_planes.append(plane_id)
-                ax.format_coord = (lambda x, y, _ax=ax, _plane_id=plane_id: self._formatter_for_axes(_ax, x, y, plane_id=_plane_id))
+                self._marker_format_by_axes[ax] = converter
+                ax.format_coord = (
+                    lambda x, y, _ax=ax: self._formatter_for_axes(
+                        _ax,
+                        x,
+                        y,
+                        plane_id=self.marker_plane_for_axes(_ax),
+                    )
+                )
                 self.axes.append(ax)
         if self.dir_num == 1:
             self.axes = list(np.array(self.axes, dtype=object).reshape(self.tiles_x, self.tiles_y).T.flat)
         self.ax = self.axes[0] if len(self.axes) > 0 else None
+        self._rebind_marker_planes_for_page()
 
         if self._marker_formats:
             self.format_pix = _ChannelMarkerFormatWrapper(self._marker_formats, self._marker_plane_base, self.plane)
@@ -679,11 +684,102 @@ class ChannelMapWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     # Marker manager integration
+    def _channel_marker_count(self) -> int:
+        images = getattr(self, "ch_imdata", None)
+        if images is not None:
+            try:
+                return len(images)
+            except Exception:
+                pass
+        try:
+            return len(getattr(self, "range_label", None) or [])
+        except Exception:
+            return 0
+
+    def _marker_plane_id_for_global_index(self, global_index: int) -> str:
+        """Return the page-independent marker plane for one channel image."""
+        return f"{self.marker_plane_prefix}_global_{int(global_index)}"
+
+    def _visible_marker_global_indices(self) -> List[int]:
+        start_index = int(self.current_page) * int(self.num_per_page)
+        end_index = min(
+            start_index + int(self.num_per_page),
+            self._channel_marker_count(),
+        )
+        return list(range(start_index, end_index))
+
+    def _rebind_marker_planes_for_page(self) -> None:
+        """Bind visible axes to stable, global channel marker planes.
+
+        Axes are page slots, while marker layers represent channel images.  A
+        page change therefore detaches old-page artists and attaches markers
+        belonging to the global channels newly displayed in those same axes.
+        """
+        axes = list(getattr(self, "axes", None) or [])
+        old_axes = dict(getattr(self, "_marker_axes", None) or {})
+        global_indices = self._visible_marker_global_indices()
+        new_axes = {
+            self._marker_plane_id_for_global_index(global_index): axes[slot]
+            for slot, global_index in enumerate(global_indices)
+            if slot < len(axes)
+        }
+
+        marker_manager = getattr(self, "marker_manager", None)
+        if marker_manager is not None:
+            layers = getattr(marker_manager, "_layers", None) or {}
+            for plane, old_ax in old_axes.items():
+                if new_axes.get(plane) is old_ax:
+                    continue
+                layer = layers.get(plane)
+                if layer is None:
+                    continue
+                for marker in layer.markers.values():
+                    marker.remove_from_axes()
+
+        self._marker_axes.clear()
+        self._marker_axes.update(new_axes)
+        self._axes_marker_plane.clear()
+        self._axes_marker_plane.update(
+            {axes_obj: plane for plane, axes_obj in new_axes.items()}
+        )
+        self._marker_planes[:] = list(new_axes)
+        self._marker_plane_base.clear()
+        self._marker_plane_base.update({plane: self.plane for plane in new_axes})
+        self._marker_formats.clear()
+        format_by_axes = getattr(self, "_marker_format_by_axes", None) or {}
+        self._marker_formats.update(
+            {
+                plane: format_by_axes[axes_obj]
+                for plane, axes_obj in new_axes.items()
+                if axes_obj in format_by_axes
+            }
+        )
+
+        if marker_manager is None:
+            return
+
+        active_plane_getter = getattr(marker_manager, "active_plane", None)
+        active_plane = active_plane_getter() if callable(active_plane_getter) else None
+        if self._marker_planes and active_plane not in self._marker_planes:
+            marker_manager.set_active_plane(self._marker_planes[0])
+
+        layers = getattr(marker_manager, "_layers", None) or {}
+        for plane, target_ax in new_axes.items():
+            layer = layers.get(plane)
+            if layer is None:
+                continue
+            for marker in layer.markers.values():
+                artist_axes = getattr(getattr(marker, "artist", None), "axes", None)
+                if artist_axes is target_ax:
+                    continue
+                marker.remove_from_axes()
+                marker.add_to_axes(target_ax)
+
     def default_marker_plane(self) -> Optional[str]:
         return self._marker_planes[0] if self._marker_planes else None
 
     def has_marker_plane(self, plane: str) -> bool:
-        return plane in self._marker_axes
+        return self._marker_plane_global_index(plane) is not None
 
     def marker_axes_for_plane(self, plane: str):
         return self._marker_axes.get(plane)
@@ -695,7 +791,11 @@ class ChannelMapWindow(QMainWindow):
         return self.canvas
 
     def marker_plane_base(self, plane: str) -> str:
-        return self._marker_plane_base.get(plane, self.plane)
+        if plane in self._marker_plane_base:
+            return self._marker_plane_base[plane]
+        if self._marker_plane_global_index(plane) is not None:
+            return self.plane
+        return self._base_plane_from_name(plane)
 
     def marker_axis_indices(self, plane: str) -> Optional[Tuple[int, int]]:
         base = self.marker_plane_base(plane)
@@ -709,22 +809,71 @@ class ChannelMapWindow(QMainWindow):
 
     def _marker_plane_tile_index(self, plane: Optional[str]) -> Optional[int]:
         plane_name = str(plane or "").strip()
-        prefix = f"{self.marker_plane_prefix}_"
-        if not plane_name.startswith(prefix):
-            return None
-        try:
-            return int(plane_name[len(prefix):])
-        except Exception:
+        canonical_prefix = f"{self.marker_plane_prefix}_global_"
+        if plane_name.startswith(canonical_prefix):
+            try:
+                global_index = int(plane_name[len(canonical_prefix):])
+            except Exception:
+                return None
+            tile_index = global_index - (int(self.current_page) * int(self.num_per_page))
+            if 0 <= tile_index < int(self.num_per_page):
+                return tile_index
             return None
 
+        # Legacy marker files used a page-local tile suffix.
+        legacy_prefix = f"{self.marker_plane_prefix}_"
+        if plane_name.startswith(legacy_prefix):
+            try:
+                tile_index = int(plane_name[len(legacy_prefix):])
+            except Exception:
+                return None
+            if 0 <= tile_index < int(self.num_per_page):
+                return tile_index
+        return None
+
     def _marker_plane_global_index(self, plane: Optional[str]) -> Optional[int]:
-        tile_index = self._marker_plane_tile_index(plane)
-        if tile_index is None or tile_index < 0:
-            return None
-        global_index = (int(self.current_page) * int(self.num_per_page)) + tile_index
-        if global_index < 0 or global_index >= len(list(self.range_label or [])):
+        plane_name = str(plane or "").strip()
+        canonical_prefix = f"{self.marker_plane_prefix}_global_"
+        if plane_name.startswith(canonical_prefix):
+            try:
+                global_index = int(plane_name[len(canonical_prefix):])
+            except Exception:
+                return None
+        else:
+            # Backward compatibility: channel_<plane>_<N> denoted visible
+            # tile slot N. Resolve it relative to the page active at import.
+            tile_index = self._marker_plane_tile_index(plane_name)
+            if tile_index is None:
+                return None
+            global_index = (int(self.current_page) * int(self.num_per_page)) + tile_index
+        if global_index < 0 or global_index >= self._channel_marker_count():
             return None
         return global_index
+
+    def marker_plane_display_label(self, plane: str) -> str:
+        """Human-readable label for the panel's stable channel-plane id."""
+
+        global_index = self._marker_plane_global_index(plane)
+        if global_index is None:
+            return str(plane).upper()
+        detail = ""
+        try:
+            raw_label = list(self.range_label or [])[global_index]
+            if isinstance(raw_label, (list, tuple)) and len(raw_label) >= 3:
+                if self.chlabel_num == 1:
+                    detail = f"{raw_label[0]} to {raw_label[2]}"
+                else:
+                    detail = str(raw_label[1])
+            elif raw_label is not None:
+                detail = str(raw_label)
+        except Exception:
+            detail = ""
+        base_label = {"xy": "X–Y", "xz": "X–Z", "zy": "Z–Y"}.get(
+            str(self.plane).lower(),
+            str(self.plane).upper(),
+        )
+        label = f"{base_label} · Channel {global_index + 1}"
+        return f"{label} · {detail}" if detail else label
 
     def _marker_plane_center_pixel(self, plane: Optional[str]) -> Optional[float]:
         global_index = self._marker_plane_global_index(plane)
@@ -865,7 +1014,12 @@ class ChannelMapWindow(QMainWindow):
 
     def set_marker_link_all(self, enabled: bool) -> None:
         self.marker_link_all = bool(enabled)
-        panel = getattr(self, "marker_panel", None)
+        try:
+            from takefits.tools.marker_panel import active_marker_panel_for_viewer
+
+            panel = active_marker_panel_for_viewer(self)
+        except Exception:
+            panel = None
         checkbox = getattr(panel, "link_all_checkbox", None) if panel is not None else None
         if checkbox is not None:
             try:
@@ -878,7 +1032,7 @@ class ChannelMapWindow(QMainWindow):
         markers = list(markers)
         if not markers:
             return False
-        return all(getattr(marker, "plane", None) in self._marker_planes for marker in markers)
+        return all(self.has_marker_plane(getattr(marker, "plane", None)) for marker in markers)
 
     def mirror_marker_creation(self, marker, plane: str, *, source: str = "primary") -> List[Marker]:
         mirrored_markers = []
@@ -916,31 +1070,9 @@ class ChannelMapWindow(QMainWindow):
         return mirrored_markers
 
     def open_marker_panel(self):
-        needs_new_panel = False
-        if self.marker_panel is None:
-            needs_new_panel = True
-        else:
-            try:
-                needs_new_panel = not self.marker_panel.isVisible()
-            except Exception:
-                # Underlying widget was deleted; recreate.
-                self.marker_panel = None
-                needs_new_panel = True
+        from takefits.tools.marker_panel import open_marker_panel_for
 
-        if needs_new_panel:
-            from takefits.tools.marker_panel import MarkerPanel
-            self.marker_panel = MarkerPanel(self, self.marker_manager)
-            try:
-                self.marker_panel.destroyed.connect(lambda: setattr(self, "marker_panel", None))
-            except Exception:
-                pass
-            self.marker_panel.setProperty("_marker_panel_positioned", False)
-        self.marker_panel.show()
-        if not bool(self.marker_panel.property("_marker_panel_positioned")):
-            self._position_marker_panel(self.marker_panel)
-            self.marker_panel.setProperty("_marker_panel_positioned", True)
-        self.marker_panel.raise_()
-        self.marker_panel.activateWindow()
+        return open_marker_panel_for(self, plane=self.default_marker_plane())
 
     def _position_marker_panel(self, panel):
         if panel is None:
@@ -979,7 +1111,12 @@ class ChannelMapWindow(QMainWindow):
         if not enabled:
             if marker_manager is not None:
                 marker_manager.cancel_placement()
-            panel = getattr(self, "marker_panel", None)
+            try:
+                from takefits.tools.marker_panel import active_marker_panel_for_viewer
+
+                panel = active_marker_panel_for_viewer(self)
+            except Exception:
+                panel = None
             if panel is not None and getattr(panel, "placement_toggle", None) is not None:
                 if panel.placement_toggle.isChecked():
                     panel.placement_toggle.blockSignals(True)
@@ -1075,11 +1212,20 @@ class ChannelMapWindow(QMainWindow):
                         return
                 except Exception:
                     pass
+
+        try:
+            from takefits.tools.marker_panel import handle_marker_placement_key
+
+            if handle_marker_placement_key(self, event):
+                return
+        except Exception:
+            pass
+
         marker_manager = getattr(self, "marker_manager", None)
         if marker_manager is not None:
             marker_manager.handle_key_press(event)
             if getattr(self, "marker_mode_enabled", False) and event.key in ("delete", "backspace"):
-                panel = getattr(self, "marker_panel", None)
+                panel = marker_manager._active_marker_panel()
                 markers_to_delete = []
                 if panel and hasattr(panel, "_selected_markers"):
                     markers_to_delete = panel._selected_markers()
@@ -1107,24 +1253,34 @@ class ChannelMapWindow(QMainWindow):
         """
         Map incoming marker states to the appropriate channel-map planes.
         - If the state plane matches this viewer's base plane (e.g., saved from main),
-          replicate to all tiles.
-        - If the state plane matches a channel-map plane (channel_<base>_N), restore to that tile index.
+          replicate to all currently visible tiles.
+        - Stable channel_<base>_global_N planes restore to global channel N,
+          including channels on non-visible pages.
+        - Legacy channel_<base>_N planes restore to visible tile slot N.
         - Ignore states whose base plane differs.
         """
         base = self._base_plane_from_name(state.plane)
         if base != self.plane:
             return []
 
-        prefix = f"{self.marker_plane_prefix}_"
         plane_name = state.plane or ""
-        if plane_name.startswith(prefix):
+        canonical_prefix = f"{self.marker_plane_prefix}_global_"
+        if plane_name.startswith(canonical_prefix):
             try:
-                index = int(plane_name[len(prefix):])
+                global_index = int(plane_name[len(canonical_prefix):])
             except Exception:
                 return []
-            if 0 <= index < len(self._marker_planes):
-                return [self._marker_planes[index]]
+            canonical_plane = self._marker_plane_id_for_global_index(global_index)
+            if self.has_marker_plane(canonical_plane):
+                return [canonical_plane]
             return []
+
+        legacy_prefix = f"{self.marker_plane_prefix}_"
+        if plane_name.startswith(legacy_prefix):
+            tile_index = self._marker_plane_tile_index(plane_name)
+            if tile_index is None or tile_index >= len(self._marker_planes):
+                return []
+            return [self._marker_planes[tile_index]]
 
         return list(self._marker_planes)
 
@@ -1917,6 +2073,7 @@ class ChannelMapWindow(QMainWindow):
         total_images = len(self.ch_imdata)
         start_index = self.current_page * self.num_per_page
         end_index = min(start_index + self.num_per_page, total_images)
+        self._rebind_marker_planes_for_page()
     
         for idx, ax in enumerate(self.axes):
             global_index = start_index + idx
@@ -2877,12 +3034,15 @@ class ChannelMapWindow(QMainWindow):
             self.color_settings_panel = None
         self.set_marker_mode(False)
         self.set_marker_link_all(False)
-        if self.marker_panel is not None:
-            try:
-                self.marker_panel.close()
-            except Exception:
-                pass
-            self.marker_panel = None
+        if self in self.fits_viewer.channel_map_windows:
+            self.fits_viewer.channel_map_windows.remove(self)
+        try:
+            from takefits.tools.marker_panel import release_marker_viewer
+
+            release_marker_viewer(self)
+        except Exception:
+            pass
+        self.marker_panel = None
     
         if self.canvas is not None:
             self.canvas.close()
@@ -2891,9 +3051,6 @@ class ChannelMapWindow(QMainWindow):
             self.fig.clear()
             self.fig = None
         
-        if self in self.fits_viewer.channel_map_windows:
-            self.fits_viewer.channel_map_windows.remove(self)
-
         #print("Result window closed")
         if self.toolbar._subplot_dialog is not None:
             self.toolbar._subplot_dialog.close()

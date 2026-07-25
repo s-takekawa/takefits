@@ -31,6 +31,7 @@ import copy
 import math
 from typing import List, Optional
 
+from astropy import units as u
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from takefits.ui.window_registry import WindowRegistry
@@ -78,6 +79,158 @@ def _spectral_subwcs(wcs):
         return spec if int(getattr(spec, "naxis", 0)) == 1 else None
     except Exception:
         return None
+
+
+def _spectral_axis_index(wcs) -> Optional[int]:
+    """Return the 1-based spectral FITS axis index for a WCS, if detectable."""
+    if wcs is None:
+        return None
+    try:
+        axis_types = list(getattr(wcs.wcs, "ctype", []) or [])
+    except Exception:
+        axis_types = []
+    for idx, ctype in enumerate(axis_types, start=1):
+        ctype_upper = str(ctype or "").upper()
+        if any(tag in ctype_upper for tag in ("VRAD", "VELO", "VOPT", "FREQ")):
+            return idx
+    return None
+
+
+def _unit_from_text(text):
+    text = str(text or "").strip()
+    if not text:
+        return None
+    try:
+        return u.Unit(text)
+    except Exception:
+        return None
+
+
+def _spectral_axis_ctype(viewer, spec=None) -> str:
+    metadata = getattr(viewer, "spectral_metadata", None)
+    if isinstance(metadata, dict):
+        ctype = str(metadata.get("current_axis_ctype") or "").strip()
+        if ctype:
+            return ctype
+
+    header = getattr(viewer, "header", None)
+    wcs = getattr(viewer, "wcs", None)
+    axis_index = None
+    if isinstance(metadata, dict):
+        try:
+            axis_index = int(metadata.get("axis_index") or 0) or None
+        except Exception:
+            axis_index = None
+    if axis_index is None:
+        axis_index = _spectral_axis_index(wcs)
+    if header is not None and axis_index is not None:
+        ctype = str(header.get(f"CTYPE{axis_index}", "") or "").strip()
+        if ctype:
+            return ctype
+
+    if spec is None:
+        spec = _spectral_subwcs(wcs)
+    if spec is not None:
+        try:
+            return str(spec.wcs.ctype[0] or "")
+        except Exception:
+            return ""
+    return ""
+
+
+def _spectral_unit_from_wcs(spec):
+    if spec is not None:
+        try:
+            return spec.wcs.cunit[0]
+        except Exception:
+            return None
+    return None
+
+
+def _effective_spectral_unit(viewer, spec=None):
+    """Unit of low-level spectral numeric values for this viewer.
+
+    Takefits normalizes velocity cubes for display by editing the low-level WCS
+    numeric values to km/s while Astropy may still expose the FITS-standard
+    unit as m/s on the high-level SpectralCoord. Velocity axes therefore prefer
+    the loader metadata/header; frequency axes prefer the low-level WCS unit,
+    which Astropy already canonicalizes.
+    """
+    if spec is None:
+        spec = _spectral_subwcs(getattr(viewer, "wcs", None))
+    ctype_upper = _spectral_axis_ctype(viewer, spec).upper()
+    if "FREQ" in ctype_upper:
+        unit = _spectral_unit_from_wcs(spec)
+        if unit is not None:
+            return unit
+
+    metadata = getattr(viewer, "spectral_metadata", None)
+    if isinstance(metadata, dict):
+        unit = _unit_from_text(metadata.get("current_axis_unit"))
+        if unit is not None:
+            return unit
+
+    header = getattr(viewer, "header", None)
+    wcs = getattr(viewer, "wcs", None)
+    axis_index = None
+    if isinstance(metadata, dict):
+        try:
+            axis_index = int(metadata.get("axis_index") or 0) or None
+        except Exception:
+            axis_index = None
+    if axis_index is None:
+        axis_index = _spectral_axis_index(wcs)
+    if header is not None and axis_index is not None:
+        unit = _unit_from_text(header.get(f"CUNIT{axis_index}", ""))
+        if unit is not None:
+            return unit
+
+    return _spectral_unit_from_wcs(spec)
+
+
+def _spectral_pixel_to_numeric(viewer, pixel):
+    """Convert a spectral pixel to a rest-frequency-free numeric world value."""
+    spec = _spectral_subwcs(getattr(viewer, "wcs", None))
+    if spec is None:
+        return None
+    try:
+        world = spec.wcs_pix2world([[float(pixel)]], 0)[0][0]
+        world = float(world)
+    except Exception:
+        return None
+    if not math.isfinite(world):
+        return None
+    return world, _effective_spectral_unit(viewer, spec)
+
+
+def _spectral_numeric_to_pixel(viewer, spectral_value):
+    """Convert a rest-frequency-free numeric spectral value to target pixels."""
+    if spectral_value is None:
+        return None
+    try:
+        value, source_unit = spectral_value
+        value = float(value)
+    except Exception:
+        return None
+    spec = _spectral_subwcs(getattr(viewer, "wcs", None))
+    if spec is None or not math.isfinite(value):
+        return None
+
+    target_unit = _effective_spectral_unit(viewer, spec)
+    if source_unit is not None and target_unit is not None:
+        try:
+            if source_unit.is_equivalent(target_unit):
+                value = (value * source_unit).to(target_unit).value
+            else:
+                return None
+        except Exception:
+            return None
+
+    try:
+        pixel = float(spec.wcs_world2pix([[value]], 0)[0][0])
+    except Exception:
+        return None
+    return pixel if math.isfinite(pixel) else None
 
 
 class WindowSyncManager(QObject):
@@ -261,7 +414,7 @@ class WindowSyncManager(QObject):
                 self._apply_z_range(target, z_world)
 
     def _source_z_world_range(self, source):
-        """Spectral world values of the source's current z (XZ/ZY) extent."""
+        """Rest-frequency-free spectral values of the source's current z extent."""
         if _spectral_subwcs(getattr(source, "wcs", None)) is None:
             return None
         subs = list(getattr(source, "subwindows", None) or [])
@@ -269,8 +422,11 @@ class WindowSyncManager(QObject):
             return None
         try:
             z0, z1 = subs[0].ax.get_ylim()  # XZ vertical axis = spectral
-            spec = source.wcs.spectral
-            return (spec.pixel_to_world(z0), spec.pixel_to_world(z1))
+            v0 = _spectral_pixel_to_numeric(source, z0)
+            v1 = _spectral_pixel_to_numeric(source, z1)
+            if v0 is None or v1 is None:
+                return None
+            return (v0, v1)
         except Exception:
             return None
 
@@ -294,13 +450,9 @@ class WindowSyncManager(QObject):
         apply_fn = getattr(target, "apply_synced_z_range", None)
         if not callable(apply_fn):
             return
-        tgt_spec = _spectral_subwcs(getattr(target, "wcs", None))
-        if tgt_spec is None:
-            return
-        try:
-            tz0 = float(tgt_spec.world_to_pixel(z_world[0]))
-            tz1 = float(tgt_spec.world_to_pixel(z_world[1]))
-        except Exception:
+        tz0 = _spectral_numeric_to_pixel(target, z_world[0])
+        tz1 = _spectral_numeric_to_pixel(target, z_world[1])
+        if tz0 is None or tz1 is None:
             return
         if not (math.isfinite(tz0) and math.isfinite(tz1)):
             return
@@ -390,7 +542,7 @@ class WindowSyncManager(QObject):
         src_spec = _spectral_subwcs(src_wcs)
         if src_spec is not None:
             try:
-                spec_world = src_spec.pixel_to_world(zpix)
+                spec_world = _spectral_pixel_to_numeric(source, zpix)
             except Exception:
                 spec_world = None
 
@@ -414,12 +566,7 @@ class WindowSyncManager(QObject):
         # Channel pixel on the target for the clicked spectral position.
         tz = None
         if spec_world is not None:
-            tgt_spec = _spectral_subwcs(getattr(target, "wcs", None))
-            if tgt_spec is not None:
-                try:
-                    tz = float(tgt_spec.world_to_pixel(spec_world))
-                except Exception:
-                    tz = None
+            tz = _spectral_numeric_to_pixel(target, spec_world)
 
         plane = str(plane or "xy")
         plane_viewer, dx, dy = self._resolve_plane_target(target, plane, tx, ty, tz)
@@ -546,21 +693,24 @@ class WindowSyncManager(QObject):
             return
         if source is None:
             return
-        src_spec = _spectral_subwcs(getattr(source, "wcs", None))
         slider = getattr(source, "slider", None)
-        if src_spec is None or slider is None:
+        if slider is None:
             return
         try:
-            world = src_spec.pixel_to_world(int(slider.value()))
+            world = _spectral_pixel_to_numeric(source, int(slider.value()))
         except Exception:
             return
+        if world is None:
+            return
         for target in self._targets(source):
-            tgt_spec = _spectral_subwcs(getattr(target, "wcs", None))
             tgt_slider = getattr(target, "slider", None)
-            if tgt_spec is None or tgt_slider is None:
+            if tgt_slider is None:
                 continue
             try:
-                channel = int(round(float(tgt_spec.world_to_pixel(world))))
+                target_pixel = _spectral_numeric_to_pixel(target, world)
+                if target_pixel is None:
+                    continue
+                channel = int(round(float(target_pixel)))
             except Exception:
                 # Quantity mismatch with no usable conversion -> skip this window.
                 continue

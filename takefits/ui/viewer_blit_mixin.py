@@ -49,6 +49,52 @@ class ViewerBlitMixin:
                 pass
         return state.image_background
 
+    @staticmethod
+    def _suppress_axes_grid(ax):
+        """Temporarily hide the WCS coordinate grid; returns coords to restore.
+
+        WCSAxes draws the grid inside ``draw_wcsaxes``. Calling that from a manual
+        blit path (to repaint ticks above the image) would re-draw the grid too:
+        for the contour-style grid (XZ/ZY spectral planes) every call leaks a new
+        ``QuadContourSet`` into ``ax.collections`` -> progressive darkening; for
+        the line grid it double-composites the semi-transparent lines. The grid is
+        already baked into the cached background, so it must be suppressed here.
+        """
+        suppressed = []
+        if ax is None:
+            return suppressed
+        coords = []
+        seen = set()
+        coord_maps = getattr(ax, "_all_coords", None)
+        if not coord_maps:
+            coord_maps = (getattr(ax, "coords", None),)
+        for coord_map in coord_maps:
+            if coord_map is None:
+                continue
+            try:
+                candidates = list(coord_map)
+            except Exception:
+                continue
+            for coord in candidates:
+                identity = id(coord)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                coords.append(coord)
+        for coord in coords:
+            kwargs = getattr(coord, "_grid_lines_kwargs", None)
+            if isinstance(kwargs, dict) and kwargs.get("visible"):
+                kwargs["visible"] = False
+                suppressed.append(coord)
+        return suppressed
+
+    @staticmethod
+    def _restore_axes_grid(suppressed):
+        for coord in suppressed or ():
+            kwargs = getattr(coord, "_grid_lines_kwargs", None)
+            if isinstance(kwargs, dict):
+                kwargs["visible"] = True
+
     def _draw_axis_foreground(self, state, *, include_ticks: bool = True):
         """
         Redraw axis frame/ticks above image artists during manual blit paths.
@@ -72,11 +118,16 @@ class ViewerBlitMixin:
         drew_wcs_ticks = False
         draw_wcsaxes = getattr(ax, "draw_wcsaxes", None)
         if include_ticks and callable(draw_wcsaxes) and renderer is not None:
+            # Keep the grid out of this repaint (it lives in the cached
+            # background); see _suppress_axes_grid for why.
+            suppressed = self._suppress_axes_grid(ax)
             try:
                 draw_wcsaxes(renderer)
                 drew_wcs_ticks = True
             except Exception:
                 pass
+            finally:
+                self._restore_axes_grid(suppressed)
 
         # Ensure the visible frame border is repainted last.
         coords = getattr(ax, "coords", None)
@@ -251,6 +302,12 @@ class ViewerBlitMixin:
 
         return background
 
+    def _plane_grid_visible(self, state) -> bool:
+        """True when the WCS coordinate grid is shown on this plane (TF-404)."""
+        viewer = getattr(state, "viewer", None) or self
+        dm = getattr(viewer, "displaymap", None)
+        return bool(getattr(dm, "grid_visible", False))
+
     def _fast_blit_image_and_overlay(
         self,
         *,
@@ -264,6 +321,23 @@ class ViewerBlitMixin:
             perf_token = self._perf_start(f"{getattr(self, 'plane', '?')} _fast_blit_image_and_overlay")
         state = getattr(self, 'state', None)
         if state is None or state.canvas is None or state.ax is None or state.im is None:
+            if perf_token and hasattr(self, "_perf_end"):
+                self._perf_end(perf_token)
+            return
+        if self._plane_grid_visible(state):
+            # The coordinate grid sits above the image. A fast image blit draws
+            # the new image over the cached background and would cover the grid
+            # (it vanishes), while repainting it here would leak/duplicate the
+            # contour grid. Fall back to a clean full draw so WCSAxes composites
+            # the grid over the new image correctly. The grid is opt-in, so the
+            # extra cost only applies while it is enabled.
+            self._draw_canvas_with_image(state)
+            self._invalidate_image_background()
+            try:
+                state._background = None
+                state.image_background = None
+            except Exception:
+                pass
             if perf_token and hasattr(self, "_perf_end"):
                 self._perf_end(perf_token)
             return

@@ -51,11 +51,14 @@ def export_moment_image(
     cmap: str = "viridis",
     origin: str = "lower",
     dpi: int = 150,
-    title: Optional[str] = None
+    title: Optional[str] = None,
+    grid: Optional[bool] = None,
+    grid_frame: Optional[str] = None,
+    grid_keep_native: Optional[bool] = None,
 ) -> str:
     """
     Compute a moment map and export it as an image using CLI/GUI styling.
-    
+
     Args:
         state: AppState with data.
         output_path: Path to save PNG/PDF/etc.
@@ -67,7 +70,13 @@ def export_moment_image(
         origin: Image origin ('lower' or 'upper').
         dpi: Output resolution.
         title: Optional title for the plot.
-        
+        grid: Override the WCS coordinate-grid overlay. When ``None`` the value
+            falls back to ``state.display_grid`` (TF-404).
+        grid_frame: Override the display frame followed by the XY grid. When
+            ``None`` this falls back to ``state.display_grid_frame`` (TF-407).
+        grid_keep_native: Override whether the native grid remains visible
+            beneath a non-native XY overlay.
+
     Returns:
         Path to saved file.
     """
@@ -99,7 +108,37 @@ def export_moment_image(
     # Override with user args
     if cmap:
         config['colorscale'] = cmap
-    
+
+    # Coordinate grid (TF-404): explicit arg wins, else mirror the app state so
+    # the headless render matches what the GUI would show.
+    grid_on = grid if grid is not None else bool(getattr(state, 'display_grid', False))
+    config['grid_visible'] = bool(grid_on)
+    config['grid_frame'] = (
+        grid_frame
+        if grid_frame is not None
+        else str(getattr(state, 'display_grid_frame', 'native') or 'native')
+    )
+    config['grid_keep_native'] = (
+        bool(grid_keep_native)
+        if grid_keep_native is not None
+        else bool(getattr(state, 'display_grid_keep_native', True))
+    )
+    if title:
+        # A non-native overlay uses the top edge for longitude tick labels.
+        # Those numeric labels remain outside even when the descriptive axis
+        # title is inside, so a titled export always needs the larger strip.
+        # The reservation is inert for native grids.
+        required_top_margin = 120.0
+        config['grid_overlay_top_margin_px'] = max(
+            required_top_margin,
+            float(
+                config.get(
+                    'grid_overlay_top_margin_px',
+                    required_top_margin,
+                )
+            ),
+        )
+
     # Only force white background if user hasn't customized it? 
     # Actually, for publication plots (headless), user likely *wants* config settings OR specific overrides.
     # We will let the config file dictate styles unless explicitly overridden by CLI args.
