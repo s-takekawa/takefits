@@ -3,7 +3,19 @@ import math
 import numpy as np
 from matplotlib.patches import Circle, Polygon, Ellipse
 from matplotlib.text import Text
-from PySide6.QtCore import Qt
+
+
+def _cursor_shapes():
+    """Qt cursor shapes, imported lazily.
+
+    Only the interactive hit-test helpers need them, and they all require a
+    live Matplotlib mouse event. Keeping the import out of module scope lets
+    headless renderers use the region geometry/artists without Qt.
+    """
+    from PySide6.QtCore import Qt
+
+    return Qt.CursorShape
+
 
 class Region(ABC):
     """
@@ -161,6 +173,58 @@ class Region(ABC):
     def get_style_attributes(self):
         return self.base_style.copy()
 
+    def _geometry_bounds(self):
+        """Return conservative ``(xmin, xmax, ymin, ymax)`` pixel bounds."""
+        return None
+
+    def _bounded_spatial_selection(self, data_shape):
+        """Build a region mask only inside its clipped geometry bounds.
+
+        Pixel coordinates refer to pixel centres at integer positions.  The
+        one-pixel padding makes the crop conservative at fractional and rotated
+        boundaries; ``contains`` remains the sole authority for membership.
+        """
+        if len(data_shape) != 2:
+            raise ValueError("Spatial region selection requires a 2D shape")
+        ny, nx = (int(data_shape[0]), int(data_shape[1]))
+        bounds = self._geometry_bounds()
+        if bounds is None:
+            x_start, x_stop, y_start, y_stop = 0, nx, 0, ny
+        else:
+            xmin, xmax, ymin, ymax = (float(value) for value in bounds)
+            if not np.all(np.isfinite([xmin, xmax, ymin, ymax])):
+                return slice(0, 0), slice(0, 0), np.zeros((0, 0), dtype=bool)
+            if xmin > xmax:
+                xmin, xmax = xmax, xmin
+            if ymin > ymax:
+                ymin, ymax = ymax, ymin
+            x_start = max(0, int(math.floor(xmin)) - 1)
+            x_stop = min(nx, int(math.ceil(xmax)) + 2)
+            y_start = max(0, int(math.floor(ymin)) - 1)
+            y_stop = min(ny, int(math.ceil(ymax)) + 2)
+
+        if x_start >= x_stop or y_start >= y_stop:
+            return (
+                slice(y_start, y_start),
+                slice(x_start, x_start),
+                np.zeros((0, 0), dtype=bool),
+            )
+
+        grid_y, grid_x = np.ogrid[y_start:y_stop, x_start:x_stop]
+        mask = np.asarray(self.contains(grid_x, grid_y), dtype=bool)
+        expected_shape = (y_stop - y_start, x_stop - x_start)
+        if mask.shape != expected_shape:
+            mask = np.broadcast_to(mask, expected_shape)
+        return slice(y_start, y_stop), slice(x_start, x_stop), mask
+
+    def _region_pixels(self, data):
+        """Return selected 2D values without allocating whole-image grids."""
+        y_slice, x_slice, mask = self._bounded_spatial_selection(data.shape)
+        if mask.size == 0 or not np.any(mask):
+            return np.array([])
+        plane = np.asanyarray(data[y_slice, x_slice])
+        return np.asanyarray(plane[mask]).reshape(-1)
+
 
     def get_moments(self, data):
         """
@@ -168,11 +232,14 @@ class Region(ABC):
         on the given 2D data array.
         """
         if data is None or data.ndim != 2: return {}
-        y_coords, x_coords = np.indices(data.shape)
-        mask = self.contains(x_coords, y_coords)
+        y_slice, x_slice, mask = self._bounded_spatial_selection(data.shape)
         if not np.any(mask): return {}
-        
-        valid_x, valid_y, intensities = x_coords[mask], y_coords[mask], data[mask]
+
+        local_y, local_x = np.nonzero(mask)
+        valid_x = local_x.astype(np.float64, copy=False) + int(x_slice.start)
+        valid_y = local_y.astype(np.float64, copy=False) + int(y_slice.start)
+        plane = np.asanyarray(data[y_slice, x_slice])
+        intensities = np.asanyarray(plane[mask]).reshape(-1)
         non_nan_mask = ~np.isnan(intensities)
         valid_x, valid_y, intensities = valid_x[non_nan_mask], valid_y[non_nan_mask], intensities[non_nan_mask]
 
@@ -214,15 +281,15 @@ class CircleRegion(Region):
         cx, cy = self.center
         return (x - cx)**2 + (y - cy)**2 < self.radius**2
 
+    def _geometry_bounds(self):
+        cx, cy = self.center
+        radius = abs(float(self.radius))
+        return cx - radius, cx + radius, cy - radius, cy + radius
+
     def get_stats(self, data):
         if self.radius == 0:
             return self._calculate_stats(np.array([]))
-        
-        y_coords, x_coords = np.indices(data.shape)
-        mask = self.contains(x_coords, y_coords)
-        region_pixels = data[mask]
-        
-        return self._calculate_stats(region_pixels)
+        return self._calculate_stats(self._region_pixels(data))
 
     def get_resize_handle(self, event, tolerance):
         if event.x is None or event.y is None:
@@ -238,7 +305,7 @@ class CircleRegion(Region):
             return None
         dist = math.hypot(event.x - center_disp[0], event.y - center_disp[1])
         if abs(dist - disp_radius) <= tolerance:
-            return {'type': 'circle', 'cursor': Qt.CursorShape.SizeAllCursor}
+            return {'type': 'circle', 'cursor': _cursor_shapes().SizeAllCursor}
         return None
 
     def get_state(self):
@@ -345,13 +412,17 @@ class RectangleRegion(Region):
             return bool(mask)
         return mask
 
+    def _geometry_bounds(self):
+        vertices = self._compute_vertices()
+        if not vertices:
+            return None
+        xs, ys = zip(*vertices)
+        return min(xs), max(xs), min(ys), max(ys)
+
     def get_stats(self, data):
         if self.width == 0 or self.height == 0:
             return self._calculate_stats(np.array([]))
-        grid_y, grid_x = np.indices(data.shape)
-        mask = self.contains(grid_x, grid_y)
-        region_pixels = data[mask]
-        return self._calculate_stats(region_pixels)
+        return self._calculate_stats(self._region_pixels(data))
 
     def get_resize_handle(self, event, tolerance):
         if event.x is None or event.y is None:
@@ -395,15 +466,15 @@ class RectangleRegion(Region):
 
         if horizontal and vertical:
             if ('left' in edges_set and 'top' in edges_set) or ('right' in edges_set and 'bottom' in edges_set):
-                cursor = Qt.CursorShape.SizeFDiagCursor
+                cursor = _cursor_shapes().SizeFDiagCursor
             else:
-                cursor = Qt.CursorShape.SizeBDiagCursor
+                cursor = _cursor_shapes().SizeBDiagCursor
         elif horizontal:
-            cursor = Qt.CursorShape.SizeHorCursor
+            cursor = _cursor_shapes().SizeHorCursor
         elif vertical:
-            cursor = Qt.CursorShape.SizeVerCursor
+            cursor = _cursor_shapes().SizeVerCursor
         else:
-            cursor = Qt.CursorShape.SizeAllCursor
+            cursor = _cursor_shapes().SizeAllCursor
 
         return {'type': 'rectangle', 'edges': edges_set, 'cursor': cursor}
 
@@ -500,13 +571,23 @@ class EllipseRegion(Region):
             return value <= 1.0
         return value <= 1.0
 
+    def _geometry_bounds(self):
+        cx, cy = self.center
+        half_w = abs(float(self.width)) / 2.0
+        half_h = abs(float(self.height)) / 2.0
+        x_radius = math.hypot(self._cos * half_w, self._sin * half_h)
+        y_radius = math.hypot(self._sin * half_w, self._cos * half_h)
+        return (
+            cx - x_radius,
+            cx + x_radius,
+            cy - y_radius,
+            cy + y_radius,
+        )
+
     def get_stats(self, data):
         if self.width == 0 or self.height == 0:
             return self._calculate_stats(np.array([]))
-        grid_y, grid_x = np.indices(data.shape)
-        mask = self.contains(grid_x, grid_y)
-        region_pixels = data[mask]
-        return self._calculate_stats(region_pixels)
+        return self._calculate_stats(self._region_pixels(data))
 
     def _outline_display_points(self, axes, half_w, half_h, phis):
         """Return display-space coords of outline points at parametric *phis*."""
@@ -537,12 +618,12 @@ class EllipseRegion(Region):
         p_disp = self._outline_display_points(axes, half_w, half_h, np.array([phi]))[0]
         ang = math.degrees(math.atan2(p_disp[1] - c_disp[1], p_disp[0] - c_disp[0])) % 180.0
         if ang < 22.5 or ang >= 157.5:
-            return Qt.CursorShape.SizeHorCursor
+            return _cursor_shapes().SizeHorCursor
         if ang < 67.5:
-            return Qt.CursorShape.SizeBDiagCursor
+            return _cursor_shapes().SizeBDiagCursor
         if ang < 112.5:
-            return Qt.CursorShape.SizeVerCursor
-        return Qt.CursorShape.SizeFDiagCursor
+            return _cursor_shapes().SizeVerCursor
+        return _cursor_shapes().SizeFDiagCursor
 
     def get_resize_handle(self, event, tolerance):
         if event.x is None or event.y is None:
@@ -637,8 +718,7 @@ class CubeRegion(RectangleRegion):
         if self.width == 0 or self.height == 0 or data.ndim < 3:
             return self._calculate_stats(np.array([]))
 
-        grid_y, grid_x = np.indices((data.shape[1], data.shape[2]))
-        xy_mask = self.contains(grid_x, grid_y)
+        y_slice, x_slice, xy_mask = self._bounded_spatial_selection(data.shape[1:])
 
         if not np.any(xy_mask):
             return self._calculate_stats(np.array([]))
@@ -649,9 +729,64 @@ class CubeRegion(RectangleRegion):
         if z_start >= z_end:
             return self._calculate_stats(np.array([]))
 
-        region_pixels = data[z_start:z_end, xy_mask]
-        
-        return self._calculate_stats(region_pixels.flatten())
+        total_pixel_count = int(np.count_nonzero(xy_mask)) * (z_end - z_start)
+        valid_pixel_count = 0
+        total_sum = 0.0
+        running_mean = 0.0
+        running_m2 = 0.0
+        data_min = np.inf
+        data_max = -np.inf
+
+        # Read one channel at a time. Advanced indexing over the complete
+        # z-range would materialize the selected cube and flatten it again.
+        for channel_index in range(z_start, z_end):
+            plane = np.asanyarray(data[channel_index])[y_slice, x_slice]
+            values = np.asanyarray(plane[xy_mask]).reshape(-1)
+            valid_values = values[~np.isnan(values)]
+            batch_count = int(valid_values.size)
+            if batch_count == 0:
+                continue
+
+            batch_mean = float(np.mean(valid_values, dtype=np.float64))
+            centered = valid_values - batch_mean
+            batch_m2 = float(np.sum(centered * centered, dtype=np.float64))
+            batch_sum = float(np.sum(valid_values, dtype=np.float64))
+
+            combined_count = valid_pixel_count + batch_count
+            delta = batch_mean - running_mean
+            running_mean += delta * batch_count / combined_count
+            running_m2 += (
+                batch_m2
+                + delta * delta
+                * valid_pixel_count
+                * batch_count
+                / combined_count
+            )
+            valid_pixel_count = combined_count
+            total_sum += batch_sum
+            data_min = min(data_min, float(np.min(valid_values)))
+            data_max = max(data_max, float(np.max(valid_values)))
+
+        if valid_pixel_count == 0:
+            return {
+                'total_pixel_count': total_pixel_count,
+                'valid_pixel_count': 0,
+                'mean': np.nan,
+                'sum': np.nan,
+                'std': np.nan,
+                'min': np.nan,
+                'max': np.nan,
+            }
+
+        return {
+            'total_pixel_count': total_pixel_count,
+            'valid_pixel_count': valid_pixel_count,
+            'mean': running_mean,
+            'sum': total_sum,
+            'std': np.sqrt(running_m2 / valid_pixel_count),
+            'min': data_min,
+            'max': data_max,
+        }
 
     def fit_to_view(self, xlim, ylim, zlim):
         """Adjusts the cube to fit within the given x, y, and z limits."""
@@ -672,26 +807,71 @@ class CubeRegion(RectangleRegion):
         z_start, z_end = max(0, int(round(self.z_min))), min(data.shape[0], int(round(self.z_max)) + 1)
         if z_start >= z_end: return {}
 
-        z, y, x = np.indices(data.shape)
-        xy_mask_2d = self.contains(x[0], y[0])
+        y_slice, x_slice, xy_mask_2d = self._bounded_spatial_selection(
+            data.shape[1:]
+        )
         if not np.any(xy_mask_2d): return {}
 
-        full_mask = ((z >= z_start) & (z < z_end)) & np.broadcast_to(xy_mask_2d, data.shape)
-        
-        vx, vy, vz, intensities = x[full_mask], y[full_mask], z[full_mask], data[full_mask]
-        non_nan_mask = ~np.isnan(intensities)
-        vx, vy, vz, intensities = vx[non_nan_mask], vy[non_nan_mask], vz[non_nan_mask], intensities[non_nan_mask]
+        selected_y, selected_x = np.nonzero(xy_mask_2d)
+        selected_x = (
+            selected_x.astype(np.float64, copy=False) + int(x_slice.start)
+        )
+        selected_y = (
+            selected_y.astype(np.float64, copy=False) + int(y_slice.start)
+        )
+        total_intensity = 0.0
+        weighted_x = 0.0
+        weighted_y = 0.0
+        weighted_z = 0.0
+        valid_count = 0
 
-        if intensities.size == 0: return {}
-        total_intensity = np.sum(intensities)
+        for channel_index in range(z_start, z_end):
+            plane = np.asanyarray(data[channel_index])[y_slice, x_slice]
+            intensities = np.asanyarray(plane[xy_mask_2d]).reshape(-1)
+            valid = ~np.isnan(intensities)
+            if not np.any(valid):
+                continue
+            values = intensities[valid]
+            x_values = selected_x[valid]
+            y_values = selected_y[valid]
+            channel_sum = float(np.sum(values, dtype=np.float64))
+            total_intensity += channel_sum
+            weighted_x += float(np.sum(values * x_values, dtype=np.float64))
+            weighted_y += float(np.sum(values * y_values, dtype=np.float64))
+            weighted_z += channel_sum * channel_index
+            valid_count += int(values.size)
+
+        if valid_count == 0: return {}
         if total_intensity == 0: return {}
 
-        mean_x = np.sum(intensities * vx) / total_intensity
-        mean_y = np.sum(intensities * vy) / total_intensity
-        mean_z = np.sum(intensities * vz) / total_intensity
-        var_x = np.sum(intensities * (vx - mean_x)**2) / total_intensity
-        var_y = np.sum(intensities * (vy - mean_y)**2) / total_intensity
-        var_z = np.sum(intensities * (vz - mean_z)**2) / total_intensity
+        mean_x = weighted_x / total_intensity
+        mean_y = weighted_y / total_intensity
+        mean_z = weighted_z / total_intensity
+        x_offset_sq = (selected_x - mean_x) ** 2
+        y_offset_sq = (selected_y - mean_y) ** 2
+        weighted_var_x = 0.0
+        weighted_var_y = 0.0
+        weighted_var_z = 0.0
+
+        for channel_index in range(z_start, z_end):
+            plane = np.asanyarray(data[channel_index])[y_slice, x_slice]
+            intensities = np.asanyarray(plane[xy_mask_2d]).reshape(-1)
+            valid = ~np.isnan(intensities)
+            if not np.any(valid):
+                continue
+            values = intensities[valid]
+            channel_sum = float(np.sum(values, dtype=np.float64))
+            weighted_var_x += float(
+                np.sum(values * x_offset_sq[valid], dtype=np.float64)
+            )
+            weighted_var_y += float(
+                np.sum(values * y_offset_sq[valid], dtype=np.float64)
+            )
+            weighted_var_z += channel_sum * (channel_index - mean_z) ** 2
+
+        var_x = weighted_var_x / total_intensity
+        var_y = weighted_var_y / total_intensity
+        var_z = weighted_var_z / total_intensity
 
         return {
             'mean_x_pix': mean_x, 'mean_y_pix': mean_y, 'mean_z_pix': mean_z,

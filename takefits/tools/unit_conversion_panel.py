@@ -13,8 +13,10 @@ from datetime import datetime
 from astropy import constants as const
 from astropy import units as u
 from astropy.io import fits
+from takefits.core.io.save_fits import update_datamin_datamax_if_present
 from takefits.core.usecases import convert_intensity_unit
 from takefits.core.history_provenance import build_processing_history_lines
+from takefits.logic.data_tools import create_preview_snapshot, is_lazy_scaled
 from takefits.tools.base_panel import (
     capture_preferred_cursor_snapshot,
     clear_action_preview_record,
@@ -616,7 +618,10 @@ class UnitConversionPanel(QWidget):
     def _ensure_original_data(self):
         """Check if original_data is cached, if not, cache it."""
         if self.original_data is None:
-            self.original_data = self.fits_viewer.data.copy()
+            self.original_data = create_preview_snapshot(
+                self.fits_viewer.data,
+                operation_name="Unit conversion",
+            )
             header = getattr(self.fits_viewer, 'header', None)
             self._conversion_baseline_has_bunit = bool(header is not None and 'BUNIT' in header)
             self._conversion_baseline_bunit = header.get('BUNIT') if header is not None else None
@@ -1288,8 +1293,9 @@ class UnitConversionPanel(QWidget):
         else: # This branch is taken if header was modified but no specific suffix applies
             suffix = "hdr_edit"
 
-        # Prepare a copy of the data to be potentially flipped back
-        data_to_save = self.fits_viewer.data.copy()
+        # Saving does not mutate the displayed array. Keep the existing array
+        # (or lazy memmap wrapper) instead of making a second full-cube copy.
+        data_to_save = self.fits_viewer.data
 
         # Check if the data should be reverted to its original order
         was_flipped_on_load = self.spectral_metadata.get('axis_flipped', False)
@@ -1304,16 +1310,31 @@ class UnitConversionPanel(QWidget):
                 spectral_axis_dim = data_to_save.ndim - self._spectral_axis_index
                 
                 if 0 <= spectral_axis_dim < data_to_save.ndim:
-                    data_to_save = np.flip(data_to_save, axis=spectral_axis_dim)
+                    if is_lazy_scaled(data_to_save):
+                        data_to_save = data_to_save._raw_view_op(
+                            np.flip,
+                            axis=spectral_axis_dim,
+                        )
+                    else:
+                        data_to_save = np.flip(
+                            data_to_save,
+                            axis=spectral_axis_dim,
+                        )
                     print("\033[96mData array reverted to original FITS file order for saving.\033[0m")
 
-        valid_data = data_to_save[np.isfinite(data_to_save)]
-        data_min = float(np.nanmin(valid_data)) if valid_data.size > 0 else 0.0
-        data_max = float(np.nanmax(valid_data)) if valid_data.size > 0 else 0.0
-
         new_header = self._prepare_header_for_save(is_data_being_flipped_back=revert_flip)
-        new_header['DATAMIN'] = data_min
-        new_header['DATAMAX'] = data_max
+        update_datamin_datamax_if_present(
+            new_header,
+            data_to_save,
+            ensure=True,
+        )
+        # Preserve this panel's historical all-invalid convention.
+        if not (
+            np.isfinite(new_header.get('DATAMIN', np.nan))
+            and np.isfinite(new_header.get('DATAMAX', np.nan))
+        ):
+            new_header['DATAMIN'] = 0.0
+            new_header['DATAMAX'] = 0.0
 
         stale_history_lines = []
         for lines in self._history_categories.values():

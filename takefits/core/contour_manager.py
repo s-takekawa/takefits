@@ -18,6 +18,7 @@ from astropy.coordinates import SkyCoord
 from astropy.wcs.utils import wcs_to_celestial_frame, skycoord_to_pixel, pixel_to_skycoord
 import astropy.units as u
 from matplotlib.path import Path
+from takefits.logic.data_tools import ensure_operation_memory_budget
 
 try:
     from scipy.ndimage import gaussian_filter
@@ -40,6 +41,97 @@ FRAME_ALIASES = {
     "GAL": "GALACTIC",
     "GALACTIC": "GALACTIC",
 }
+
+_CONTOUR_BASE_BYTES_PER_PIXEL = 40
+_CONTOUR_SMOOTHING_BYTES_PER_PIXEL = 24
+_CONTOUR_PATH_BYTES_PER_PIXEL_PER_LEVEL = 8
+_CONTOUR_PRICED_LEVEL_LIMIT = 4
+
+
+def estimate_contour_working_nbytes(
+    data,
+    *,
+    smoothing: float = 0.0,
+    level_count: int = 1,
+) -> Optional[int]:
+    """Estimate additional arrays used to materialize and contour a 2D plane.
+
+    The allowance covers a float64 plane, invalid-value masks, Matplotlib's
+    numeric/masked buffers, and a bounded path-vertex allowance per contour
+    level. Gaussian filtering adds sanitized input, output, and scratch space.
+    """
+    shape = getattr(data, "shape", None)
+    if shape is None or len(shape) != 2:
+        return None
+    try:
+        pixels = int(shape[0]) * int(shape[1])
+        levels = max(1, int(level_count))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    bytes_per_pixel = _CONTOUR_BASE_BYTES_PER_PIXEL
+    if float(smoothing or 0.0) > 0:
+        bytes_per_pixel += _CONTOUR_SMOOTHING_BYTES_PER_PIXEL
+    bytes_per_pixel += (
+        min(levels, _CONTOUR_PRICED_LEVEL_LIMIT)
+        * _CONTOUR_PATH_BYTES_PER_PIXEL_PER_LEVEL
+    )
+    return pixels * bytes_per_pixel
+
+
+def ensure_contour_memory_budget(
+    data,
+    *,
+    smoothing: float = 0.0,
+    level_count: int = 1,
+    operation_name: str = "Contour generation",
+) -> None:
+    """Reject a contour operation before a full plane is materialized."""
+    required = estimate_contour_working_nbytes(
+        data,
+        smoothing=smoothing,
+        level_count=level_count,
+    )
+    if required is None:
+        return
+    ensure_operation_memory_budget(
+        required,
+        operation_name=operation_name,
+        guidance=(
+            "Use a smaller FITS cutout, fewer contour levels, or disable "
+            "Gaussian smoothing before generating contours."
+        ),
+    )
+
+
+def _finite_bounds_2d(data, *, target_bytes: int = 16 * 1024 ** 2):
+    """Return finite min/max using bounded row blocks."""
+    shape = getattr(data, "shape", None)
+    if shape is None or len(shape) != 2:
+        return None
+    try:
+        ny, nx = int(shape[0]), int(shape[1])
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if ny <= 0 or nx <= 0:
+        return None
+    rows_per_block = max(1, int(target_bytes) // max(1, nx * 8))
+    current_min = np.inf
+    current_max = -np.inf
+    any_finite = False
+    for row_start in range(0, ny, rows_per_block):
+        row_stop = min(ny, row_start + rows_per_block)
+        block = np.asarray(data[row_start:row_stop], dtype=np.float64)
+        finite = np.isfinite(block)
+        if not np.any(finite):
+            continue
+        block_min = float(np.min(block, where=finite, initial=np.inf))
+        block_max = float(np.max(block, where=finite, initial=-np.inf))
+        current_min = min(current_min, block_min)
+        current_max = max(current_max, block_max)
+        any_finite = True
+    if not any_finite:
+        return None
+    return current_min, current_max
 
 
 def _normalize_frame_name(name: Optional[str]) -> Optional[str]:
@@ -285,6 +377,58 @@ class ContourListEntry:
     active: bool = False
 
 
+def resolve_contour_levels(
+    params: "ContourParameters",
+    data_min: float,
+    data_max: float,
+) -> Optional[List[float]]:
+    """Contour levels from explicit values, or from a min/max/step ladder.
+
+    Module-level so headless rendering uses the exact rules the GUI does
+    (TF-303); `ContourLayer._ensure_levels` delegates here.
+    """
+    if params.levels is not None:
+        ordered: List[float] = []
+        values: List[float] = []
+        for level in params.levels:
+            try:
+                value = float(level)
+            except Exception:
+                continue
+            if not np.isfinite(value):
+                continue
+            values.append(value)
+        for value in sorted(values):
+            if not ordered or not math.isclose(ordered[-1], value):
+                ordered.append(value)
+        return ordered or None
+
+    vmin = params.level_min if params.level_min is not None else data_min
+    vmax = params.level_max if params.level_max is not None else data_max
+    if vmin > vmax:
+        vmin, vmax = vmax, vmin
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        return None
+    if math.isclose(vmin, vmax):
+        return [vmin]
+    if params.level_step is None or params.level_step == 0:
+        return [vmin, vmax]
+    step = params.level_step
+    if step < 0:
+        step = abs(step)
+    if step == 0:
+        step = (vmax - vmin) / 7.0 if vmax != vmin else 1.0
+    count = int(math.floor((vmax - vmin) / step)) + 1
+    if count < 1:
+        count = 1
+    levels = [vmin + i * step for i in range(count)]
+    ordered: List[float] = []
+    for val in levels:
+        if not ordered or not math.isclose(ordered[-1], val):
+            ordered.append(val)
+    return ordered
+
+
 class ContourLayer:
     """
     Wraps one logical drawing surface (main window, subwindow, PV plot, etc.).
@@ -381,14 +525,11 @@ class ContourLayer:
                     if np.isfinite(cmin) and np.isfinite(cmax):
                         clim_mins.append(cmin)
                         clim_maxs.append(cmax)
-            arr = np.asarray(item.data, dtype=float)
-            if arr.size == 0:
+            bounds = _finite_bounds_2d(item.data)
+            if bounds is None:
                 continue
-            arr = arr[np.isfinite(arr)]
-            if arr.size == 0:
-                continue
-            mins.append(float(arr.min()))
-            maxs.append(float(arr.max()))
+            mins.append(float(bounds[0]))
+            maxs.append(float(bounds[1]))
         if clim_mins and clim_maxs:
             return float(min(clim_mins)), float(max(clim_maxs))
         if not mins or not maxs:
@@ -945,46 +1086,7 @@ class ContourLayer:
         data_min: float,
         data_max: float,
     ) -> Optional[List[float]]:
-        if params.levels is not None:
-            ordered: List[float] = []
-            values: List[float] = []
-            for level in params.levels:
-                try:
-                    value = float(level)
-                except Exception:
-                    continue
-                if not np.isfinite(value):
-                    continue
-                values.append(value)
-            for value in sorted(values):
-                if not ordered or not math.isclose(ordered[-1], value):
-                    ordered.append(value)
-            return ordered or None
-
-        vmin = params.level_min if params.level_min is not None else data_min
-        vmax = params.level_max if params.level_max is not None else data_max
-        if vmin > vmax:
-            vmin, vmax = vmax, vmin
-        if not np.isfinite(vmin) or not np.isfinite(vmax):
-            return None
-        if math.isclose(vmin, vmax):
-            return [vmin]
-        if params.level_step is None or params.level_step == 0:
-            return [vmin, vmax]
-        step = params.level_step
-        if step < 0:
-            step = abs(step)
-        if step == 0:
-            step = (vmax - vmin) / 7.0 if vmax != vmin else 1.0
-        count = int(math.floor((vmax - vmin) / step)) + 1
-        if count < 1:
-            count = 1
-        levels = [vmin + i * step for i in range(count)]
-        ordered: List[float] = []
-        for val in levels:
-            if not ordered or not math.isclose(ordered[-1], val):
-                ordered.append(val)
-        return ordered
+        return resolve_contour_levels(params, data_min, data_max)
 
 
     def update(self, params: ContourParameters) -> Optional[ContourState]:        
@@ -1041,15 +1143,11 @@ class ContourLayer:
         mins = []
         maxs = []
         for item in items:
-            arr = np.asarray(item.data, dtype=float)
-            if arr.size == 0:
+            bounds = _finite_bounds_2d(item.data)
+            if bounds is None:
                 continue
-            finite_mask = np.isfinite(arr)
-            if not finite_mask.any():
-                continue
-            finite_vals = arr[finite_mask]
-            mins.append(float(finite_vals.min()))
-            maxs.append(float(finite_vals.max()))
+            mins.append(float(bounds[0]))
+            maxs.append(float(bounds[1]))
 
         try:
             if not mins or not maxs:
@@ -1072,20 +1170,27 @@ class ContourLayer:
             new_last_contour_sets: Dict[str, "QuadContourSet"] = {}
 
             for item in items:
+                ensure_contour_memory_budget(
+                    item.data,
+                    smoothing=params.smoothing,
+                    level_count=len(levels),
+                )
                 arr = np.asarray(item.data, dtype=float)
                 if arr.ndim != 2 or arr.size == 0:
                     continue
-                arr = np.where(np.isfinite(arr), arr, np.nan)
 
                 if params.smoothing and params.smoothing > 0 and gaussian_filter is not None:
                     sigma = max(params.smoothing, 0.0)
+                    finite = np.isfinite(arr)
+                    if not np.all(finite):
+                        arr = np.array(arr, dtype=float, copy=True)
+                        arr[~finite] = np.nan
                     arr = gaussian_filter(arr, sigma=sigma)
 
-                finite_mask = np.isfinite(arr)
-                if not finite_mask.any():
+                bounds = _finite_bounds_2d(arr)
+                if bounds is None:
                     continue
-                arr_min = float(np.nanmin(arr))
-                arr_max = float(np.nanmax(arr))
+                arr_min, arr_max = bounds
                 if math.isclose(arr_min, arr_max):
                     continue
 

@@ -18,7 +18,25 @@ except Exception:  # pragma: no cover - SciPy compatibility fallback
         PeakPropertyWarning = Warning
 
 from takefits.core.app_state import AppState, RegionSpec
+from takefits.logic.data_tools import ensure_operation_memory_budget, sanitize_slice
 from .utils import get_axis_ctype, parse_world_coordinate
+
+
+_AVERAGED_SPECTRUM_TILE_PIXELS = 1_048_576
+
+
+def _averaged_spectrum_tile_shape(height: int, width: int) -> Tuple[int, int]:
+    """Choose a spatial tile containing at most the configured pixel target."""
+    width_for_rows = min(max(1, int(width)), _AVERAGED_SPECTRUM_TILE_PIXELS)
+    tile_rows = min(
+        max(1, int(height)),
+        max(1, _AVERAGED_SPECTRUM_TILE_PIXELS // width_for_rows),
+    )
+    tile_cols = min(
+        max(1, int(width)),
+        max(1, _AVERAGED_SPECTRUM_TILE_PIXELS // tile_rows),
+    )
+    return tile_rows, tile_cols
 
 
 def get_spectrum(
@@ -87,14 +105,14 @@ def get_spectrum(
             # But logic allows 2D returns array of 1.
             y = max(0, min(y, data.shape[0] - 1))
             x = max(0, min(x, data.shape[1] - 1))
-            return np.array([data[y, x]])
+            return sanitize_slice(np.array([data[y, x]]))
         raise ValueError(f"Expected 3D data cube, got {data.ndim}D")
 
     # Clamp to valid range
     y = max(0, min(y, data.shape[1] - 1))
     x = max(0, min(x, data.shape[2] - 1))
 
-    return data[:, y, x].copy()
+    return sanitize_slice(data[:, y, x]).copy()
 
 
 def get_averaged_spectrum(
@@ -118,7 +136,7 @@ def get_averaged_spectrum(
 
     data_cube = state.data
     if data_cube.ndim == 4:
-        data_cube = data_cube[0]
+        data_cube = data_cube[state.current_s]
 
     # Get dimensions
     z_dim, height, width = data_cube.shape
@@ -150,7 +168,7 @@ def get_averaged_spectrum(
     else:
         raise ValueError(f"Unsupported region shape: {region.type}")
 
-    # --- 2. Create a small sub-cube based on the bounding box ---
+    # --- 2. Clip the region's spatial bounding box ---
     x_start, x_end = int(np.floor(x_min)), int(np.ceil(x_max))
     y_start, y_end = int(np.floor(y_min)), int(np.ceil(y_max))
 
@@ -162,12 +180,26 @@ def get_averaged_spectrum(
     if x_start >= x_end or y_start >= y_end:
         raise ValueError("Region is outside data bounds")
 
-    sub_cube = data_cube[:, y_start:y_end, x_start:x_end]
+    region_height = y_end - y_start
+    region_width = x_end - x_start
+    region_pixels = region_height * region_width
 
-    # --- 3. Create a local mask for the sub-cube ---
-    y_grid, x_grid = np.indices(sub_cube.shape[1:])
-    x_grid = x_grid + x_start
-    y_grid = y_grid + y_start
+    # The only region-sized state retained below is a 2-D boolean mask.  The
+    # coordinate expressions used to construct rotated shapes can briefly hold
+    # a few float64 planes, so bound that peak before creating them.
+    ensure_operation_memory_budget(
+        region_pixels * (4 * np.dtype(np.float64).itemsize + np.dtype(np.bool_).itemsize)
+        + z_dim * 2 * np.dtype(np.float64).itemsize,
+        operation_name="Region-averaged Spectrum",
+        guidance=(
+            "Select a smaller spatial region or make a cutout before averaging "
+            "the spectrum."
+        ),
+    )
+
+    # --- 3. Create one 2-D local mask (never a channel-broadcast 3-D mask) ---
+    y_grid = np.arange(y_start, y_end, dtype=np.float64)[:, np.newaxis]
+    x_grid = np.arange(x_start, x_end, dtype=np.float64)[np.newaxis, :]
 
     # Region check logic (using RegionSpec params)
     if region.type == "circle":
@@ -207,54 +239,117 @@ def get_averaged_spectrum(
     if not np.any(local_mask):
         raise ValueError("Region contains no data")
 
-    # --- 4. Calculate average ---
-    mask_3d = np.broadcast_to(local_mask, sub_cube.shape)
+    # --- 4. Average finite values channel-by-channel and spatial-tile-by-tile ---
+    # A LazyScaledArray therefore scales only one bounded 2-D tile at a time,
+    # while a normal ndarray follows the same finite-value averaging semantics.
+    spectrum = np.full(z_dim, np.nan, dtype=np.float64)
+    tile_rows, tile_cols = _averaged_spectrum_tile_shape(
+        region_height, region_width
+    )
+    for channel in range(z_dim):
+        channel_sum = 0.0
+        channel_count = 0
+        for local_y in range(0, region_height, tile_rows):
+            local_y_end = min(local_y + tile_rows, region_height)
+            source_y = slice(y_start + local_y, y_start + local_y_end)
+            for local_x in range(0, region_width, tile_cols):
+                local_x_end = min(local_x + tile_cols, region_width)
+                source_x = slice(x_start + local_x, x_start + local_x_end)
+                region_tile = local_mask[
+                    local_y:local_y_end,
+                    local_x:local_x_end,
+                ]
+                if not np.any(region_tile):
+                    continue
 
-    # Apply NAN masking if needed
-    if np.ma.is_masked(sub_cube):
-        mask_3d = mask_3d & (~sub_cube.mask)
-    else:
-        # Handle NaNs in numpy array
-        nan_mask = np.isnan(sub_cube)
-        mask_3d = mask_3d & (~nan_mask)
+                data_tile = data_cube[channel, source_y, source_x]
+                if np.ma.isMaskedArray(data_tile):
+                    values = sanitize_slice(
+                        np.array(np.ma.getdata(data_tile), copy=True)
+                    )
+                    valid = ~np.ma.getmaskarray(data_tile)
+                    valid = valid & region_tile & np.isfinite(values)
+                else:
+                    values = sanitize_slice(np.array(data_tile, copy=True))
+                    valid = region_tile & np.isfinite(values)
 
-    masked_data = np.ma.array(sub_cube, mask=~mask_3d)
-    spectrum = masked_data.mean(axis=(1, 2))
+                valid_count = int(np.count_nonzero(valid))
+                if valid_count:
+                    channel_sum += float(np.sum(values[valid], dtype=np.float64))
+                    channel_count += valid_count
 
-    # --- 5. Clean up spectrum ---
-    if isinstance(spectrum, np.ma.MaskedArray):
-        spectrum = spectrum.filled(np.nan)
+        if channel_count:
+            spectrum[channel] = channel_sum / channel_count
 
-    # --- 6. Get velocity axis ---
-    spectrum_len = len(spectrum)
-    if state.wcs and state.wcs.wcs.naxis >= 3:
-        # Generate pixel indices for spectral axis
-        spec_axis = 2  # Default 3rd axis
-        # Try to find spectral axis index
-        for i, ctype in enumerate(state.wcs.wcs.ctype):
-            if any(x in ctype.upper() for x in ['VEL', 'FREQ', 'VRAD', 'VOPT']):
-                spec_axis = i
-                break
-
-        pix_coords = np.arange(spectrum_len)
-        # Convert to world coordinates (spectral only)
-        # This is a bit simplified; ideally we use pixel_to_world_values logic
-        # But we can use crval/cdelt/crpix approximation if WCS is linear,
-        # or use WCS methods if complex.
-        # Fallback to linear approx for headless speed and simplicity in this bridging phase
-        crval = state.wcs.wcs.crval[spec_axis]
-        cdelt = state.wcs.wcs.cdelt[spec_axis]
-        crpix = state.wcs.wcs.crpix[spec_axis]
-        # X = (p - crpix) * cdelt + crval
-        velocity_values = (pix_coords - (crpix - 1)) * cdelt + crval
-
-        # Unit
-        unit = state.wcs.wcs.cunit[spec_axis].to_string() if state.wcs.wcs.cunit else "unknown"
-    else:
-        velocity_values = np.arange(spectrum_len)
-        unit = "pixel"
+    # --- 5. Get spectral axis ---
+    velocity_values = spectral_axis_values(state, len(spectrum))
+    unit = spectral_axis_unit(state, len(spectrum), fallback="pixel")
 
     return velocity_values, spectrum, unit
+
+
+def _spectral_axis_values_with_status(
+    state: AppState, n_channels: int
+) -> Tuple[np.ndarray, bool]:
+    """Return spectral values and whether WCS conversion actually succeeded."""
+    values = np.arange(int(n_channels), dtype=float)
+    wcs = getattr(state, "wcs", None)
+    if wcs is None:
+        return values, False
+    try:
+        spectral = wcs.spectral
+        if spectral.naxis != 1:
+            return values, False
+        world = np.asarray(
+            spectral.pixel_to_world_values(values), dtype=float
+        ).ravel()
+        if world.size == values.size and np.all(np.isfinite(world)):
+            return world, True
+    except Exception:
+        pass
+    return values, False
+
+
+def spectral_axis_values(state: AppState, n_channels: int) -> np.ndarray:
+    """World values along the spectral axis, falling back to channel index.
+
+    Using the one-dimensional spectral WCS keeps extraction, fitting, and
+    plotting on the same axis, including non-trivial WCS transformations.
+    """
+    return _spectral_axis_values_with_status(state, n_channels)[0]
+
+
+def spectral_axis_unit(
+    state: AppState, n_channels: int, *, fallback: str = "pixel"
+) -> str:
+    """Unit matching :func:`spectral_axis_values`, including its fallback."""
+    _values, used_world = _spectral_axis_values_with_status(state, n_channels)
+    if not used_world:
+        return fallback
+    unit = spectral_unit_string(state)
+    if unit:
+        return unit
+    try:
+        spectral_unit = state.wcs.spectral.wcs.cunit[0]
+        return spectral_unit.to_string() if spectral_unit else fallback
+    except Exception:
+        return fallback
+
+
+def spectral_unit_string(state: AppState) -> str:
+    """Converted spectral-axis unit from `spectral_metadata`, or ''.
+
+    Accepts either a bare unit (``"km/s"``) or a decorated label
+    (``"Velocity [km/s]"``), matching what `export_pv_fits` parses.
+    """
+    metadata = getattr(state, "spectral_metadata", None) or {}
+    raw = str(metadata.get("current_axis_unit", "") or "").strip()
+    if not raw:
+        return ""
+    import re
+
+    match = re.search(r"\[(.*?)\]", raw)
+    return (match.group(1) if match else raw).strip()
 
 
 @dataclass
@@ -291,6 +386,36 @@ class GaussianFitResult:
     y: np.ndarray
     model: np.ndarray
     residual: np.ndarray
+
+    def evaluate(self, x: np.ndarray) -> np.ndarray:
+        """Evaluate the fitted model at arbitrary *x*.
+
+        ``model`` is sampled only at the input channels, so plotting it draws a
+        polyline through a handful of points and a narrow line looks angular.
+        Re-evaluating on a finer grid gives the smooth curve a figure wants.
+        """
+        params: List[float] = []
+        for component in self.components:
+            params.extend(
+                [component.amplitude, component.center, component.sigma]
+            )
+        return _multi_gaussian_model(
+            np.asarray(x, dtype=float), float(self.baseline), params
+        )
+
+    def sample_curve(self, oversample: int = 20, n_points: Optional[int] = None):
+        """Return ``(x, y)`` of the fitted model on a smooth grid.
+
+        The grid spans the fitted x range with ``oversample`` points per input
+        channel, capped so a long spectrum does not produce a huge array.
+        """
+        x_values = np.asarray(self.x, dtype=float)
+        if x_values.size < 2:
+            return x_values, self.evaluate(x_values)
+        if n_points is None:
+            n_points = int(min(4000, max(x_values.size * int(oversample), 200)))
+        fine = np.linspace(float(x_values.min()), float(x_values.max()), n_points)
+        return fine, self.evaluate(fine)
 
 
 def _estimate_noise_sigma(values: np.ndarray, *, clip_sigma: float = 4.0, max_iter: int = 3) -> float:
@@ -806,3 +931,60 @@ def export_spectrum(
     np.savetxt(output_path, data_to_save, fmt='%.6g', delimiter='   ', header=header, comments='')
 
     return output_path
+
+
+def get_region_spectrum(
+    state: AppState,
+    region: Dict[str, Any] | RegionSpec,
+) -> Dict[str, Any]:
+    """Region-averaged spectrum as a JSON-serializable payload (TF-303).
+
+    `get_averaged_spectrum` is headless but returns bare arrays, which an
+    action cannot hand back through a manifest. This wrapper accepts a region
+    payload and returns plain lists plus the spectral unit.
+
+    Args:
+        state: AppState with data and WCS.
+        region: RegionSpec, or a payload dict as used by `add_region`.
+
+    Returns:
+        ``{"velocity": [...], "spectrum": [...], "unit": "km/s", "n_channels": N}``
+    """
+    spec = region if isinstance(region, RegionSpec) else RegionSpec.from_dict(region)
+    velocity_values, spectrum_values, unit_string = get_averaged_spectrum(state, spec)
+    return {
+        "velocity": [float(v) for v in np.asarray(velocity_values).ravel()],
+        "spectrum": [float(v) for v in np.asarray(spectrum_values).ravel()],
+        "unit": str(unit_string),
+        "n_channels": int(np.asarray(spectrum_values).size),
+    }
+
+
+def fit_spectrum_gaussian(
+    state: AppState,
+    x: Optional[int] = None,
+    y: Optional[int] = None,
+    region: Optional[Dict[str, Any] | RegionSpec] = None,
+    n_components: Optional[int] = None,
+    **fit_kwargs: Any,
+) -> "GaussianFitResult":
+    """Fit Gaussians to a spectrum taken from *state* (TF-303).
+
+    Chooses the spectrum source in this order: an explicit ``region`` (averaged
+    spectrum), else the pixel at ``(x, y)``, else the cursor position that
+    `get_spectrum` defaults to. `fit_gaussian_spectrum` itself takes bare
+    arrays, which is not reachable from a manifest.
+    """
+    if region is not None:
+        spec = region if isinstance(region, RegionSpec) else RegionSpec.from_dict(region)
+        x_values, y_values, _unit = get_averaged_spectrum(state, spec)
+    else:
+        y_values = get_spectrum(state, x=x, y=y)
+        x_values = spectral_axis_values(state, np.asarray(y_values).size)
+
+    return fit_gaussian_spectrum(
+        np.asarray(x_values, dtype=float),
+        np.asarray(y_values, dtype=float),
+        n_components=n_components,
+        **fit_kwargs,
+    )

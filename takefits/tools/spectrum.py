@@ -1564,6 +1564,16 @@ class SpecWindow(QWidget):
         else:
              return None, "Application state not initialized"
 
+    def closeEvent(self, event):
+        timer = getattr(self, "_fit_resample_timer", None)
+        if timer is not None:
+            timer.stop()
+        try:
+            plt.close(self.fig)
+        finally:
+            super().closeEvent(event)
+
+
 class SpecNavigationToolbar(NavigationToolbar):
     def __init__(self, canvas, parent=None):
         super().__init__(canvas, parent)

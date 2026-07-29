@@ -892,8 +892,8 @@ class BaselinePanel(BaseToolPanel):
             app_state = getattr(self.fits_viewer, "app_state", None)
             s_idx = int(getattr(app_state, "current_s", 0)) if app_state is not None else 0
             s_idx = max(0, min(s_idx, int(data.shape[0]) - 1))
-            return np.asarray(data[s_idx])
-        return np.asarray(data)
+            return data[s_idx]
+        return data
 
     def _current_cube(self):
         data = getattr(self.fits_viewer, "data", None)
@@ -1068,7 +1068,7 @@ class BaselinePanel(BaseToolPanel):
         if region_spec is None:
             return None, "Unsupported region shape"
 
-        state = SimpleNamespace(data=np.asarray(cube), wcs=self.fits_viewer.wcs)
+        state = SimpleNamespace(data=cube, wcs=self.fits_viewer.wcs)
         try:
             velocity, spectrum, _unit = get_averaged_spectrum(state, region_spec)
             if update_velocity and velocity is not None:
@@ -1733,4 +1733,7 @@ class BaselinePanel(BaseToolPanel):
                 except Exception:
                     pass
             self._region_signal_connected = False
-        super().closeEvent(event)
+        try:
+            plt.close(self.fig)
+        finally:
+            super().closeEvent(event)

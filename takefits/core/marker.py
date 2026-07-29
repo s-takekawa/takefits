@@ -258,7 +258,10 @@ class SymbolMarker(Marker):
     kind = "symbol"
 
     def __init__(self, plane: PlaneId, pixel: Tuple[float, ...], *, symbol: Optional[str] = None, **kwargs: Any) -> None:
-        self.symbol = symbol or kwargs.pop("marker_symbol", "o")
+        # Leave the symbol unset when the caller did not name one, so
+        # ``add_to_axes`` can fall back to ``style.marker_symbol``. Defaulting
+        # to "o" here would make that style field unreachable.
+        self.symbol = symbol or kwargs.pop("marker_symbol", None)
         super().__init__(plane, pixel, **kwargs)
 
     def add_to_axes(self, ax) -> None:  # pragma: no cover - requires mpl context

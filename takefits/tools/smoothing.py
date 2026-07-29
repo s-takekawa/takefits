@@ -5,6 +5,7 @@ import numpy as np
 from takefits.ui.save_fits_dialog import SaveFITS
 from takefits.core import usecases
 from takefits.core.history_provenance import build_processing_history_lines
+from takefits.logic.data_tools import create_preview_snapshot, is_lazy_scaled
 from takefits.tools.base_panel import clear_action_preview_record, confirm_pending_close, has_action_record_tag, record_action_preview
 import time
 import os
@@ -232,9 +233,16 @@ class SmoothSettingsPanel(QDialog):
         else:
             self.smoothness_groupbox.setEnabled(True)
 
-    def execute_smoothing(self):
+    def _ensure_original_data(self):
+        """Snapshot normal arrays but keep immutable scaled memmaps lazy."""
         if self.original_data is None:
-            self.original_data = self.fits_viewer.data.copy()
+            self.original_data = create_preview_snapshot(
+                self.fits_viewer.data,
+                operation_name="Smoothing",
+            )
+
+    def execute_smoothing(self):
+        self._ensure_original_data()
 
         # Determine kernel type
         if self.gaussian_radio.isChecked():
@@ -244,16 +252,20 @@ class SmoothSettingsPanel(QDialog):
         else:
             kernel_type = 'hanning'
 
-        if self.checkbox.isChecked() and kernel_type == 'gaussian':
-            # Target resolution smoothing
-            smoothed_data = self._execute_target_resolution_smoothing()
-            if smoothed_data is None:
-                return
-        else:
-            # Normal smoothing with pixel-based kernel size
-            smoothed_data = self._execute_normal_smoothing(kernel_type)
-            if smoothed_data is None:
-                return
+        try:
+            if self.checkbox.isChecked() and kernel_type == 'gaussian':
+                # Target resolution smoothing
+                smoothed_data = self._execute_target_resolution_smoothing()
+                if smoothed_data is None:
+                    return False
+            else:
+                # Normal smoothing with pixel-based kernel size
+                smoothed_data = self._execute_normal_smoothing(kernel_type)
+                if smoothed_data is None:
+                    return False
+        except MemoryError as exc:
+            QMessageBox.critical(self, "Smoothing Memory Limit", str(exc))
+            return False
 
         # Update data in viewer and subwindows
         self.fits_viewer.data = smoothed_data
@@ -269,6 +281,7 @@ class SmoothSettingsPanel(QDialog):
         self.update_all_displays()
         self._refresh_main_hpbw_overlay()
         self._record_preview_action()
+        return True
 
     def _execute_normal_smoothing(self, kernel_type: str):
         """Execute normal smoothing using usecase layer."""
@@ -311,28 +324,18 @@ class SmoothSettingsPanel(QDialog):
         current_time = time.time()
         print("Convolving kernel...")
 
-        # Handle 4D data by applying to each slice
         data = self.original_data
-        if data.ndim == 4:
-            smoothed_data = np.empty_like(data)
-            for i in range(data.shape[0]):
-                smoothed_data[i] = usecases.compute_smoothed(
-                    data[i],
-                    kernel_type=kernel_type,
-                    smoothness_x=smoothness_x,
-                    smoothness_y=smoothness_y,
-                    smoothness_z=smoothness_z,
-                    handle_nan=True,
-                )
-        else:
-            smoothed_data = usecases.compute_smoothed(
-                data,
-                kernel_type=kernel_type,
-                smoothness_x=smoothness_x,
-                smoothness_y=smoothness_y,
-                smoothness_z=smoothness_z,
-                handle_nan=True,
-            )
+        # The usecase handles both 3-D and 4-D data without mixing the leading
+        # Stokes axis. Keeping one path avoids a persistent full 4-D output plus
+        # a second per-Stokes smoothing result.
+        smoothed_data = usecases.compute_smoothed(
+            data,
+            kernel_type=kernel_type,
+            smoothness_x=smoothness_x,
+            smoothness_y=smoothness_y,
+            smoothness_z=smoothness_z,
+            handle_nan=True,
+        )
 
         elapsed_time = time.time() - current_time
         print(f"Smoothing done in {elapsed_time:.3g} sec")
@@ -439,7 +442,11 @@ class SmoothSettingsPanel(QDialog):
 
         # Fallback path: reset to the state when the panel was opened.
         if not restored_from_history and self.original_data is not None:
-            self.fits_viewer.data = self.original_data.copy()
+            self.fits_viewer.data = (
+                self.original_data
+                if is_lazy_scaled(self.original_data)
+                else self.original_data.copy()
+            )
             self.fits_viewer.update_cube()
             for window in self.subwindows:
                 if window:
@@ -707,7 +714,8 @@ class SmoothSettingsPanel(QDialog):
                 window.canvas.draw()
 
     def save_fits(self):
-        self.execute_smoothing()
+        if self.execute_smoothing() is not True:
+            return
         data_min =  float(np.nanmin(self.fits_viewer.data))
         data_max =  float(np.nanmax(self.fits_viewer.data))
         new_header = self.fits_viewer.header.copy()

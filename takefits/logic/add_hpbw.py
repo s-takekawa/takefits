@@ -1,6 +1,8 @@
 import matplotlib as mpl
 import numpy as np
 
+from takefits.core.plotting.beam import beam_pixel_geometry
+
 class AddHPBW:
     initial_config = None
     def __init__(self, ax, header, config):
@@ -53,33 +55,16 @@ class AddHPBW:
 
 
     def calculate_hpbw_in_pixels(self):
-        cunit1 = self.header.get('CUNIT1', '').strip().lower()
-        cunit2 = self.header.get('CUNIT2', '').strip().lower()
-        if cunit1 == '' and cunit2 == '': pass
-        elif cunit1 != 'deg' or cunit2 != 'deg':
-            #raise ValueError("CUNIT1 and CUNIT2 must be in degrees (deg).")
+        """Beam size in pixels, shared with the headless renderer.
+
+        The geometry lives in `core/plotting/beam.py` so the GUI and headless
+        exports cannot drift apart. A header with no usable beam yields a
+        zero-size ellipse here, which is what this class has always drawn.
+        """
+        geometry = beam_pixel_geometry(self.header)
+        if geometry is None:
             return 0, 0, 0
-    
-        bmaj = self.header.get('BMAJ', 0)
-        bmin = self.header.get('BMIN', 0)
-        bpa = self.header.get('BPA', 0)
-        
-        try:
-            cdelt1 = abs(self.header['CDELT1'])
-            cdelt2 = abs(self.header['CDELT2'])
-        except: #to be developed!
-            print("\033[1;31m\033[1mWarning: Coordinates are defined by CD matrix.\033[0m")
-            print("\033[1;31m\033[1mCoordinate axis is tilted to the frame.\033[0m")
-            cdelt1 = np.sqrt((self.header['CD1_1'])**2 + (self.header['CD2_1'])**2)
-            cdelt2 = np.sqrt((self.header['CD1_2'])**2 + (self.header['CD2_2'])**2)
-
-        #if bmaj is None or bmin is None:
-        #    raise ValueError("BMAJ or BMIN is not available in the FITS header.")
-
-        hpbw_major_pix = bmaj / cdelt1
-        hpbw_minor_pix = bmin / cdelt2
-
-        return hpbw_major_pix, hpbw_minor_pix, bpa
+        return geometry
 
     def update_position(self, event=None):
         self.relative_x = self.config.get('beam_pos_x', 0.1)

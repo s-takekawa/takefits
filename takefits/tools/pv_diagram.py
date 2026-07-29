@@ -2,7 +2,7 @@ import copy
 import json
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QGroupBox, QFormLayout, QCheckBox, QComboBox, QDoubleSpinBox, QLabel, QButtonGroup, QRadioButton, QLineEdit, QGridLayout, QFileDialog, QMessageBox, QScrollArea, QSizePolicy, QAbstractScrollArea, QSlider, QMenu
 import time
@@ -56,6 +56,20 @@ from takefits.core.usecases import (
 from takefits.tools.pv_slit_overlay import build_slit_overlay
 
 DEFAULT_SAMPLE_SPACING_PIX = 1.0
+PV_COLOR_HISTOGRAM_DEBOUNCE_MS = 150
+
+
+def _sample_centered_image_extent(
+    bounds,
+    num_samples,
+):
+    """Expand centre-coordinate bounds into the pixel edges used by imshow."""
+    start, end = float(bounds[0]), float(bounds[1])
+    count = int(num_samples)
+    if count <= 1:
+        return start, end
+    step = (end - start) / float(count - 1)
+    return start - step / 2.0, end + step / 2.0
 
 
 class PVNavigationToolbar(MyNavigationToolbar):
@@ -173,7 +187,7 @@ class PVdiagram(QMainWindow):
         self.coord_converter = CoordinateConverter(self.wcs, self.fits_viewer.config_manager.config)
 
         self._get_pixel_scale()
-        self.length_unit = 'pixel'  # Default unit
+        self.length_unit = self._default_length_unit()
 
         self.color_settings_panel = None
         self._contour_layer_id: Optional[str] = None
@@ -248,6 +262,7 @@ class PVdiagram(QMainWindow):
         self.position_axis_flipped = False
         self.ellipse_axis_unit = "pixel"
         self.position_origin = POSITION_ORIGIN_START
+        self._endpoint_position_origin = POSITION_ORIGIN_START
         self.geometry_input_mode = "endpoints"
         self._updating_geometry_controls = False
         self.path_type = "straight"
@@ -376,6 +391,20 @@ class PVdiagram(QMainWindow):
         if self.pixel_scale_deg is None:
             print("Warning: Pixel scale in degrees could not be determined. Angular unit conversion will be disabled.")
 
+    def _default_length_unit(self):
+        """Choose a readable angular unit for lengths spanning this image."""
+        if self.pixel_scale_deg is None:
+            return 'pixel'
+        try:
+            spatial_shape = self.data.shape[-2:]
+            max_span_px = max(max(int(size) - 1, 1) for size in spatial_shape)
+            field_span_deg = max_span_px * float(self.pixel_scale_deg)
+        except Exception:
+            return 'deg'
+        if field_span_deg < (1.0 / 60.0):
+            return 'arcsec'
+        return 'deg'
+
     def _convert_length(self, length, from_unit, to_unit):
         """Convert length between different units."""
         if from_unit == to_unit or self.pixel_scale_deg is None:
@@ -427,8 +456,10 @@ class PVdiagram(QMainWindow):
         self.fits_canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.fits_canvas.setFocus()
 
-        central_layout = QVBoxLayout()
-        main_layout.addLayout(central_layout, stretch=5)
+        self.pvResultPanel = QWidget(main_widget)
+        central_layout = QVBoxLayout(self.pvResultPanel)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self.pvResultPanel, stretch=5)
 
         control_panel_right_widget = QWidget()
         control_layout_right = QVBoxLayout(control_panel_right_widget)
@@ -774,6 +805,7 @@ class PVdiagram(QMainWindow):
 
         self.lengthUnitCombo = QComboBox()
         self.lengthUnitCombo.addItems(['pixel', 'deg', 'arcmin', 'arcsec'])
+        self.lengthUnitCombo.setCurrentText(self.length_unit)
         length_layout.addWidget(self.lengthUnitCombo)
         length_layout.addStretch()
         self.lengthWidget = QWidget()
@@ -1123,6 +1155,181 @@ class PVdiagram(QMainWindow):
         # initial baseline snapshot reads the current widget state.
         self._build_slit_undo_menu()
         self._init_slit_undo_state()
+
+        # Most sessions begin by placing a slit on the main image. Keep this
+        # window compact until a usable path is committed; the PV range, canvas,
+        # and toolbar are revealed together exactly once per window lifetime.
+        self._pv_result_revealed = False
+        self._pv_result_full_size_hint = self.sizeHint()
+        self.pvResultPanel.setVisible(False)
+        # QMainWindow may retain the width calculated while the result pane was
+        # still visible. Re-apply the compact size hint so the initial window is
+        # only as wide as the Slit Geometry scroll panel (plus layout margins).
+        compact_layout = self.centralWidget().layout()
+        compact_layout.invalidate()
+        compact_layout.activate()
+        compact_hint = self.centralWidget().sizeHint()
+        minimum_hint = self.minimumSizeHint()
+        compact_width = max(
+            compact_hint.width(),
+            minimum_hint.width(),
+        )
+        compact_height = max(
+            self._pv_result_full_size_hint.height(),
+            minimum_hint.height(),
+        )
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            # Qt will not honor a geometry smaller than minimumSizeHint().
+            # Re-apply that constraint after the screen clamp so our target
+            # matches the geometry Qt can actually set on small displays.
+            compact_width = max(
+                min(compact_width, available.width()),
+                minimum_hint.width(),
+            )
+            compact_height = max(
+                min(compact_height, available.height()),
+                minimum_hint.height(),
+            )
+        self.resize(compact_width, compact_height)
+        self._pv_compact_positioned = False
+
+    def _position_compact_panel_next_to_main(self):
+        """Place the initial Slit Geometry panel beside the main image window."""
+        if (
+            not self.isVisible()
+            or getattr(self, "_pv_result_revealed", False)
+            or getattr(self, "_pv_compact_positioned", False)
+        ):
+            return
+
+        main = getattr(self, "fits_viewer", None)
+        if main is None:
+            return
+        try:
+            main_geometry = main.frameGeometry()
+        except Exception:
+            return
+
+        screen = None
+        try:
+            screen = main.screen()
+        except Exception:
+            pass
+        if screen is None:
+            screen = self.screen()
+        if screen is None:
+            return
+
+        available = screen.availableGeometry()
+        gap = 8
+        right_x = main_geometry.right() + gap + 1
+        left_x = main_geometry.left() - gap - self.width()
+        if right_x + self.width() - 1 <= available.right():
+            x = right_x
+        elif left_x >= available.left():
+            x = left_x
+        else:
+            x = max(available.left(), available.right() - self.width() + 1)
+        y = max(
+            available.top(),
+            min(main_geometry.top(), available.bottom() - self.height() + 1),
+        )
+        self.move(x, y)
+        self._pv_compact_positioned = True
+
+    def _reveal_pv_result(self):
+        """Reveal the PV result pane once and expand the window around its right edge."""
+        panel = getattr(self, "pvResultPanel", None)
+        if panel is None or getattr(self, "_pv_result_revealed", False):
+            return False
+
+        previous_geometry = self.geometry()
+        self._pv_result_revealed = True
+        if not self.isVisible():
+            panel.setVisible(True)
+            return True
+
+        # Showing the result pane and deferring setGeometry() to the next event
+        # loop exposes Qt's intermediate layout: the window first grows to the
+        # right, then jumps back when its settings-side edge is restored. Apply
+        # visibility and the final geometry in one update-suppressed operation
+        # so only the settled layout is painted.
+        updates_were_enabled = self.updatesEnabled()
+        if updates_were_enabled:
+            self.setUpdatesEnabled(False)
+        try:
+            panel.setVisible(True)
+            self._expand_for_pv_result(previous_geometry)
+        finally:
+            if updates_were_enabled:
+                self.setUpdatesEnabled(True)
+        self.update()
+        return True
+
+    def _expand_for_pv_result(self, previous_geometry):
+        """Resize a visible compact window without moving its settings-side edge."""
+        if not self.isVisible() or not getattr(self, "_pv_result_revealed", False):
+            return
+
+        if getattr(self, "pvResultPanel", None) is None:
+            return
+        try:
+            self.centralWidget().layout().activate()
+        except Exception:
+            pass
+
+        full_hint = getattr(self, "_pv_result_full_size_hint", None)
+        minimum_hint = self.minimumSizeHint()
+        target_width = max(
+            full_hint.width() if full_hint is not None else previous_geometry.width(),
+            minimum_hint.width(),
+        )
+        target_height = max(
+            full_hint.height() if full_hint is not None else previous_geometry.height(),
+            minimum_hint.height(),
+        )
+
+        screen = self.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            target_width = max(
+                min(target_width, available.width()),
+                minimum_hint.width(),
+            )
+            target_height = max(
+                min(target_height, available.height()),
+                minimum_hint.height(),
+            )
+            right_edge = previous_geometry.right()
+            x = max(
+                available.left(),
+                min(right_edge - target_width + 1, available.right() - target_width + 1),
+            )
+            y = max(
+                available.top(),
+                min(previous_geometry.top(), available.bottom() - target_height + 1),
+            )
+        else:
+            x = previous_geometry.right() - target_width + 1
+            y = previous_geometry.top()
+
+        self.setGeometry(x, y, target_width, target_height)
+        try:
+            self.pv_canvas.draw_idle()
+        except Exception:
+            pass
+
+    def _reveal_pv_result_if_ready(self):
+        """Reveal only after a non-degenerate path has been committed/restored."""
+        try:
+            ready = self._current_path_length_px() > 1e-6
+        except Exception:
+            ready = False
+        if ready:
+            return self._reveal_pv_result()
+        return False
 
 
     # ------------------------------------------------------------------
@@ -1635,6 +1842,7 @@ class PVdiagram(QMainWindow):
                 item["name"] = self._new_pv_path_name(path_type)
         if sync_combo:
             self._sync_path_list_combo()
+        self._reveal_pv_result_if_ready()
         return True
 
     def begin_new_path(self):
@@ -2144,8 +2352,26 @@ class PVdiagram(QMainWindow):
                 pass
 
     def _on_geometry_input_mode_changed(self):
-        self.geometry_input_mode = self._current_geometry_input_mode()
+        previous_mode = getattr(self, "geometry_input_mode", "endpoints")
+        new_mode = self._current_geometry_input_mode()
+        if new_mode == "center" and previous_mode != "center":
+            self._endpoint_position_origin = self._current_position_origin()
+
+        self.geometry_input_mode = new_mode
         self._sync_geometry_input_enabled()
+        if new_mode == "endpoints" and previous_mode == "center":
+            origin = normalize_position_origin(
+                getattr(self, "_endpoint_position_origin", POSITION_ORIGIN_START)
+            )
+            combo = getattr(self, "positionOriginCombo", None)
+            if combo is not None:
+                idx = combo.findData(origin)
+                if idx >= 0 and combo.currentIndex() != idx:
+                    combo.setCurrentIndex(idx)
+                else:
+                    self.position_origin = origin
+            else:
+                self.position_origin = origin
         self.update_controls()
 
     def _set_position_origin_for_center_input(self):
@@ -2284,6 +2510,8 @@ class PVdiagram(QMainWindow):
         old_origin = normalize_position_origin(getattr(self, "position_origin", POSITION_ORIGIN_START))
         fraction = self._get_cursor_fractional_position(origin=old_origin)
         self.position_origin = self._current_position_origin()
+        if self._current_geometry_input_mode() == "endpoints":
+            self._endpoint_position_origin = self.position_origin
         if fraction is not None:
             self.last_position_coord = self._position_coord_from_fraction(
                 fraction,
@@ -2452,6 +2680,145 @@ class PVdiagram(QMainWindow):
             return None
         return x, y
 
+    def _event_xy_for_main_image_drag(self, event):
+        """Return main-image data coordinates while an existing drag is active.
+
+        Press handling remains restricted to the image axes, but a drag that
+        started there must keep receiving useful coordinates after the pointer
+        crosses the axes frame. Matplotlib still supplies display-pixel
+        coordinates for those motion/release events even though ``inaxes`` and
+        ``xdata``/``ydata`` become ``None``.
+        """
+        event_xy = self._event_xy_on_main_image(event)
+        if event_xy is not None:
+            return event_xy
+        if event is None or self.fits_ax is None:
+            return None
+
+        ex = getattr(event, "x", None)
+        ey = getattr(event, "y", None)
+        if ex is None or ey is None:
+            return None
+        try:
+            x, y = self.fits_ax.transData.inverted().transform((float(ex), float(ey)))
+        except Exception:
+            return None
+        if not np.isfinite(x) or not np.isfinite(y):
+            return None
+        return float(x), float(y)
+
+    def _straight_interaction_active(self):
+        return self.drag_mode == "draw" or self.edit_mode in {"endpoint", "move", "rotate"}
+
+    def _main_image_drag_bounds(self):
+        """Return the visible, sampleable data rectangle for straight drags."""
+        height, width = self.data.shape[-2], self.data.shape[-1]
+        data_bounds = (
+            0.0,
+            max(0.0, float(width - 1)),
+            0.0,
+            max(0.0, float(height - 1)),
+        )
+        try:
+            view_x0, view_x1 = sorted(float(value) for value in self.fits_ax.get_xlim())
+            view_y0, view_y1 = sorted(float(value) for value in self.fits_ax.get_ylim())
+        except Exception:
+            return data_bounds
+
+        x0 = max(data_bounds[0], view_x0)
+        x1 = min(data_bounds[1], view_x1)
+        y0 = max(data_bounds[2], view_y0)
+        y1 = min(data_bounds[3], view_y1)
+        if x0 > x1 or y0 > y1:
+            return data_bounds
+        return x0, x1, y0, y1
+
+    @staticmethod
+    def _project_drag_point_to_bounds(anchor, target, bounds):
+        """Project an outside target onto a rectangle along the anchor ray."""
+        x0, x1, y0, y1 = bounds
+        ax, ay = float(anchor[0]), float(anchor[1])
+        tx, ty = float(target[0]), float(target[1])
+        if x0 <= tx <= x1 and y0 <= ty <= y1:
+            return tx, ty
+
+        anchor_is_inside = x0 <= ax <= x1 and y0 <= ay <= y1
+        dx = tx - ax
+        dy = ty - ay
+        if not anchor_is_inside or (abs(dx) < 1e-12 and abs(dy) < 1e-12):
+            return min(max(tx, x0), x1), min(max(ty, y0), y1)
+
+        exit_fractions = []
+        if dx > 0.0:
+            exit_fractions.append((x1 - ax) / dx)
+        elif dx < 0.0:
+            exit_fractions.append((x0 - ax) / dx)
+        if dy > 0.0:
+            exit_fractions.append((y1 - ay) / dy)
+        elif dy < 0.0:
+            exit_fractions.append((y0 - ay) / dy)
+
+        valid_fractions = [value for value in exit_fractions if 0.0 <= value <= 1.0]
+        if not valid_fractions:
+            return min(max(tx, x0), x1), min(max(ty, y0), y1)
+        fraction = min(valid_fractions)
+        return ax + fraction * dx, ay + fraction * dy
+
+    def _constrain_straight_drag_xy(self, x, y):
+        """Keep a straight-slit drag inside the visible image data rectangle."""
+        bounds = self._main_image_drag_bounds()
+        target = (float(x), float(y))
+
+        if self.drag_mode == "draw" and self.line_start is not None:
+            return self._project_drag_point_to_bounds(self.line_start, target, bounds)
+
+        if self.edit_mode == "endpoint":
+            anchor = self.locked_end if self.dragging_endpoint == 0 else self.locked_start
+            if anchor is not None:
+                return self._project_drag_point_to_bounds(anchor, target, bounds)
+
+        if (
+            self.edit_mode == "move"
+            and self.drag_start is not None
+            and self.initial_line_start is not None
+            and self.initial_line_end is not None
+        ):
+            x0, x1, y0, y1 = bounds
+            desired_dx = target[0] - self.drag_start[0]
+            desired_dy = target[1] - self.drag_start[1]
+            line_min_x = min(self.initial_line_start[0], self.initial_line_end[0])
+            line_max_x = max(self.initial_line_start[0], self.initial_line_end[0])
+            line_min_y = min(self.initial_line_start[1], self.initial_line_end[1])
+            line_max_y = max(self.initial_line_start[1], self.initial_line_end[1])
+            min_dx = x0 - line_min_x
+            max_dx = x1 - line_max_x
+            min_dy = y0 - line_min_y
+            max_dy = y1 - line_max_y
+            if min_dx <= max_dx:
+                desired_dx = min(max(desired_dx, min_dx), max_dx)
+            if min_dy <= max_dy:
+                desired_dy = min(max(desired_dy, min_dy), max_dy)
+            return self.drag_start[0] + desired_dx, self.drag_start[1] + desired_dy
+
+        # Rotation only uses the pointer direction; its fixed-length geometry is
+        # left unchanged rather than distorting the slit to fit the rectangle.
+        return target
+
+    @staticmethod
+    def _motion_has_left_button(event):
+        """Return whether a motion event reports the left button as held."""
+        buttons = getattr(event, "buttons", None)
+        if buttons is not None:
+            try:
+                return bool(buttons & mpl.backend_bases.MouseButton.LEFT)
+            except (TypeError, ValueError):
+                try:
+                    return mpl.backend_bases.MouseButton.LEFT in buttons
+                except TypeError:
+                    pass
+        button = getattr(event, "button", None)
+        return button in (1, mpl.backend_bases.MouseButton.LEFT)
+
     def _update_world_from_pixel(self):
         """Update WCS QLineEdits from pixel QDoubleSpinBoxes."""
         if self.line_start is None or self.line_end is None:
@@ -2595,10 +2962,14 @@ class PVdiagram(QMainWindow):
     def open_color_settings(self):
         self._seed_color_panel_settings_from_current_image()
         if self.color_settings_panel is None:
+            # Histogram/auto-range controls must describe the derived PV image,
+            # not rescan the entire source cube.  Passing self.data here caused
+            # >1 GiB boolean masks/copies when the PV color panel was opened.
+            pv_data = self.pv_im.get_array()
             self.color_settings_panel = ColorSettingsPanel(
                 mode=ColorMode.PV,
                 fits_viewer=self,
-                data=self.data,
+                data=pv_data,
                 config=self.fits_viewer.displaymap.config,
                 color_pattern= self.color_pattern,
                 filename = self.fits_viewer.filename,
@@ -2610,7 +2981,40 @@ class PVdiagram(QMainWindow):
             self.color_settings_panel.raise_()
             self.color_settings_panel.activateWindow()
 
+    def _refresh_open_pv_color_histogram(self):
+        """Refresh one visible histogram from the latest debounced PV image."""
+        panel = self.color_settings_panel
+        if panel is None:
+            return
+        toggle = getattr(panel, "hist_toggle_button", None)
+        if toggle is not None and not toggle.isChecked():
+            return
+        panel.update_histogram()
+
+    def _sync_open_pv_color_panel_data(self):
+        """Point Color Settings at the latest PV and debounce histogram work."""
+        panel = self.color_settings_panel
+        if panel is None:
+            return
+        current_pv_data = self.pv_im.get_array()
+        panel.data = current_pv_data
+        panel._data_nbytes = getattr(current_pv_data, "nbytes", None)
+
+        toggle = getattr(panel, "hist_toggle_button", None)
+        if toggle is not None and not toggle.isChecked():
+            return
+        timer = getattr(self, "_pv_color_histogram_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._refresh_open_pv_color_histogram)
+            self._pv_color_histogram_timer = timer
+        timer.start(PV_COLOR_HISTOGRAM_DEBOUNCE_MS)
+
     def on_color_settings_closed(self):
+        timer = getattr(self, "_pv_color_histogram_timer", None)
+        if timer is not None:
+            timer.stop()
         try:
             self._color_panel_hint = dict(ColorSettingsPanel.settings.get(ColorMode.PV, {}) or {})
             pattern = str(self._color_panel_hint.get("color_pattern") or "")
@@ -2639,18 +3043,24 @@ class PVdiagram(QMainWindow):
         """Saves the current PV diagram data using core usecase."""
         ellipse_mode = self._is_ellipse_mode()
         polyline_mode = self._is_polyline_mode()
-        ellipse_path = self._current_ellipse_path_geometry() if ellipse_mode else None
-        polyline_path = self._current_polyline_path_geometry() if polyline_mode else None
+        try:
+            ellipse_path = self._current_ellipse_path_geometry() if ellipse_mode else None
+            polyline_path = self._current_polyline_path_geometry() if polyline_mode else None
+        except (MemoryError, ValueError) as exc:
+            self._handle_pv_memory_error(exc, force_update=True)
+            return
         if ellipse_mode:
             if ellipse_path is None:
                 QMessageBox.warning(self, "Save Error", "Please draw an ellipse PV path before saving.")
                 return
-            self.update_pv_diagram(force_update=True)
+            if not self.update_pv_diagram(force_update=True):
+                return
         elif polyline_mode:
             if polyline_path is None:
                 QMessageBox.warning(self, "Save Error", "Please draw a polyline PV path before saving.")
                 return
-            self.update_pv_diagram(force_update=True)
+            if not self.update_pv_diagram(force_update=True):
+                return
         elif self.line_start is None or self.line_end is None:
             QMessageBox.warning(self, "Save Error", "Please draw a PV slice on the main window first before saving.")
             return
@@ -5174,7 +5584,7 @@ class PVdiagram(QMainWindow):
         """Slider released: force the PV recompute and record one undo step."""
         self._apply_polyline_curve_change(record_undo=True)
 
-    def apply_controls(self):
+    def apply_controls(self, *, preserve_straight_geometry=False):
         if self._is_polyline_mode():
             self._apply_polyline()
             return
@@ -5188,7 +5598,18 @@ class PVdiagram(QMainWindow):
             self._request_main_overlay_redraw()
             self._record_slit_change()
             return
-        if self._current_geometry_input_mode() == "center":
+        preserve_straight_geometry = (
+            preserve_straight_geometry
+            and self.line_start is not None
+            and self.line_end is not None
+        )
+        if preserve_straight_geometry:
+            # Mouse drags already produced the authoritative endpoints. In pixel
+            # display mode arrowLengthSpin is intentionally rounded for the UI;
+            # rebuilding from that rounded value would move a boundary-clipped
+            # endpoint back outside the image during release finalization.
+            pass
+        elif self._current_geometry_input_mode() == "center":
             center = (self.centerXSpin.value(), self.centerYSpin.value())
             length_px = self._convert_length(
                 self.arrowLengthSpin.value(),
@@ -5550,6 +5971,33 @@ class PVdiagram(QMainWindow):
         else:
             self._set_canvas_cursor(Qt.CursorShape.ArrowCursor)
 
+    def _finish_straight_interaction(self, event_xy=None):
+        """Commit the current straight interaction and always clear drag state."""
+        interaction_was_active = self._straight_interaction_active()
+        try:
+            # Preserve the existing release behavior for control-driven preview
+            # updates too; only the drag-state cleanup depends on an active
+            # pointer interaction.
+            if self.is_interactive_mode:
+                self.finalize_interactive_update(
+                    preserve_straight_geometry=interaction_was_active,
+                )
+        finally:
+            self.drag_mode = None
+            self.edit_mode = None
+            self.dragging_endpoint = None
+            self.arrow_is_being_dragged = False
+
+        if event_xy is not None:
+            self._update_hover_cursor(*event_xy)
+        else:
+            self._set_canvas_cursor(Qt.CursorShape.ArrowCursor)
+
+        if interaction_was_active:
+            # No-op when finalize_interactive_update/apply_controls already
+            # recorded the same geometry.
+            self._record_slit_change()
+
     def on_press(self, event):
         self.arrow_is_being_dragged = False
         # --- Toolbar Mode Check ---
@@ -5660,6 +6108,14 @@ class PVdiagram(QMainWindow):
         # --- End Check ---
 
         event_xy = self._event_xy_on_main_image(event)
+        if self._straight_interaction_active() and not self._motion_has_left_button(event):
+            # A release outside the canvas may not reach Matplotlib. If the next
+            # motion reports no left button, settle the last valid geometry
+            # instead of reviving a stale drag when the pointer re-enters.
+            self._finish_straight_interaction(event_xy)
+            return
+        if event_xy is None and self._straight_interaction_active():
+            event_xy = self._event_xy_for_main_image_drag(event)
         if event_xy is None:
             self._set_canvas_cursor(Qt.CursorShape.ArrowCursor)
             return
@@ -5710,6 +6166,9 @@ class PVdiagram(QMainWindow):
         if self._is_ellipse_mode():
             self._on_ellipse_motion(x, y)
             return
+
+        if self._straight_interaction_active():
+            x, y = self._constrain_straight_drag_xy(x, y)
 
         # Rotate preview when line is fixed and shift key is pressed
         if self.line_fixed and self.edit_mode is None and self.shift_pressed:
@@ -5805,23 +6264,9 @@ class PVdiagram(QMainWindow):
             if self._on_ellipse_release(event_xy):
                 return
 
-        if event_xy is None:
-            self._set_canvas_cursor(Qt.CursorShape.ArrowCursor)
-            return
-
-        # This now handles finalization for ALL mouse operations
-        if self.is_interactive_mode:
-            self.finalize_interactive_update()
-
-        self.drag_mode = None
-        self.edit_mode = None
-        self.dragging_endpoint = None
-        self.arrow_is_being_dragged = False
-
-        self._update_hover_cursor(*event_xy)
-        # Fallback commit for geometry edits that did not route through
-        # apply_controls (no-op when nothing changed, thanks to the diff check).
-        self._record_slit_change()
+        # Straight interactions must terminate even when the pointer is outside
+        # the axes and no data coordinates are available on release.
+        self._finish_straight_interaction(event_xy)
 
 
     def set_pv_range(self):
@@ -5997,29 +6442,58 @@ class PVdiagram(QMainWindow):
         self.is_range_manual = False
         self.update_pv_diagram(force_update=True)
 
+    def _handle_pv_memory_error(self, exc, *, force_update=False):
+        """Report a PV input/allocation failure without modal-dialog storms."""
+        message = str(exc)
+        self._set_pv_status_message(message)
+        now = time.monotonic()
+        previous_message = getattr(self, "_last_pv_memory_error_message", None)
+        previous_time = float(getattr(self, "_last_pv_memory_error_time", 0.0) or 0.0)
+        should_show = (
+            message != previous_message
+            or now - previous_time >= 5.0
+        )
+        self._last_pv_memory_error_message = message
+        if should_show:
+            self._last_pv_memory_error_time = now
+            title = (
+                "PV Memory Limit"
+                if isinstance(exc, MemoryError)
+                else "Invalid PV Path"
+            )
+            QMessageBox.warning(self, title, message)
+
+    def _clear_pv_error_state(self):
+        self._last_pv_memory_error_message = None
+        self._last_pv_memory_error_time = 0.0
 
     def update_pv_diagram(self, force_update=False):
         """Update the PV diagram based on sampled points along the line."""
         if not self.autoUpdateCheck.isChecked() and not force_update:
-            return
+            return False
 
-        ellipse_mode = self._is_ellipse_mode()
-        polyline_mode = self._is_polyline_mode()
-        ellipse_path = self._current_ellipse_path_geometry() if ellipse_mode else None
-        polyline_path = self._current_polyline_path_geometry() if polyline_mode else None
-        # Ellipse and polyline are both driven by a path_geometry object (vs the
-        # straight path's line_start/line_end), so they share most branches here.
-        path_geometry_mode = ellipse_mode or polyline_mode
-        active_path = ellipse_path if ellipse_mode else polyline_path
-        if path_geometry_mode:
-            if active_path is None:
-                return
-        elif self.line_start is None or self.line_end is None:
-            return
+        try:
+            ellipse_mode = self._is_ellipse_mode()
+            polyline_mode = self._is_polyline_mode()
+            ellipse_path = self._current_ellipse_path_geometry() if ellipse_mode else None
+            polyline_path = self._current_polyline_path_geometry() if polyline_mode else None
+            # Ellipse and polyline are both driven by a path_geometry object (vs
+            # the straight path's line_start/line_end), so they share most
+            # branches here.
+            path_geometry_mode = ellipse_mode or polyline_mode
+            active_path = ellipse_path if ellipse_mode else polyline_path
+            if path_geometry_mode:
+                if active_path is None:
+                    return False
+            elif self.line_start is None or self.line_end is None:
+                return False
+        except (MemoryError, ValueError) as exc:
+            self._handle_pv_memory_error(exc, force_update=force_update)
+            return False
 
         current_time = time.time()
         if current_time - self.last_update_time < 0.1 and not force_update:
-            return
+            return False
         self.last_update_time = current_time
 
         # --- Proportional Zoom Calculation (Step 1) ---
@@ -6054,12 +6528,16 @@ class PVdiagram(QMainWindow):
         # --- End Proportional Zoom Calculation ---
 
         # --- PV Data Calculation (Step 2) ---
-        if path_geometry_mode:
-            line_length_px = float(active_path.length_px)
-        else:
-            x0, y0 = self.line_start
-            x1, y1 = self.line_end
-            line_length_px = np.hypot(x1 - x0, y1 - y0)
+        try:
+            if path_geometry_mode:
+                line_length_px = float(active_path.length_px)
+            else:
+                x0, y0 = self.line_start
+                x1, y1 = self.line_end
+                line_length_px = np.hypot(x1 - x0, y1 - y0)
+        except (MemoryError, ValueError) as exc:
+            self._handle_pv_memory_error(exc, force_update=force_update)
+            return False
         sample_spacing_pix = self._current_sample_spacing_pix()
         x_axis_mode = self._current_x_axis_mode()
 
@@ -6067,26 +6545,40 @@ class PVdiagram(QMainWindow):
         app_state = self.get_app_state()
         if app_state:
             if path_geometry_mode:
-                pv = compute_pv(
-                    app_state,
-                    path_geometry=active_path,
-                    width=self.slice_width,
-                    sample_spacing_pix=sample_spacing_pix,
-                    weight_mode=self.weight_mode,
-                    sample_axis=x_axis_mode,
-                )
+                try:
+                    pv = compute_pv(
+                        app_state,
+                        path_geometry=active_path,
+                        width=self.slice_width,
+                        sample_spacing_pix=sample_spacing_pix,
+                        weight_mode=self.weight_mode,
+                        sample_axis=x_axis_mode,
+                    )
+                except (MemoryError, ValueError) as exc:
+                    self._handle_pv_memory_error(
+                        exc,
+                        force_update=force_update,
+                    )
+                    return False
             else:
                 # Sync standard params
                 self.sync_pv_state(x0, y0, x1, y1, self.slice_width)
 
                 # Compute using headless usecase
-                pv = compute_pv(
-                    app_state,
-                    x0=x0, y0=y0, x1=x1, y1=y1,
-                    width=self.slice_width,
-                    sample_spacing_pix=sample_spacing_pix,
-                    weight_mode=self.weight_mode
-                )
+                try:
+                    pv = compute_pv(
+                        app_state,
+                        x0=x0, y0=y0, x1=x1, y1=y1,
+                        width=self.slice_width,
+                        sample_spacing_pix=sample_spacing_pix,
+                        weight_mode=self.weight_mode
+                    )
+                except (MemoryError, ValueError) as exc:
+                    self._handle_pv_memory_error(
+                        exc,
+                        force_update=force_update,
+                    )
+                    return False
             num_samples = pv.shape[1]
         else:
             # Fallback (should normally not happen)
@@ -6100,12 +6592,17 @@ class PVdiagram(QMainWindow):
                  print("Warning: AppState not available for PV calculation.")
 
         # --- End PV Data Calculation ---
+        self._clear_pv_error_state()
 
+        # Preserve the historical all-NaN update path: replace the image, but
+        # leave the current axes/range controls untouched.  It is still a
+        # successful refresh (and therefore safe to export), not a stale result.
         if np.all(np.isnan(pv)):
             self.pv_im.set_data(pv)
+            self._sync_open_pv_color_panel_data()
             self._refresh_contours()
             self.pv_canvas.draw()
-            return
+            return True
 
         # --- New Full Range Calculation and Axis Formatting (Step 3) ---
         current_unit = self.lengthUnitCombo.currentText()
@@ -6157,6 +6654,10 @@ class PVdiagram(QMainWindow):
         # Define new full ranges based on current units
         new_pos_full_range = (x_min_pos, x_max_pos)
         new_vel_full_range = (y_min, y_max)
+        image_pos_extent = _sample_centered_image_extent(
+            new_pos_full_range,
+            num_samples,
+        )
         # --- End Full Range Calculation ---
 
 
@@ -6195,7 +6696,7 @@ class PVdiagram(QMainWindow):
         if self.swapAxesCheck.isChecked():
             pv_display = np.transpose(pv)
             self.pv_im.set_data(pv_display)
-            self.pv_im.set_extent((new_vel_full_range[0], new_vel_full_range[1], new_pos_full_range[0], new_pos_full_range[1])) # ★ Use FULL range for extent
+            self.pv_im.set_extent((new_vel_full_range[0], new_vel_full_range[1], image_pos_extent[0], image_pos_extent[1]))
             self._refresh_contours()
             self.pv_ax.set_ylim(*self._display_position_limits(pos_lim_final))
             self.pv_ax.set_xlim(vel_lim_final)
@@ -6203,12 +6704,14 @@ class PVdiagram(QMainWindow):
             self.pv_ax.set_ylabel(position_label)
         else:
             self.pv_im.set_data(pv)
-            self.pv_im.set_extent((new_pos_full_range[0], new_pos_full_range[1], new_vel_full_range[0], new_vel_full_range[1])) # ★ Use FULL range for extent
+            self.pv_im.set_extent((image_pos_extent[0], image_pos_extent[1], new_vel_full_range[0], new_vel_full_range[1]))
             self._refresh_contours()
             self.pv_ax.set_xlim(*self._display_position_limits(pos_lim_final))
             self.pv_ax.set_ylim(vel_lim_final)
             self.pv_ax.set_xlabel(position_label)
             self.pv_ax.set_ylabel(vel_label)
+
+        self._sync_open_pv_color_panel_data()
 
         # Update color scale limits
         pv_settings = ColorSettingsPanel.settings[ColorMode.PV]
@@ -6228,6 +6731,7 @@ class PVdiagram(QMainWindow):
         self.update_range_inputs()
         self.pv_canvas.draw()
         self.pv_canvas.flush_events()
+        return True
 
     def get_channel_from_velocity(self, velocity_coord):
         """Convert velocity coordinate from PV diagram to channel index."""
@@ -6688,13 +7192,15 @@ class PVdiagram(QMainWindow):
         self.fits_canvas.blit(self.fits_ax.bbox)
         self.fits_canvas.flush_events()
 
-    def finalize_interactive_update(self):
+    def finalize_interactive_update(self, *, preserve_straight_geometry=False):
         if not self.is_interactive_mode:
             if self._is_ellipse_mode():
                 if self.ellipse_geometry is not None:
                     self.apply_controls()
             elif self.line_start is not None:
-                self.apply_controls()
+                self.apply_controls(
+                    preserve_straight_geometry=preserve_straight_geometry,
+                )
             return
 
         self.is_interactive_mode = False
@@ -6705,7 +7211,9 @@ class PVdiagram(QMainWindow):
             if artist:
                 artist.set_animated(False)
 
-        self.apply_controls()
+        self.apply_controls(
+            preserve_straight_geometry=preserve_straight_geometry,
+        )
 
     def _default_contour_label(self) -> str:
         title = self.windowTitle() or "PV Diagram"
@@ -7068,6 +7576,9 @@ class PVdiagram(QMainWindow):
             "sample_spacing_pix": self._current_sample_spacing_pix(),
             "weight_mode": int(self.weight_mode),
             "position_origin": self._current_position_origin(),
+            "endpoint_position_origin": normalize_position_origin(
+                getattr(self, "_endpoint_position_origin", POSITION_ORIGIN_START)
+            ),
             "geometry_input_mode": self._current_geometry_input_mode(),
             "swap_axes": bool(self.swapAxesCheck.isChecked()),
             "position_axis_flipped": self._position_axis_flipped(),
@@ -7280,6 +7791,8 @@ class PVdiagram(QMainWindow):
                     self._redraw_inactive_path_artists()
                     self._invalidate_main_overlay_background()
                     self._request_main_overlay_redraw()
+                    if restored:
+                        self._reveal_pv_result_if_ready()
                     return bool(restored)
 
         desired_unit = str(state.get("length_unit") or self.lengthUnitCombo.currentText() or "pixel")
@@ -7355,6 +7868,15 @@ class PVdiagram(QMainWindow):
         self._sync_sampling_controls()
 
         desired_origin = normalize_position_origin(state.get("position_origin", POSITION_ORIGIN_START))
+        stored_geometry_input = str(state.get("geometry_input_mode") or "endpoints")
+        endpoint_origin_fallback = (
+            desired_origin
+            if stored_geometry_input == "endpoints"
+            else POSITION_ORIGIN_START
+        )
+        self._endpoint_position_origin = normalize_position_origin(
+            state.get("endpoint_position_origin", endpoint_origin_fallback)
+        )
         try:
             idx = self.positionOriginCombo.findData(desired_origin)
             if idx >= 0:
@@ -7450,6 +7972,8 @@ class PVdiagram(QMainWindow):
             if restored_polyline and not getattr(self, "_restoring_single_pv_path", False):
                 self._sync_active_path_item_from_current_state()
                 self._redraw_inactive_path_artists()
+            if restored_polyline:
+                self._reveal_pv_result_if_ready()
             return restored_polyline
 
         if self._is_ellipse_path_type(desired_path_type):
@@ -7506,6 +8030,8 @@ class PVdiagram(QMainWindow):
             if restored_ellipse and not getattr(self, "_restoring_single_pv_path", False):
                 self._sync_active_path_item_from_current_state()
                 self._redraw_inactive_path_artists()
+            if restored_ellipse:
+                self._reveal_pv_result_if_ready()
             return restored_ellipse
 
         self._clear_ellipse_path()
@@ -7599,6 +8125,8 @@ class PVdiagram(QMainWindow):
             self._sync_active_path_item_from_current_state()
             self._redraw_inactive_path_artists()
 
+        if restored_line:
+            self._reveal_pv_result_if_ready()
         return restored_line
 
     def showEvent(self, event):
@@ -7607,6 +8135,11 @@ class PVdiagram(QMainWindow):
         # slit (the slit is edited on the main canvas, so the main window is the
         # active window during editing and must serve the shortcut).
         self._register_slit_undo_tool(True)
+        if (
+            not getattr(self, "_pv_result_revealed", False)
+            and not getattr(self, "_pv_compact_positioned", False)
+        ):
+            QTimer.singleShot(0, self._position_compact_panel_next_to_main)
 
     def _register_slit_undo_tool(self, active):
         main = getattr(self, "fits_viewer", None)

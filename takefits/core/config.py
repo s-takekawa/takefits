@@ -6,6 +6,23 @@ import os
 from takefits.app_paths import app_config_path
 
 
+AXES_POSITION_KEYS = ("ax_pos_l", "ax_pos_r", "ax_pos_t", "ax_pos_b")
+
+
+def axes_positions_are_valid(config):
+    """Return whether the configured axes rectangle has positive dimensions."""
+    try:
+        raw_values = [config[key] for key in AXES_POSITION_KEYS]
+        if any(isinstance(value, bool) for value in raw_values):
+            return False
+        left, right, top, bottom = (float(value) for value in raw_values)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (left, right, top, bottom)):
+        return False
+    return left < right and bottom < top
+
+
 def _normalize_grid_linestyle(value, default):
     token = str(value or "").strip().lower()
     mapping = {
@@ -54,12 +71,13 @@ def _config_bool(value, default):
     return bool(default)
 
 
-class ConfigManager:
-    def __init__(self, config_file=None):
-        if config_file is None:
-            config_file = app_config_path('config.yaml')
-        self.config_file = config_file
-        self.default_config = {
+def build_default_config():
+    """Return a fresh copy of the built-in config defaults.
+
+    Kept module-level so callers can inspect the known key set without
+    reading or creating the user's config file.
+    """
+    return {
             'colorscale': 'Rainbow',  # Default color pattern setting
         
             # Background color settings
@@ -110,12 +128,15 @@ class ConfigManager:
             'colorbar_tick_bottom': True,
 
             'colorbar_tick_labelcolor': 'black',
-            'colorbar_tick_labelleft': False, 
+            'colorbar_tick_labelsize': None, # None inherits the Matplotlib default
+            'colorbar_tick_labelfontfamily': None, # None follows tick_font
+            'colorbar_tick_labelleft': False,
             'colorbar_tick_labeltop': False,
-            
+
             'colorbar_label': None,
             'colorbar_label_fontsize': 12,
             'colorbar_label_color': 'black',
+            'colorbar_label_fontfamily': 'DejaVu Sans',
         
             # Axis label settings
             'axislabel_fontsize': 14,        # Font size of the axis labels
@@ -136,8 +157,19 @@ class ConfigManager:
             'mtick_length': 2,       # Length of the minor ticks
             
             'x_mtick_freq': 5,       #minor tick frequency
-            'y_mtick_freq': 5, 
+            'y_mtick_freq': 5,
             'z_mtick_freq': 5,
+
+            # Major tick placement. None lets astropy WCSAxes choose.
+            # `spacing` is expressed in the axis' displayed format unit
+            # (deg for decimal celestial axes, hourangle for sexagesimal RA,
+            # km/s or m/s for a spectral axis). `spacing` wins over `number`.
+            'x_tick_spacing': None,
+            'y_tick_spacing': None,
+            'z_tick_spacing': None,
+            'x_tick_number': None,
+            'y_tick_number': None,
+            'z_tick_number': None,
             
             # Tick label settings
             'tick_labelsize': 10,     # Font size of the tick labels
@@ -179,8 +211,10 @@ class ConfigManager:
             'invert_wheel_direction': False,  # Reverse mouse wheel channel direction
 
             # Large Data Mode thresholds (MiB)
-            'large_data_mode_threshold_mb': 8192,
+            # "auto" uses 25% of physical RAM, clamped to 2–8 GiB.
+            'large_data_mode_threshold_mb': 'auto',
             'large_data_no_memmap_threshold_mb': 2048,
+            'large_data_threshold_policy': 2,
         
             # Coordinates label position settings
             'poslabel_x': 0.99,  # X position of the coordinate label
@@ -193,9 +227,24 @@ class ConfigManager:
             #'pos_chlabel_w': 250,  # Width of the coordinate label
             #'pos_chlabel_h': 20,   # Height of the coordinate label
 
-            'ch_label_color': 'grey', 
+            'ch_label_color': 'grey',
             'ch_label_font': 'DejaVu Sans',
             'ch_label_size': 10,
+
+            # Channel-map grid layout for headless export. None keeps the
+            # historical automatic value.
+            'chmap_left': 0.08,
+            'chmap_right': None,   # None derives room for the colorbar
+            'chmap_bottom': 0.08,
+            'chmap_top': 0.95,
+            'chmap_wspace': 0.12,
+            'chmap_hspace': 0.12,
+            # One shared axis label per figure instead of one per edge tile,
+            # which is the usual publication style for a channel-map grid.
+            'chmap_shared_axislabels': False,
+            # Tile index carrying the HPBW beam. None follows the GUI, which
+            # draws it on the bottom-left panel.
+            'chmap_beam_tile': None,
             
             # Click-related settings
             'click_label_color': 'grey',   # Color of the label when clicking
@@ -216,7 +265,18 @@ class ConfigManager:
 
             # Range file
             'range_file': 'takefits.range'  # Range file path
-        }
+    }
+
+
+DEFAULT_CONFIG_KEYS = frozenset(build_default_config())
+
+
+class ConfigManager:
+    def __init__(self, config_file=None):
+        if config_file is None:
+            config_file = app_config_path('config.yaml')
+        self.config_file = config_file
+        self.default_config = build_default_config()
         self.config = self.load_config()
         self.config_bu = copy.deepcopy(self.config)
 
@@ -233,6 +293,16 @@ class ConfigManager:
             print(f"\033[91mFailed to load config file: {e}\033[0m")
             config = copy.deepcopy(self.default_config)
         if isinstance(config, dict):
+            # Version 1 shipped a fixed 8192 MiB value as if it were a user
+            # preference, overriding the RAM-aware default on every machine.
+            # Migrate that exact legacy default once; explicit post-migration
+            # overrides remain untouched.
+            if (
+                'large_data_threshold_policy' not in config
+                and config.get('large_data_mode_threshold_mb') == 8192
+            ):
+                config['large_data_mode_threshold_mb'] = 'auto'
+            config['large_data_threshold_policy'] = 2
             # Migrate the short-lived inward-only title-offset experiment to
             # semantic placement before defaults are merged. Existing custom
             # files retain their visual intent under the semantic Inside
@@ -261,6 +331,17 @@ class ConfigManager:
             merged_config = copy.deepcopy(self.default_config)
             merged_config.update(config)
             config = merged_config
+            if not axes_positions_are_valid(config):
+                invalid_values = {
+                    key: config.get(key) for key in AXES_POSITION_KEYS
+                }
+                for key in AXES_POSITION_KEYS:
+                    config[key] = self.default_config[key]
+                print(
+                    "\033[93mInvalid axes positions in config file "
+                    f"'{self.config_file}': {invalid_values}. "
+                    "Using defaults for the axes rectangle.\033[0m"
+                )
             # Backward compatibility: legacy "match" behaves as full-length ratio.
             mode = str(config.get('colorbar_length_mode', '') or '').strip().lower()
             if mode == 'match':

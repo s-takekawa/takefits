@@ -9,6 +9,12 @@ import numpy as np
 
 from takefits.core.app_state import AppState
 from takefits.core.io.save_fits import write_fits
+from takefits.logic.data_tools import (
+    ensure_operation_memory_budget,
+    estimate_materialized_nbytes,
+    is_lazy_scaled,
+    materialize_elementwise_inputs,
+)
 from .utils import axis_world_to_pixel, get_axis_ctype, parse_world_coordinate
 
 
@@ -30,6 +36,16 @@ class BaselineSubtractionResult:
     @property
     def shape(self) -> Tuple[int, ...]:
         return tuple(np.asarray(self.subtracted_data).shape)
+
+
+def _baseline_working_bytes(data) -> int:
+    """Estimate materialization plus the corrected/model output cubes."""
+    count = int(getattr(data, "size", 0) or 0)
+    source_bytes = int(estimate_materialized_nbytes(data) or 0)
+    dtype = np.dtype(getattr(data, "dtype", np.float64))
+    output_dtype = dtype if np.issubdtype(dtype, np.floating) else np.dtype(np.float32)
+    output_bytes = count * int(output_dtype.itemsize)
+    return (source_bytes if is_lazy_scaled(data) else 0) + (2 * output_bytes)
 
 
 def _default_reference_pixel(state: AppState) -> Optional[Tuple[float, ...]]:
@@ -181,6 +197,8 @@ def _fit_baseline_single_cube(
     *,
     channel_mask: np.ndarray,
     order: int,
+    subtracted_out: Optional[np.ndarray] = None,
+    model_out: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, int, int]:
     if cube.ndim != 3:
         raise ValueError(f"Expected 3D cube, got {cube.ndim}D.")
@@ -189,8 +207,20 @@ def _fit_baseline_single_cube(
         raise ValueError("channel_mask shape does not match spectral axis length.")
 
     out_dtype = cube.dtype if np.issubdtype(cube.dtype, np.floating) else np.float32
-    subtracted = np.asarray(cube, dtype=out_dtype).copy()
-    model = np.full(cube.shape, np.nan, dtype=out_dtype)
+    if subtracted_out is None:
+        subtracted = np.asarray(cube, dtype=out_dtype).copy()
+    else:
+        if subtracted_out.shape != cube.shape:
+            raise ValueError("subtracted_out shape does not match cube shape.")
+        subtracted = subtracted_out
+        np.copyto(subtracted, cube, casting="unsafe")
+    if model_out is None:
+        model = np.full(cube.shape, np.nan, dtype=out_dtype)
+    else:
+        if model_out.shape != cube.shape:
+            raise ValueError("model_out shape does not match cube shape.")
+        model = model_out
+        model.fill(np.nan)
     x_axis = np.arange(n_channels, dtype=float)
 
     total_spectra = int(np.prod(cube.shape[1:]))
@@ -245,20 +275,36 @@ def compute_polynomial_baseline_subtraction(
     if int(order) < 0:
         raise ValueError("Polynomial order must be >= 0.")
 
-    data = np.asarray(state.data)
-    if data.ndim < 3:
+    source_data = state.data
+    data_ndim = int(getattr(source_data, "ndim", 0))
+    if data_ndim < 3:
         raise ValueError("Baseline subtraction requires 3D/4D cube data.")
 
-    working_ndim = 3 if data.ndim == 4 else data.ndim
+    working_ndim = 3 if data_ndim == 4 else data_ndim
     spectral_wcs_axis = _spectral_wcs_axis(state, data_ndim=working_ndim)
     ref_pixel = _normalize_reference_pixel(state, reference_pixel)
-    n_channels = int(data.shape[1] if data.ndim == 4 else data.shape[0])
+    source_shape = tuple(int(dim) for dim in source_data.shape)
+    n_channels = int(source_shape[1] if data_ndim == 4 else source_shape[0])
     channel_mask, normalized_world_ranges, pixel_ranges = _world_ranges_to_channel_mask(
         state,
         world_ranges=world_ranges,
         n_channels=n_channels,
         spectral_wcs_axis=spectral_wcs_axis,
         reference_pixel=ref_pixel,
+    )
+
+    ensure_operation_memory_budget(
+        _baseline_working_bytes(source_data),
+        operation_name="Polynomial baseline subtraction",
+        guidance=(
+            "Use Tools > Cutout, fewer channels, or a smaller spatial region "
+            "before subtracting a baseline."
+        ),
+    )
+    data, = materialize_elementwise_inputs(
+        source_data,
+        operation_name="Polynomial baseline subtraction",
+        output_array_count=2.0,
     )
 
     order_int = int(order)
@@ -275,13 +321,13 @@ def compute_polynomial_baseline_subtraction(
         n_total = 0
         n_fit = 0
         for s_idx in range(int(data.shape[0])):
-            s_sub, s_model, s_total, s_fit = _fit_baseline_single_cube(
+            _, _, s_total, s_fit = _fit_baseline_single_cube(
                 np.asarray(data[s_idx]),
                 channel_mask=channel_mask,
                 order=order_int,
+                subtracted_out=subtracted[s_idx],
+                model_out=model[s_idx],
             )
-            subtracted[s_idx] = s_sub
-            model[s_idx] = s_model
             n_total += int(s_total)
             n_fit += int(s_fit)
 
@@ -361,14 +407,6 @@ def export_baseline_model_fits(
     for idx, dim in enumerate(data_to_save.shape[::-1], start=1):
         header[f"NAXIS{idx}"] = int(dim)
 
-    finite = data_to_save[np.isfinite(data_to_save)]
-    if finite.size > 0:
-        header["DATAMIN"] = float(np.min(finite))
-        header["DATAMAX"] = float(np.max(finite))
-    else:
-        header.pop("DATAMIN", None)
-        header.pop("DATAMAX", None)
-
     header.add_history(
         f"Baseline model exported using takefits on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
@@ -376,4 +414,10 @@ def export_baseline_model_fits(
         for entry in history_entries:
             header.add_history(entry)
 
-    return write_fits(output_path, data_to_save, header)
+    return write_fits(
+        output_path,
+        data_to_save,
+        header,
+        ensure_datamin_datamax=True,
+        drop_extrema_if_all_invalid=True,
+    )

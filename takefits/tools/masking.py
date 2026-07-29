@@ -28,6 +28,11 @@ from PySide6.QtGui import QKeySequence, QShortcut
 from takefits.core import usecases
 from takefits.core.app_state import create_app_state
 from takefits.core.history_provenance import build_processing_history_lines
+from takefits.core.usecases.mask import (
+    compute_masked_from_keep_mask,
+    compute_moment_masked,
+)
+from takefits.logic.data_tools import create_preview_snapshot
 from takefits.tools.base_panel import BaseToolPanel, clear_action_preview_record, has_action_record_tag, record_action_preview
 from takefits.tools.base_panel import capture_preferred_cursor_snapshot, replay_action_history_to_current_cursor
 from takefits.ui.save_fits_dialog import SaveFITS
@@ -453,7 +458,10 @@ class MaskSettingsPanel(BaseToolPanel):
 
     def _ensure_original_data(self):
         if self.original_data is None:
-            self.original_data = self.fits_viewer.data.copy()
+            self.original_data = create_preview_snapshot(
+                self.fits_viewer.data,
+                operation_name="Masking",
+            )
 
     def _collect_moment_params(self) -> dict:
         return {
@@ -518,11 +526,10 @@ class MaskSettingsPanel(BaseToolPanel):
         self._ensure_original_data()
         params = self._collect_moment_params()
         try:
-            mask = usecases.compute_moment_mask(self.original_data, **params)
-            masked_data = self.original_data.copy()
-            if not np.issubdtype(masked_data.dtype, np.floating):
-                masked_data = masked_data.astype(np.float32, copy=False)
-            masked_data[~mask] = np.nan
+            masked_data, mask = compute_moment_masked(
+                self.original_data,
+                **params,
+            )
 
             self.current_mask = mask.astype(bool)
             algorithm = params["algorithm"]
@@ -579,10 +586,11 @@ class MaskSettingsPanel(BaseToolPanel):
                     return
 
             current_mask = np.isfinite(mask_data) & (mask_data != 0)
-            masked_data = self.original_data.copy()
-            if not np.issubdtype(masked_data.dtype, np.floating):
-                masked_data = masked_data.astype(np.float32, copy=False)
-            masked_data[~current_mask] = np.nan
+            masked_data = compute_masked_from_keep_mask(
+                self.original_data,
+                current_mask,
+                operation_name="External masking",
+            )
 
             self.current_mask = current_mask
             self.last_mask_history_entries = [f"External mask applied: {os.path.basename(filename)}"]
@@ -695,7 +703,6 @@ class MaskSettingsPanel(BaseToolPanel):
 
         try:
             new_header = self._get_sanitized_header()
-            finite = np.isfinite(self.fits_viewer.data)
             new_header["DATAMAX"] = float(np.nanmax(self.fits_viewer.data))
 
             for entry in build_processing_history_lines(self.fits_viewer):
@@ -712,7 +719,10 @@ class MaskSettingsPanel(BaseToolPanel):
             return
 
         try:
-            mask_data = np.where(self.current_mask, 1.0, 0.0).astype(np.float32)
+            mask_data = np.asarray(self.current_mask, dtype=bool).astype(
+                np.float32,
+                copy=False,
+            )
             save_dialog = SaveFITS(mask_data, self.fits_viewer.header, self.fits_viewer.filename)
             default_filename = save_dialog.generate_new_filename("mask")
             filename, _ = QFileDialog.getSaveFileName(

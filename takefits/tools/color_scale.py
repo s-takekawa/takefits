@@ -19,6 +19,20 @@ from takefits.logic.data_tools import (
 _HISTOGRAM_MAX_SAMPLES = 1_000_000
 
 
+def _register_colormap_once(cmap):
+    """Register *cmap* unless Matplotlib already knows the name.
+
+    These registrations run at import time. The headless usecase layer
+    registers the same colormaps via
+    `core/usecases/visualization.register_custom_colormaps()`, so importing
+    this module after a headless export used to raise
+    `ValueError: A colormap named "Rainbow" is already registered.`
+    """
+    if cmap.name in colormaps:
+        return
+    colormaps.register(cmap)
+
+
 class RegisterColor:
     rainbow_cdict = ColorDefinitions.rainbow()
     cool_cdict = ColorDefinitions.cool()
@@ -26,10 +40,10 @@ class RegisterColor:
     cool = CustomColormap('Cool', cool_cdict)
     rainbow_r = rainbow.reversed_colormap()
     cool_r = cool.reversed_colormap()
-    colormaps.register(rainbow.get_colormap())
-    colormaps.register(cool.get_colormap())
-    colormaps.register(rainbow_r.get_colormap())
-    colormaps.register(cool_r.get_colormap())
+    _register_colormap_once(rainbow.get_colormap())
+    _register_colormap_once(cool.get_colormap())
+    _register_colormap_once(rainbow_r.get_colormap())
+    _register_colormap_once(cool_r.get_colormap())
 
 
 
@@ -39,7 +53,18 @@ class ColorSettingsPanel(QWidget):
     
     settings = default_color_settings_map()
 
-    def __init__(self, fits_viewer, subwindows=None, data=None, config=None, color_pattern=None, bad_color=None, filename = None, mode = ColorMode.MAIN):
+    def __init__(
+        self,
+        fits_viewer,
+        subwindows=None,
+        data=None,
+        config=None,
+        color_pattern=None,
+        bad_color=None,
+        filename=None,
+        mode=ColorMode.MAIN,
+        data_range=None,
+    ):
         super().__init__()
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.fits_viewer = fits_viewer
@@ -60,6 +85,13 @@ class ColorSettingsPanel(QWidget):
         if data is None: self.data = self.fits_viewer.data
         else: self.data = data
         self._data_nbytes = estimate_array_nbytes(self.data)
+        self._data_range_override = None
+        if data_range is not None:
+            try:
+                range_min, range_max = data_range
+                self._data_range_override = (float(range_min), float(range_max))
+            except (TypeError, ValueError):
+                self._data_range_override = None
         if  color_pattern is None: self.color_pattern = self.fits_viewer.displaymap.colorscale
         elif self.current_settings["color_pattern"] is None: self.color_pattern = color_pattern
         if self.current_settings["color_pattern"] is not None:
@@ -439,6 +471,10 @@ class ColorSettingsPanel(QWidget):
             return (None, None)
 
     def _data_range(self):
+        override = getattr(self, "_data_range_override", None)
+        if override is not None:
+            return override
+
         if self._is_large_data_mode():
             display_data_min, display_data_max = self._current_image_data_range()
             if display_data_min is not None and display_data_max is not None:
@@ -449,8 +485,11 @@ class ColorSettingsPanel(QWidget):
                 return (display_min, display_max)
 
         allow_full_scan = (
-            self._data_nbytes is None
-            or self._data_nbytes <= MEMMAP_THRESHOLD_BYTES
+            not isinstance(self.data, LazyScaledArray)
+            and (
+                self._data_nbytes is None
+                or self._data_nbytes <= MEMMAP_THRESHOLD_BYTES
+            )
         )
         if allow_full_scan:
             try:
@@ -1057,13 +1096,7 @@ class ColorSettingsPanel(QWidget):
         if raw_data is None:
             return np.asarray([], dtype=float)
         array = np.asanyarray(raw_data)
-        should_sample = (
-            self._data_nbytes is not None
-            and self._data_nbytes > MEMMAP_THRESHOLD_BYTES
-        )
-        if should_sample:
-            return self._histogram_sample_by_flat_index(array)
-        return array.ravel()
+        return self._histogram_sample_by_flat_index(array)
 
     def _compute_histogram_cache(self):
         data = self._histogram_source_sample()

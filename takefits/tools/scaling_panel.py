@@ -1,9 +1,11 @@
-import numpy as np
 from PySide6.QtWidgets import (
     QVBoxLayout, QFormLayout, QLineEdit, QPushButton,
     QMessageBox, QHBoxLayout
 )
 from datetime import datetime
+from takefits.core.io.save_fits import update_datamin_datamax_if_present
+from takefits.core.usecases import compute_scaled
+from takefits.logic.data_tools import create_preview_snapshot
 from takefits.tools.base_panel import (
     BaseToolPanel,
     capture_preferred_cursor_snapshot,
@@ -84,7 +86,10 @@ class ScalingPanel(BaseToolPanel):
     def _ensure_original_data(self):
         """Cache the original data if it hasn't been already."""
         if self.original_data is None:
-            self.original_data = self.fits_viewer.data.copy()
+            self.original_data = create_preview_snapshot(
+                self.fits_viewer.data,
+                operation_name="Scaling",
+            )
 
     def apply_manual_scaling(self):
         """Apply the y=ax manual scaling."""
@@ -93,9 +98,11 @@ class ScalingPanel(BaseToolPanel):
             self._ensure_original_data()
             
             if self.scaling_reference_data is None:
-                self.scaling_reference_data = self.fits_viewer.data.copy()
+                # Both caches describe the same immutable pre-scaling cube.
+                # Sharing avoids a second full-size copy on the first Apply.
+                self.scaling_reference_data = self.original_data
 
-            scaled_data = self.scaling_reference_data * scale_factor
+            scaled_data = compute_scaled(self.scaling_reference_data, scale_factor)
             history_msg = f"Manual scaling: multiplied by {scale_factor}"
             
             self._apply_data_and_history(scaled_data, history_msg)
@@ -200,14 +207,24 @@ class ScalingPanel(BaseToolPanel):
         data_to_save = self.fits_viewer.data
         new_header = self.fits_viewer.header.copy()
 
-        # Update DATAMIN and DATAMAX in the new header
-        try:
-            valid_data = data_to_save[np.isfinite(data_to_save)]
-            if valid_data.size > 0:
-                new_header['DATAMIN'] = float(np.nanmin(valid_data))
-                new_header['DATAMAX'] = float(np.nanmax(valid_data))
-        except Exception as e:
-            print(f"Warning: Could not update DATAMIN/DATAMAX in header. Error: {e}")
+        # Use the bounded central extrema scanner instead of allocating a
+        # cube-sized finite mask and a second compacted data copy.
+        previous_extrema = {
+            key: new_header[key]
+            for key in ("DATAMIN", "DATAMAX")
+            if key in new_header
+        }
+        update_datamin_datamax_if_present(
+            new_header,
+            data_to_save,
+            ensure=True,
+            drop_if_all_invalid=True,
+        )
+        if "DATAMIN" not in new_header and "DATAMAX" not in new_header:
+            # Historically an all-invalid result left pre-existing extrema
+            # untouched. Preserve that edge-case header behaviour.
+            for key, value in previous_extrema.items():
+                new_header[key] = value
 
         from takefits.ui.save_fits_dialog import SaveFITS
 

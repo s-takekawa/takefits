@@ -2,18 +2,31 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 from scipy.ndimage import map_coordinates
 
 from takefits.core.app_state import AppState
+from takefits.logic.data_tools import (
+    _get_available_memory_bytes,
+    format_nbytes,
+    is_lazy_scaled,
+    sanitize_slice,
+)
 from .utils import get_axis_ctype, parse_world_coordinate, update_datamin_datamax_if_present
 
 POSITION_ORIGIN_START = "start"
 POSITION_ORIGIN_CENTER = "center"
 PV_X_AXIS_POSITION = "position"
 PV_X_AXIS_PHI = "phi"
+
+_PV_WORKING_SET_FALLBACK_LIMIT_BYTES = 512 * 1024 * 1024
+_PV_WORKING_SET_RAM_FRACTION = 0.80
+_PV_MAX_SAMPLE_COUNT = 5_000_000
+_PV_MAX_WIDTH_SAMPLE_COUNT = 250_000
+_PV_MAX_DENSIFIED_VERTICES = 250_000
+_PV_MAX_ELLIPSE_LOOKUP_POINTS = 1_000_000
 
 # Polyline spline interpolation types. "none" = straight segments (legacy
 # behavior); "catmull_rom" = centripetal Catmull-Rom that *interpolates* the
@@ -70,8 +83,14 @@ class StraightPathGeometry:
     end: tuple[float, float]
 
     def __post_init__(self):
-        object.__setattr__(self, "start", (float(self.start[0]), float(self.start[1])))
-        object.__setattr__(self, "end", (float(self.end[0]), float(self.end[1])))
+        start = (float(self.start[0]), float(self.start[1]))
+        end = (float(self.end[0]), float(self.end[1]))
+        if not np.all(np.isfinite((*start, *end))):
+            raise ValueError("PV path endpoints must be finite")
+        if not np.isfinite(np.hypot(end[0] - start[0], end[1] - start[1])):
+            raise ValueError("PV path length must be finite")
+        object.__setattr__(self, "start", start)
+        object.__setattr__(self, "end", end)
 
     @classmethod
     def from_endpoints(cls, x0: float, y0: float, x1: float, y1: float) -> "StraightPathGeometry":
@@ -95,10 +114,22 @@ class CirclePathGeometry:
         radius = float(self.radius_px)
         if not np.isfinite(radius) or radius < 0.0:
             raise ValueError("radius_px must be a non-negative finite value")
-        object.__setattr__(self, "center", (float(self.center[0]), float(self.center[1])))
+        center = (float(self.center[0]), float(self.center[1]))
+        start_angle = float(self.start_angle_rad)
+        end_angle = float(self.end_angle_rad)
+        if not np.all(np.isfinite((*center, start_angle, end_angle))):
+            raise ValueError("Circle PV coordinates and angles must be finite")
+        sweep = end_angle - start_angle
+        if (
+            not np.isfinite(sweep)
+            or not np.isfinite(radius * abs(sweep))
+            or not np.all(np.isfinite(np.asarray(center) + radius))
+        ):
+            raise ValueError("Circle PV extent must be finite")
+        object.__setattr__(self, "center", center)
         object.__setattr__(self, "radius_px", radius)
-        object.__setattr__(self, "start_angle_rad", float(self.start_angle_rad))
-        object.__setattr__(self, "end_angle_rad", float(self.end_angle_rad))
+        object.__setattr__(self, "start_angle_rad", start_angle)
+        object.__setattr__(self, "end_angle_rad", end_angle)
 
     @property
     def sweep_angle_rad(self) -> float:
@@ -127,12 +158,26 @@ class EllipsePathGeometry:
             raise ValueError("semi_major_px must be a non-negative finite value")
         if not np.isfinite(minor) or minor < 0.0:
             raise ValueError("semi_minor_px must be a non-negative finite value")
-        object.__setattr__(self, "center", (float(self.center[0]), float(self.center[1])))
+        center = (float(self.center[0]), float(self.center[1]))
+        pa = float(self.pa_rad)
+        start_phi = float(self.start_phi_rad)
+        end_phi = float(self.end_phi_rad)
+        if not np.all(np.isfinite((*center, pa, start_phi, end_phi))):
+            raise ValueError("Ellipse PV coordinates and angles must be finite")
+        sweep = end_phi - start_phi
+        extent = max(major, minor)
+        if (
+            not np.isfinite(sweep)
+            or not np.isfinite(extent * abs(sweep))
+            or not np.all(np.isfinite(np.asarray(center) + major + minor))
+        ):
+            raise ValueError("Ellipse PV extent must be finite")
+        object.__setattr__(self, "center", center)
         object.__setattr__(self, "semi_major_px", major)
         object.__setattr__(self, "semi_minor_px", minor)
-        object.__setattr__(self, "pa_rad", float(self.pa_rad))
-        object.__setattr__(self, "start_phi_rad", float(self.start_phi_rad))
-        object.__setattr__(self, "end_phi_rad", float(self.end_phi_rad))
+        object.__setattr__(self, "pa_rad", pa)
+        object.__setattr__(self, "start_phi_rad", start_phi)
+        object.__setattr__(self, "end_phi_rad", end_phi)
 
     @property
     def sweep_phi_rad(self) -> float:
@@ -226,6 +271,24 @@ def catmull_rom_densify(
     if n < 3:
         return pts.copy()
     s = clamp_pv_smoothness(smoothness)
+    if samples_per_segment is not None:
+        per_segment = max(2, int(samples_per_segment))
+        estimated_count = per_segment * (n - 1) + 1
+    else:
+        chords = np.hypot(
+            np.diff(pts[:, 0]),
+            np.diff(pts[:, 1]),
+        )
+        estimated_count = int(
+            np.sum(np.maximum(8, np.ceil(chords)), dtype=np.float64)
+        ) + 1
+    if estimated_count > _PV_MAX_DENSIFIED_VERTICES:
+        raise MemoryError(
+            "Smoothed PV path is too large to densify safely "
+            f"({estimated_count:,} points; limit "
+            f"{_PV_MAX_DENSIFIED_VERTICES:,}). Shorten the path or disable "
+            "smoothing."
+        )
 
     # Phantom endpoints clamp the spline to the first/last nodes.
     padded = np.vstack([pts[0], pts, pts[-1]])  # real points live at index 1..n
@@ -330,6 +393,14 @@ def bspline_densify(
         seg = np.diff(pts, axis=0)
         total = float(np.sum(np.hypot(seg[:, 0], seg[:, 1])))
         count = max(8 * (n - 1), int(np.ceil(total)))
+    estimated_count = count + n
+    if estimated_count > _PV_MAX_DENSIFIED_VERTICES:
+        raise MemoryError(
+            "Smoothed PV path is too large to densify safely "
+            f"({estimated_count:,} points; limit "
+            f"{_PV_MAX_DENSIFIED_VERTICES:,}). Shorten the path or disable "
+            "smoothing."
+        )
     # Include the control-node parameters so the control polygon is sampled at its
     # corners; this makes the smoothness=0 blend an exact straight polyline (no
     # corner cutting) and keeps the blended poly component accurate.
@@ -370,6 +441,13 @@ class PolylinePathGeometry:
         coerced = [(float(vx), float(vy)) for vx, vy in self.vertices]
         if len(coerced) < 2:
             raise ValueError("Polyline path requires at least 2 vertices")
+        if not np.all(np.isfinite(np.asarray(coerced, dtype=np.float64))):
+            raise ValueError("Polyline PV vertices must be finite")
+        segment_deltas = np.diff(np.asarray(coerced, dtype=np.float64), axis=0)
+        if not np.all(
+            np.isfinite(np.hypot(segment_deltas[:, 0], segment_deltas[:, 1]))
+        ):
+            raise ValueError("Polyline PV segment lengths must be finite")
         # Drop consecutive duplicate vertices: zero-length segments would make
         # the local segment direction (and therefore the slice normal) undefined.
         deduped: list[tuple[float, float]] = [coerced[0]]
@@ -476,9 +554,9 @@ def _sample_count(line_length_px: float, num_samples: Optional[int], sample_spac
 
 
 def _ellipse_speed(semi_major_px: float, semi_minor_px: float, phi_rad: np.ndarray) -> np.ndarray:
-    return np.sqrt(
-        (float(semi_major_px) * np.sin(phi_rad)) ** 2
-        + (float(semi_minor_px) * np.cos(phi_rad)) ** 2
+    return np.hypot(
+        float(semi_major_px) * np.sin(phi_rad),
+        float(semi_minor_px) * np.cos(phi_rad),
     )
 
 
@@ -496,6 +574,12 @@ def _ellipse_arc_lookup(
         return phis, np.array([0.0, 0.0], dtype=float)
 
     steps = max(int(min_steps), int(np.ceil(abs(sweep) / (2.0 * np.pi) * 2048)))
+    if steps + 1 > _PV_MAX_ELLIPSE_LOOKUP_POINTS:
+        raise MemoryError(
+            "Ellipse PV arc requires too many lookup points "
+            f"({steps + 1:,}; limit {_PV_MAX_ELLIPSE_LOOKUP_POINTS:,}). "
+            "Reduce the angular sweep."
+        )
     phis = np.linspace(float(start_phi_rad), float(end_phi_rad), steps + 1)
     speeds = _ellipse_speed(semi_major_px, semi_minor_px, phis)
     deltas = np.abs(np.diff(phis)) * (speeds[:-1] + speeds[1:]) / 2.0
@@ -877,6 +961,285 @@ def set_pv_endpoints(
     return state
 
 
+PVPathGeometry = Union[
+    StraightPathGeometry,
+    CirclePathGeometry,
+    EllipsePathGeometry,
+    PolylinePathGeometry,
+]
+
+
+def resolve_pv_path_geometry(
+    state: AppState,
+    x0: Optional[float] = None,
+    y0: Optional[float] = None,
+    x1: Optional[float] = None,
+    y1: Optional[float] = None,
+    start_world: Optional[List[Union[float, str]]] = None,
+    end_world: Optional[List[Union[float, str]]] = None,
+    path_geometry: Optional[PVPathGeometry] = None,
+    path_type: str = "straight",
+    center: Optional[List[float]] = None,
+    semi_major_px: Optional[float] = None,
+    semi_minor_px: Optional[float] = None,
+    pa_rad: float = 0.0,
+    start_phi_rad: float = 0.0,
+    end_phi_rad: Optional[float] = None,
+    vertices: Optional[List[List[float]]] = None,
+    vertices_world: Optional[List[List[Union[float, str]]]] = None,
+    spline_type: str = PV_SPLINE_NONE,
+    smoothness: float = 1.0,
+    smooth: Optional[bool] = None,
+) -> PVPathGeometry:
+    """Resolve manifest-friendly PV path arguments into one geometry object.
+
+    Both extraction and figure export use this function so curved paths cannot
+    silently fall back to the state's straight-line endpoints.
+    """
+    path_kind = str(path_type or "straight").strip().lower()
+    if path_kind == "ellipse_arc":
+        path_kind = "ellipse"
+
+    if path_geometry is None and path_kind == "ellipse":
+        if center is None or semi_major_px is None or semi_minor_px is None:
+            raise ValueError(
+                "Ellipse PV requires center, semi_major_px, and semi_minor_px"
+            )
+        if len(center) < 2:
+            raise ValueError("Ellipse center must have at least 2 coordinates")
+        path_geometry = EllipsePathGeometry(
+            center=(float(center[0]), float(center[1])),
+            semi_major_px=float(semi_major_px),
+            semi_minor_px=float(semi_minor_px),
+            pa_rad=float(pa_rad),
+            start_phi_rad=float(start_phi_rad),
+            end_phi_rad=(
+                float(end_phi_rad)
+                if end_phi_rad is not None
+                else float(start_phi_rad) + 2.0 * np.pi
+            ),
+        )
+
+    if path_geometry is None and path_kind == "polyline":
+        verts = vertices
+        if verts is None and vertices_world is not None:
+            if state.wcs is None:
+                raise ValueError("WCS required for vertices_world")
+            verts = []
+            for vw in vertices_world:
+                if len(vw) < 2:
+                    raise ValueError(
+                        "each vertex in vertices_world needs at least 2 coordinates"
+                    )
+                world = []
+                for i, value in enumerate(vw):
+                    if i >= state.wcs.naxis:
+                        break
+                    world.append(
+                        parse_world_coordinate(value, get_axis_ctype(state, i))
+                    )
+                while len(world) < state.wcs.naxis:
+                    world.append(0.0)
+                pixel = state.wcs.wcs_world2pix([world], 0)[0]
+                verts.append([float(pixel[0]), float(pixel[1])])
+        if not verts or len(verts) < 2:
+            raise ValueError("Polyline PV requires at least 2 vertices")
+        resolved_spline = normalize_pv_spline_type(spline_type)
+        if resolved_spline == PV_SPLINE_NONE and smooth:
+            resolved_spline = PV_SPLINE_CATMULL_ROM
+        path_geometry = PolylinePathGeometry.from_points(
+            verts, spline_type=resolved_spline, smoothness=smoothness
+        )
+
+    if path_geometry is not None and (
+        start_world is not None or end_world is not None
+    ):
+        raise ValueError(
+            "start_world/end_world cannot be combined with path_geometry"
+        )
+
+    if path_geometry is not None:
+        return path_geometry
+
+    if path_kind not in ("straight", ""):
+        raise ValueError(f"Unsupported PV path type: {path_type}")
+
+    def _world_to_pixel(
+        value: Optional[List[Union[float, str]]], label: str
+    ) -> Optional[tuple[float, float]]:
+        if value is None:
+            return None
+        if state.wcs is None:
+            raise ValueError(f"WCS required for {label}")
+        if len(value) < 2:
+            raise ValueError(
+                f"{label} must have at least 2 coordinates (x, y)"
+            )
+        world = []
+        for i, item in enumerate(value):
+            if i >= state.wcs.naxis:
+                break
+            world.append(
+                parse_world_coordinate(item, get_axis_ctype(state, i))
+            )
+        while len(world) < state.wcs.naxis:
+            world.append(0.0)
+        pixel = state.wcs.wcs_world2pix([world], 0)[0]
+        return float(pixel[0]), float(pixel[1])
+
+    start_pixel = _world_to_pixel(start_world, "start_world")
+    end_pixel = _world_to_pixel(end_world, "end_world")
+    if start_pixel is not None:
+        x0, y0 = start_pixel
+    if end_pixel is not None:
+        x1, y1 = end_pixel
+
+    x0 = state.pv_x0 if x0 is None else x0
+    y0 = state.pv_y0 if y0 is None else y0
+    x1 = state.pv_x1 if x1 is None else x1
+    y1 = state.pv_y1 if y1 is None else y1
+    if any(value is None for value in (x0, y0, x1, y1)):
+        raise ValueError("PV slice endpoints not specified")
+    return StraightPathGeometry.from_endpoints(x0, y0, x1, y1)
+
+
+def _pv_output_memory_limit_bytes() -> int:
+    """Return a conservative limit for the complete PV working set."""
+    available = _get_available_memory_bytes()
+    if available is not None:
+        return max(
+            1 * 1024 * 1024,
+            int(available * _PV_WORKING_SET_RAM_FRACTION),
+        )
+    return _PV_WORKING_SET_FALLBACK_LIMIT_BYTES
+
+
+def _estimate_pv_output_nbytes(n_vel: int, num_samples: int) -> int:
+    """Return the float64 bytes required by one PV result image."""
+    return (
+        max(0, int(n_vel))
+        * max(0, int(num_samples))
+        * np.dtype(np.float64).itemsize
+    )
+
+
+def _estimate_pv_working_set_nbytes(
+    n_vel: int,
+    num_samples: int,
+    *,
+    plane_shape: Optional[Tuple[int, int]] = None,
+    include_phi: bool = False,
+    width_work_nbytes: int = 0,
+) -> int:
+    """Estimate peak compute plus GUI handoff memory for one PV update."""
+    samples = max(0, int(num_samples))
+    output = _estimate_pv_output_nbytes(n_vel, samples)
+    # Result + Matplotlib's mandatory image copy + the previous displayed
+    # image during replacement.
+    displayed_results = 3 * output
+    # Path arrays (x/y/normals/distance[/phi]) plus offset coordinates,
+    # profile, row accumulators, validity masks, and plotting extents.
+    path_arrays = (6 if include_phi else 5) * samples * 8
+    row_work = samples * (8 * 7 + 4 + 1)
+    plane_work = 0
+    if plane_shape is not None:
+        plane_pixels = max(0, int(plane_shape[0])) * max(0, int(plane_shape[1]))
+        # Private float64 plane plus the transient sanitization mask.
+        plane_work = plane_pixels * 9
+    return (
+        displayed_results
+        + path_arrays
+        + row_work
+        + plane_work
+        + max(0, int(width_work_nbytes))
+    )
+
+
+def _ensure_pv_output_memory_budget(
+    n_vel: int,
+    num_samples: int,
+    *,
+    plane_shape: Optional[Tuple[int, int]] = None,
+    include_phi: bool = False,
+    width_work_nbytes: int = 0,
+) -> None:
+    """Refuse unsafe sampling/allocation before NumPy or the OS kills the GUI."""
+    num_samples = int(num_samples)
+    if num_samples > _PV_MAX_SAMPLE_COUNT:
+        raise MemoryError(
+            "PV extraction requested too many path samples "
+            f"({num_samples:,}; hard limit {_PV_MAX_SAMPLE_COUNT:,}). "
+            "Increase the Sampling Step or shorten the slit."
+        )
+    needed = _estimate_pv_working_set_nbytes(
+        n_vel,
+        num_samples,
+        plane_shape=plane_shape,
+        include_phi=include_phi,
+        width_work_nbytes=width_work_nbytes,
+    )
+    output = _estimate_pv_output_nbytes(n_vel, num_samples)
+    limit = _pv_output_memory_limit_bytes()
+    if needed <= limit:
+        return
+    raise MemoryError(
+        "PV extraction cannot safely allocate the requested working set "
+        f"({int(n_vel):,} channels x {int(num_samples):,} samples, "
+        f"about {format_nbytes(needed)} including a {format_nbytes(output)} "
+        f"result). The current available-memory safety limit is "
+        f"{format_nbytes(limit)}. Increase the Sampling Step, shorten the slit, "
+        "or cut out a smaller spectral/spatial cube first."
+    )
+
+
+def _pv_width_sampling_plan(width: float, weight_mode: int) -> tuple[int, int]:
+    """Return width sample count and peak coordinate/weight workspace bytes."""
+    width = float(width)
+    if width <= 0.0:
+        return 0, 0
+
+    limit = int(_PV_MAX_WIDTH_SAMPLE_COUNT)
+    if weight_mode == 0:
+        # Avoid converting an enormous finite float into an equally enormous
+        # Python integer before rejecting it.
+        if width > float(limit) + 0.5:
+            count = limit + 1
+        else:
+            count = max(1, int(round(width)))
+        bytes_per_sample = np.dtype(np.float64).itemsize
+    else:
+        # Gaussian extraction creates offsets, weights, and expression
+        # temporaries. Check the equivalent count without evaluating width * 2
+        # when that multiplication could overflow.
+        max_width = max(0.0, (float(limit) - 1.0) / 2.0)
+        if width > max_width:
+            count = limit + 1
+        else:
+            count = int(np.ceil(width * 2.0)) + 1
+        bytes_per_sample = 4 * np.dtype(np.float64).itemsize
+
+    if count > limit:
+        raise MemoryError(
+            "PV extraction requested too many width samples "
+            f"({count:,}; hard limit {limit:,}). Reduce the Slice Width."
+        )
+    return count, count * bytes_per_sample
+
+
+def _pv_source_plane(data, channel: int) -> np.ndarray:
+    """Materialize and sanitize one source plane exactly once per channel."""
+    lazy = is_lazy_scaled(data)
+    plane = data[channel]
+    # LazyScaledArray already returns a newly-owned float64 plane. Normal
+    # ndarrays and Astropy copy-on-write memmaps get a bounded private copy so
+    # sanitization cannot dirty every source page or mutate caller data.
+    if lazy:
+        materialized = np.asarray(plane, dtype=np.float64)
+    else:
+        materialized = np.array(plane, dtype=np.float64, copy=True)
+    return sanitize_slice(materialized)
+
+
 def compute_pv(
     state: AppState,
     x0: Optional[float] = None,
@@ -889,7 +1252,7 @@ def compute_pv(
     weight_mode: int = 0,
     start_world: Optional[List[Union[float, str]]] = None,
     end_world: Optional[List[Union[float, str]]] = None,
-    path_geometry: Optional[Union[StraightPathGeometry, CirclePathGeometry, EllipsePathGeometry, PolylinePathGeometry]] = None,
+    path_geometry: Optional[PVPathGeometry] = None,
     path_type: str = "straight",
     center: Optional[List[float]] = None,
     semi_major_px: Optional[float] = None,
@@ -946,124 +1309,57 @@ def compute_pv(
     if state.data is None:
         raise ValueError("No data loaded")
 
-    path_kind = str(path_type or "straight").strip().lower()
-    if path_kind == "ellipse_arc":
-        path_kind = "ellipse"
-
-    if path_geometry is None and path_kind == "ellipse":
-        if center is None or semi_major_px is None or semi_minor_px is None:
-            raise ValueError("Ellipse PV requires center, semi_major_px, and semi_minor_px")
-        if len(center) < 2:
-            raise ValueError("Ellipse center must have at least 2 coordinates")
-        path_geometry = EllipsePathGeometry(
-            center=(float(center[0]), float(center[1])),
-            semi_major_px=float(semi_major_px),
-            semi_minor_px=float(semi_minor_px),
-            pa_rad=float(pa_rad),
-            start_phi_rad=float(start_phi_rad),
-            end_phi_rad=float(end_phi_rad) if end_phi_rad is not None else float(start_phi_rad) + 2.0 * np.pi,
-        )
-
-    if path_geometry is None and path_kind == "polyline":
-        verts = vertices
-        if verts is None and vertices_world is not None:
-            if state.wcs is None:
-                raise ValueError("WCS required for vertices_world")
-            verts = []
-            for vw in vertices_world:
-                if len(vw) < 2:
-                    raise ValueError("each vertex in vertices_world needs at least 2 coordinates")
-                w = []
-                for i, val in enumerate(vw):
-                    if i >= state.wcs.naxis:
-                        break
-                    ctype = get_axis_ctype(state, i)
-                    w.append(parse_world_coordinate(val, ctype))
-                while len(w) < state.wcs.naxis:
-                    w.append(0.0)
-                pix = state.wcs.wcs_world2pix([w], 0)[0]
-                verts.append([float(pix[0]), float(pix[1])])
-        if not verts or len(verts) < 2:
-            raise ValueError("Polyline PV requires at least 2 vertices")
-        resolved_spline = normalize_pv_spline_type(spline_type)
-        if resolved_spline == PV_SPLINE_NONE and smooth:
-            # Backward-compatible alias for the original boolean flag.
-            resolved_spline = PV_SPLINE_CATMULL_ROM
-        path_geometry = PolylinePathGeometry.from_points(
-            verts, spline_type=resolved_spline, smoothness=smoothness
-        )
-
-    if path_geometry is not None and (start_world is not None or end_world is not None):
-        raise ValueError("start_world/end_world cannot be combined with path_geometry")
-
-    if path_geometry is None and path_kind not in ("straight", ""):
-        raise ValueError(f"Unsupported PV path type: {path_type}")
-
-    # Handle world coordinates if provided for straight paths
-    if path_geometry is None and start_world is not None:
-        if state.wcs is None:
-            raise ValueError("WCS required for start_world")
-        if len(start_world) < 2:
-            raise ValueError("start_world must have at least 2 coordinates (x, y)")
-
-        # Parse strings
-        w0 = []
-        for i, val in enumerate(start_world):
-            # Map input indices to WCS axes 0, 1
-            if i >= state.wcs.naxis:
-                break
-            ctype = get_axis_ctype(state, i)
-            w0.append(parse_world_coordinate(val, ctype))
-
-        # Pad with 0s to match naxis
-        while len(w0) < state.wcs.naxis:
-            w0.append(0.0)
-
-        pix0 = state.wcs.wcs_world2pix([w0], 0)[0]
-        x0 = float(pix0[0])
-        y0 = float(pix0[1])
-
-    if path_geometry is None and end_world is not None:
-        if state.wcs is None:
-            raise ValueError("WCS required for end_world")
-        if len(end_world) < 2:
-            raise ValueError("end_world must have at least 2 coordinates (x, y)")
-
-        w1 = []
-        for i, val in enumerate(end_world):
-            if i >= state.wcs.naxis:
-                break
-            ctype = get_axis_ctype(state, i)
-            w1.append(parse_world_coordinate(val, ctype))
-
-        while len(w1) < state.wcs.naxis:
-            w1.append(0.0)
-
-        pix1 = state.wcs.wcs_world2pix([w1], 0)[0]
-        x1 = float(pix1[0])
-        y1 = float(pix1[1])
-
     if width is None:
         width = state.pv_width
 
     width_value = 0.0 if width is None else float(width)
-    if path_geometry is None:
-        # Use state values if not provided
-        if x0 is None:
-            x0 = state.pv_x0
-        if y0 is None:
-            y0 = state.pv_y0
-        if x1 is None:
-            x1 = state.pv_x1
-        if y1 is None:
-            y1 = state.pv_y1
-
-        if any(v is None for v in [x0, y0, x1, y1]):
-            raise ValueError("PV slice endpoints not specified")
-
-        path = StraightPathGeometry.from_endpoints(x0, y0, x1, y1)
-    else:
-        path = path_geometry
+    if not np.isfinite(width_value) or width_value < 0.0:
+        raise ValueError("width must be a non-negative finite value")
+    try:
+        weight_mode_value = float(weight_mode)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("weight_mode must be 0 (box) or 1 (Gaussian)") from exc
+    if (
+        not np.isfinite(weight_mode_value)
+        or not weight_mode_value.is_integer()
+        or int(weight_mode_value) not in (0, 1)
+    ):
+        raise ValueError("weight_mode must be 0 (box) or 1 (Gaussian)")
+    weight_mode = int(weight_mode_value)
+    if num_samples is not None:
+        try:
+            requested_samples = float(num_samples)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("num_samples must be a positive integer") from exc
+        if (
+            not np.isfinite(requested_samples)
+            or not requested_samples.is_integer()
+            or requested_samples <= 0.0
+        ):
+            raise ValueError("num_samples must be a positive integer")
+        num_samples = int(requested_samples)
+    path = resolve_pv_path_geometry(
+        state,
+        x0=x0,
+        y0=y0,
+        x1=x1,
+        y1=y1,
+        start_world=start_world,
+        end_world=end_world,
+        path_geometry=path_geometry,
+        path_type=path_type,
+        center=center,
+        semi_major_px=semi_major_px,
+        semi_minor_px=semi_minor_px,
+        pa_rad=pa_rad,
+        start_phi_rad=start_phi_rad,
+        end_phi_rad=end_phi_rad,
+        vertices=vertices,
+        vertices_world=vertices_world,
+        spline_type=spline_type,
+        smoothness=smoothness,
+        smooth=smooth,
+    )
 
     if isinstance(path, StraightPathGeometry):
         set_pv_endpoints(
@@ -1079,12 +1375,30 @@ def compute_pv(
 
     # Handle 4D data by selecting current S slice
     if data.ndim == 4:
-        data = data[state.current_s]
+        current_s = max(0, min(int(state.current_s), data.shape[0] - 1))
+        data = data[current_s]
 
     if data.ndim != 3:
         raise ValueError(f"Expected 3D data cube, got {data.ndim}D")
 
     n_vel = data.shape[0]
+    width_sample_count, width_work_nbytes = _pv_width_sampling_plan(
+        width_value,
+        weight_mode,
+    )
+    predicted_samples = _sample_count(
+        float(path.length_px),
+        num_samples,
+        sample_spacing_pix,
+    )
+    include_phi = isinstance(path, (CirclePathGeometry, EllipsePathGeometry))
+    _ensure_pv_output_memory_budget(
+        n_vel,
+        predicted_samples,
+        plane_shape=(int(data.shape[1]), int(data.shape[2])),
+        include_phi=include_phi,
+        width_work_nbytes=width_work_nbytes,
+    )
 
     samples = sample_path_points(
         path,
@@ -1097,6 +1411,13 @@ def compute_pv(
 
     if line_length_px == 0:
         num_samples = 1
+        _ensure_pv_output_memory_budget(
+            n_vel,
+            num_samples,
+            plane_shape=(int(data.shape[1]), int(data.shape[2])),
+            include_phi=include_phi,
+            width_work_nbytes=width_work_nbytes,
+        )
         pv = np.full((n_vel, num_samples), np.nan)
     else:
         xs = samples.xs
@@ -1104,38 +1425,55 @@ def compute_pv(
         normal_x = samples.normal_x
         normal_y = samples.normal_y
 
+        _ensure_pv_output_memory_budget(
+            n_vel,
+            num_samples,
+            plane_shape=(int(data.shape[1]), int(data.shape[2])),
+            include_phi=include_phi,
+            width_work_nbytes=width_work_nbytes,
+        )
         pv = np.zeros((n_vel, num_samples), dtype=np.float64)
 
         if width_value <= 0:
             # Simple interpolation along the line (no width)
             for v in range(n_vel):
+                plane = _pv_source_plane(data, v)
                 pv[v, :] = map_coordinates(
-                    data[v], [ys, xs],
-                    order=1, mode='constant', cval=np.nan
+                    plane, [ys, xs],
+                    order=1, mode='constant', cval=np.nan,
+                    output=np.float64,
                 )
 
         elif weight_mode == 0:
-            # Bilinear interpolation averaged over width
-            n_width = max(1, int(round(width_value)))
-            offsets = np.linspace(-width_value / 2, width_value / 2, n_width)
+            # Bilinear interpolation averaged over width.  Accumulate one
+            # profile at a time instead of allocating (width x samples), and
+            # materialize a lazy-scaled source plane only once per channel.
+            n_width = width_sample_count
+            offsets = (
+                (np.arange(n_width, dtype=np.float64) + 0.5)
+                * (width_value / n_width)
+                - width_value / 2.0
+            )
 
             for v in range(n_vel):
-                values = np.full((n_width, num_samples), np.nan, dtype=np.float64)
-                for i, offset in enumerate(offsets):
+                plane = _pv_source_plane(data, v)
+                sums = np.zeros(num_samples, dtype=np.float64)
+                count = np.zeros(num_samples, dtype=np.int32)
+                for offset in offsets:
                     # Use perp vectors directly like in original code
                     # Original: off_x = -np.sin(theta) * off
                     # theta = arctan2(dy, dx), so cos(theta)=dx/len, sin(theta)=dy/len
                     # off_x = - (dy/len) * off = perp_x * off
                     xs_offset = xs + offset * normal_x
                     ys_offset = ys + offset * normal_y
-                    values[i, :] = map_coordinates(
-                        data[v], [ys_offset, xs_offset],
-                        order=1, mode='constant', cval=np.nan
+                    profile = map_coordinates(
+                        plane, [ys_offset, xs_offset],
+                        order=1, mode='constant', cval=np.nan,
+                        output=np.float64,
                     )
-                # Avoid RuntimeWarning from np.nanmean on all-NaN columns.
-                valid = ~np.isnan(values)
-                count = valid.sum(axis=0)
-                sums = np.nansum(values, axis=0)
+                    valid = ~np.isnan(profile)
+                    sums[valid] += profile[valid]
+                    count[valid] += 1
                 row = np.full(num_samples, np.nan, dtype=np.float64)
                 valid_cols = count > 0
                 row[valid_cols] = sums[valid_cols] / count[valid_cols]
@@ -1144,21 +1482,23 @@ def compute_pv(
         elif weight_mode == 1:
             # Gaussian weighted interpolation
             sigma = width_value / (2.0 * np.sqrt(2.0 * np.log(2)))
-            n_offsets = int(np.ceil(width_value * 2)) + 1
+            n_offsets = width_sample_count
             offsets = np.linspace(-width_value / 2, width_value / 2, n_offsets)
             weights = np.exp(-0.5 * (offsets / sigma) ** 2)
             weights /= weights.sum()
 
             for v in range(n_vel):
-                prof_sum = np.zeros(num_samples)
-                weight_sum = np.zeros(num_samples)
+                plane = _pv_source_plane(data, v)
+                prof_sum = np.zeros(num_samples, dtype=np.float64)
+                weight_sum = np.zeros(num_samples, dtype=np.float64)
 
                 for offset, w in zip(offsets, weights):
                     xs_offset = xs + offset * normal_x
                     ys_offset = ys + offset * normal_y
                     prof = map_coordinates(
-                        data[v], [ys_offset, xs_offset],
-                        order=1, mode='constant', cval=np.nan
+                        plane, [ys_offset, xs_offset],
+                        order=1, mode='constant', cval=np.nan,
+                        output=np.float64,
                     )
 
                     valid = ~np.isnan(prof)
@@ -1176,7 +1516,7 @@ def compute_pv(
 def export_pv_fits(
     state: AppState,
     pv_data: np.ndarray,
-    output_path: str,
+    output_path: Optional[str],
     x0: float, y0: float, x1: float, y1: float,
     is_swapped: bool = False,
     history_entries: Optional[list] = None,
@@ -1295,11 +1635,14 @@ def export_pv_fits(
         )
 
     if num_pos_pixels > 1:
-        pos_cdelt = length_deg / num_pos_pixels
+        # Path sampling includes both endpoints, so adjacent sample centres are
+        # separated by length/(N-1), not length/N.
+        pos_cdelt = length_deg / (num_pos_pixels - 1)
     else:
         pos_cdelt = length_deg
 
-    pos_crpix = 0.5
+    # CRVAL is the first sampled position (start or -length/2).
+    pos_crpix = 1.0
 
     # --- Define Velocity Axis ---
     vel_axis_index = 2  # Default to 3rd axis (0-indexed 2)
@@ -1368,8 +1711,34 @@ def export_pv_fits(
 
     update_datamin_datamax_if_present(header, data_to_save)
 
+    if output_path is None:
+        # Header-only mode used by `build_pv_header`; see below.
+        return data_to_save, header
+
     # Write file
-    hdu = fits.PrimaryHDU(data=data_to_save.astype(np.float32), header=header)
-    hdu.writeto(output_path, overwrite=True)
+    from takefits.core.io.save_fits import atomic_write_fits
+
+    hdu = fits.PrimaryHDU(
+        data=data_to_save.astype(np.float32, copy=False),
+        header=header,
+    )
+    atomic_write_fits(
+        output_path,
+        lambda temporary: hdu.writeto(temporary, overwrite=True),
+    )
 
     return output_path
+
+
+def build_pv_header(
+    state: AppState,
+    pv_data: np.ndarray,
+    x0: float, y0: float, x1: float, y1: float,
+    **kwargs: Any,
+):
+    """Return ``(data, header)`` for a PV diagram without writing a file.
+
+    Shares `export_pv_fits`'s axis construction so a PV image and a PV FITS
+    describe exactly the same position/velocity axes (TF-303).
+    """
+    return export_pv_fits(state, pv_data, None, x0, y0, x1, y1, **kwargs)

@@ -6,6 +6,7 @@ from typing import Any, Literal, Tuple
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.logic.data_tools import materialize_elementwise_inputs
 
 
 IntensityUnit = Literal["jy/beam", "k", "jy/pix"]
@@ -36,6 +37,27 @@ def convert_intensity_unit(
 
     from_unit = from_unit.lower().replace(" ", "").replace("jy/pixel", "jy/pix")
     to_unit = to_unit.lower().replace(" ", "").replace("jy/pixel", "jy/pix")
+    method = method.lower()
+
+    is_chained = (
+        (from_unit == "k" and to_unit == "jy/pix")
+        or (from_unit == "jy/pix" and to_unit == "k")
+    )
+    if method == "planck":
+        output_array_count = 5 if is_chained else 4
+    elif is_chained:
+        output_array_count = 2
+    elif from_unit == to_unit:
+        output_array_count = 1
+    else:
+        # Some direct Rayleigh-Jeans paths hold a scaled-intensity temporary
+        # while allocating the final converted cube.
+        output_array_count = 2
+    (data,) = materialize_elementwise_inputs(
+        data,
+        operation_name="Unit conversion",
+        output_array_count=output_array_count,
+    )
 
     if from_unit == to_unit:
         return data.copy(), to_unit.upper()

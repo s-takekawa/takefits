@@ -145,9 +145,15 @@ class MarkerSpec:
         marker_id = str(payload.get("id") or payload.get("marker_id") or _new_marker_id())
         plane = str(payload.get("plane") or "xy")
         kind = str(payload.get("kind") or "symbol")
+        metadata = dict(payload.get("metadata") or {})
         pixel = payload.get("pixel") or ()
         if not pixel:
-            raise ValueError("Marker payload is missing 'pixel' coordinates")
+            # A marker placed by axes fraction (TF-302 `metadata.anchor_frac`)
+            # gets its real position at render time, when the image dimensions
+            # are known. Anything else is still a malformed payload.
+            if metadata.get("anchor_frac") is None:
+                raise ValueError("Marker payload is missing 'pixel' coordinates")
+            pixel = (0.0, 0.0)
         pixel_tuple = tuple(float(v) for v in pixel)
         world_payload = payload.get("world")
         world_tuple: Optional[Tuple[float, ...]] = None
@@ -155,7 +161,6 @@ class MarkerSpec:
             world_tuple = tuple(float(v) for v in world_payload)
         world_frame = str(payload.get("world_frame") or "")
         label = str(payload.get("label") or "")
-        metadata = dict(payload.get("metadata") or {})
         style = dict(payload.get("style") or {})
         return cls(
             pixel=pixel_tuple,
@@ -229,6 +234,16 @@ class AppState:
     display_grid: bool = False
     display_grid_frame: str = "native"
     display_grid_keep_native: bool = True
+
+    # Contour overlay specs (TF-303). Each entry either contours the
+    # rendered image itself or names an external FITS to overlay by world
+    # coordinate. Kept as plain dicts so they stay manifest-serializable.
+    contours: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Render styling overrides (TF-302). Sparse subset of the ConfigManager
+    # keys, applied on top of the stored config by headless image exports so
+    # ticks/labels/fonts/colorbar styling is action- and CLI-driveable.
+    render_config: Dict[str, Any] = field(default_factory=dict)
 
     def get_view_state(self, plane: str) -> ViewState:
         """Get view state for a specific plane."""

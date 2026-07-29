@@ -8,7 +8,73 @@ import math
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.logic.data_tools import ensure_operation_memory_budget, sanitize_slice
 from .utils import axis_world_to_pixel
+
+
+_CHANNEL_MAP_MAX_PANELS = 100_000
+_CHANNEL_MAP_PANEL_METADATA_BYTES = 512
+# Keep the computed float64 map and reserve one Matplotlib image copy for the
+# corresponding visible tile. Paginated maps usually display fewer panels, but
+# pricing all of them keeps unusually large grid layouts from exhausting RAM.
+_CHANNEL_MAP_RESULT_BYTES_PER_PIXEL = 2 * np.dtype(np.float64).itemsize
+_CHANNEL_MAP_WORK_BYTES_PER_PIXEL = (
+    3 * np.dtype(np.float64).itemsize + 2 * np.dtype(np.bool_).itemsize
+)
+
+
+def _preflight_channel_map_memory(
+    data,
+    *,
+    axis: int,
+    start_channel: float,
+    end_channel: float,
+    interval: float,
+) -> int:
+    """Return the planned panel count after bounding retained map memory."""
+    span = end_channel - start_channel
+    panel_ratio = span / interval
+    if not math.isfinite(panel_ratio):
+        raise MemoryError(
+            "Channel Map would require an unbounded number of panels. "
+            "Use a finite channel range and a larger interval."
+        )
+
+    # ``ceil`` is intentionally conservative at floating-point boundaries.  An
+    # extra estimated panel can only make the preflight safer; the established
+    # loop below remains the authority for the actual panel labels/results.
+    panel_count = max(1, int(math.ceil(panel_ratio)))
+    if panel_count > _CHANNEL_MAP_MAX_PANELS:
+        raise MemoryError(
+            f"Channel Map would generate about {panel_count:,} panels, which is "
+            "too many to retain and page through safely. Increase the interval "
+            "or select a smaller channel range."
+        )
+
+    normalized_axis = axis if axis >= 0 else data.ndim + axis
+    plane_pixels = math.prod(
+        int(dim) for index, dim in enumerate(data.shape) if index != normalized_axis
+    )
+
+    # The source cube remains owned by the viewer while every result image is
+    # retained by ChannelMapResult.  Current available-memory detection already
+    # accounts for that resident source, so price the additional result set,
+    # per-panel Python metadata, and one active panel's sanitation/accumulation
+    # scratch without double-counting the source itself.
+    retained_result_bytes = (
+        panel_count * plane_pixels * _CHANNEL_MAP_RESULT_BYTES_PER_PIXEL
+    )
+    panel_metadata_bytes = panel_count * _CHANNEL_MAP_PANEL_METADATA_BYTES
+    active_panel_bytes = plane_pixels * _CHANNEL_MAP_WORK_BYTES_PER_PIXEL
+    ensure_operation_memory_budget(
+        retained_result_bytes + panel_metadata_bytes + active_panel_bytes,
+        operation_name="Channel Map",
+        guidance=(
+            "Increase the channel interval, select a smaller channel range, "
+            "or make a spatial cutout before generating the map."
+        ),
+    )
+    return panel_count
 
 
 @dataclass
@@ -100,8 +166,24 @@ def compute_channel_map(
         # Allow tiny tolerance? No, just raise if empty.
         raise ValueError(f"Invalid channel range: {start_channel} to {end_channel}")
 
+    interval = float(interval)
+    if not (
+        math.isfinite(start_channel)
+        and math.isfinite(end_channel)
+        and math.isfinite(interval)
+    ):
+        raise ValueError("Channel range and interval must be finite")
+
     if interval <= 0:
         raise ValueError("Interval must be positive")
+
+    _preflight_channel_map_memory(
+        data,
+        axis=axis,
+        start_channel=start_channel,
+        end_channel=end_channel,
+        interval=interval,
+    )
 
     images = []
     labels = []
@@ -129,7 +211,7 @@ def compute_channel_map(
 
             slices = list(base_slices)
             slices[axis] = slice(idx, idx + 1)
-            img = np.squeeze(data[tuple(slices)], axis=axis)
+            img = sanitize_slice(np.squeeze(data[tuple(slices)], axis=axis))
 
         else:  # average or integrate
             # Implementing fractional implementation logic
@@ -186,7 +268,7 @@ def compute_channel_map(
                 if weight > 0:
                     slices = list(base_slices)
                     slices[axis] = i  # Select single index to get 2D array
-                    val = data[tuple(slices)]
+                    val = sanitize_slice(data[tuple(slices)])
 
                     # Handle NaNs
                     val_clean = np.nan_to_num(val, nan=0.0)

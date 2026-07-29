@@ -9,6 +9,7 @@ import yaml
 import os
 import math
 
+from takefits.core.config import axes_positions_are_valid
 from takefits.ui.widget_sizing import fit_button_to_text
 
 
@@ -1802,6 +1803,23 @@ class ConfigPanel(QWidget):
         )
         return False
 
+    def _validate_axes_positions(self):
+        values = {
+            "ax_pos_l": self.axis_left_spinbox.value(),
+            "ax_pos_r": self.axis_right_spinbox.value(),
+            "ax_pos_t": self.axis_top_spinbox.value(),
+            "ax_pos_b": self.axis_bottom_spinbox.value(),
+        }
+        if axes_positions_are_valid(values):
+            return True
+        QMessageBox.critical(
+            self,
+            "Invalid Axes Position",
+            "Axis Left must be smaller than Axis Right, and Axis Bottom "
+            "must be smaller than Axis Top.",
+        )
+        return False
+
     def _propagate_preference_updates(self, updates, roots):
         """Copy the form values to every registered top-level config."""
         changed_keys = set()
@@ -2021,6 +2039,8 @@ class ConfigPanel(QWidget):
 
     def apply_changes(self):
         """Apply user-edited preferences to all open FITS viewers."""
+        if not self._validate_axes_positions():
+            return False
         if not self._validate_grid_colors():
             return False
 

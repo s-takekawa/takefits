@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from takefits.ui.navigation_toolbar import MyNavigationToolbar
 from takefits.core.coordinate import CoordinateConverter
+from takefits.core.color import ColorMode
 from takefits.core.config import ConfigManager
 from takefits.core.colorbar_layout import compute_colorbar_geometry, orientation_for_placement
 from takefits.core.click_label_layout import compute_click_label_geometry
@@ -54,6 +55,7 @@ from takefits.logic.data_tools import (
     DEFAULT_LARGE_DATA_DISPLAY_MAX_DIM,
     build_large_data_profile,
     downsample_2d_for_display,
+    estimate_array_nbytes,
     is_lazy_scaled,
     sanitize_slice,
 )
@@ -5050,6 +5052,17 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self._overlay_updates_enabled = bool(enabled)
 
     def update_cube(self):
+        cache = getattr(self, '_large_data_slice_cache', None)
+        if cache is not None:
+            cache.clear()
+        self._large_data_prefetch_request = None
+        prefetch_timer = getattr(self, '_large_data_prefetch_timer', None)
+        if prefetch_timer is not None:
+            try:
+                prefetch_timer.stop()
+            except RuntimeError:
+                pass
+
         if self.data.ndim == 2:
             # For 2D data, self.cube is the same as self.data
             self.cube = self.data
@@ -5065,6 +5078,20 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 main_window.sync_app_state_data()
             except Exception:
                 pass
+
+        if main_window is self:
+            control_panel = getattr(self, 'control_panel', None)
+            color_panel = getattr(control_panel, 'color_settings_panel', None)
+            if color_panel is not None and getattr(color_panel, 'mode', None) == ColorMode.MAIN:
+                try:
+                    color_panel.data = self.data
+                    color_panel._data_nbytes = estimate_array_nbytes(self.data)
+                    self._color_panel_histogram_cache = None
+                    toggle = getattr(color_panel, 'hist_toggle_button', None)
+                    if toggle is not None and toggle.isChecked():
+                        color_panel.update_histogram()
+                except RuntimeError:
+                    pass
 
     def _get_plane_viewer(self, plane):
         """

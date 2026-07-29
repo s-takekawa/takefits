@@ -332,8 +332,16 @@ class IntegSettingsPanel(QDialog):
 
 
     def _set_integ_data(self):
-        self.data = self.fits_viewer.data.copy()
-        if self.wcs.naxis == 4: self.data = self.data[0]
+        # Keep the source cube shared.  The moment usecase is read-only and
+        # performs clipping/sanitization on bounded private tiles, so copying a
+        # multi-GiB memmap here only wastes RAM.  Result windows may safely keep
+        # this shared reference for coordinate/range operations.
+        self.data = self.fits_viewer.data
+        if getattr(self.data, "ndim", 0) == 4:
+            app_state = self.get_app_state()
+            current_s = int(getattr(app_state, "current_s", 0) or 0)
+            current_s = max(0, min(current_s, self.data.shape[0] - 1))
+            self.data = self.data[current_s]
         
         # Set pixel dimensions for range validation
         self.znpix = self.data.shape[0] - 1
@@ -355,6 +363,23 @@ class IntegSettingsPanel(QDialog):
             if self.wcs.naxis == 4: self.integ_slice = (0, 'y', 'x', 0)
             elif self.wcs.naxis == 3: self.integ_slice = (0, 'y', 'x')
             self.integ_axis = 2
+
+    def _compute_integration_map(self, app_state, moment_type, clip_threshold):
+        """Compute one map and turn predictable resource/input failures into UI."""
+        try:
+            self.integrated_data = compute_moment(
+                app_state,
+                moment_type=moment_type,
+                axis=self.integ_axis,
+                clip_threshold=clip_threshold,
+            )
+        except MemoryError as exc:
+            QMessageBox.warning(self, "Moment Memory Limit", str(exc))
+            return False
+        except ValueError as exc:
+            QMessageBox.warning(self, "Moment Calculation Error", str(exc))
+            return False
+        return True
 
 
     def execute_integration(self):
@@ -382,7 +407,8 @@ class IntegSettingsPanel(QDialog):
             
             if mode_text == "Average":
                 self.integ_mode = 'average'
-                self.integrated_data = compute_moment(app_state, moment_type="average", axis=self.integ_axis, clip_threshold=clip_threshold)
+                if not self._compute_integration_map(app_state, "average", clip_threshold):
+                    return
                 window = self.show_in_new_window(f"Average: {self.min_input} to {self.max_input}")
                 if window is not None:
                     self._record_current_integration_action(
@@ -391,7 +417,8 @@ class IntegSettingsPanel(QDialog):
                     )
             elif mode_text == "Peak Int.":
                 self.integ_mode = 'peak_int'
-                self.integrated_data = compute_moment(app_state, moment_type="peak", axis=self.integ_axis, clip_threshold=clip_threshold)
+                if not self._compute_integration_map(app_state, "peak", clip_threshold):
+                    return
                 window = self.show_in_new_window(f"Peak Int.: {self.min_input} to {self.max_input}")
                 if window is not None:
                     self._record_current_integration_action(
@@ -400,7 +427,8 @@ class IntegSettingsPanel(QDialog):
                     )
             elif mode_text == "Peak Coord.":
                 self.integ_mode = 'peak_corrd'
-                self.integrated_data = compute_moment(app_state, moment_type="peak_coord", axis=self.integ_axis, clip_threshold=clip_threshold)
+                if not self._compute_integration_map(app_state, "peak_coord", clip_threshold):
+                    return
                 window = self.show_in_new_window(f"Peak Coord.: {self.min_input} to {self.max_input}")
                 if window is not None:
                     self._record_current_integration_action(
@@ -409,7 +437,8 @@ class IntegSettingsPanel(QDialog):
                     )
             elif mode_text == "Median":
                 self.integ_mode = 'median_int'
-                self.integrated_data = compute_moment(app_state, moment_type="median", axis=self.integ_axis, clip_threshold=clip_threshold)
+                if not self._compute_integration_map(app_state, "median", clip_threshold):
+                    return
                 window = self.show_in_new_window(f"Median: {self.min_input} to {self.max_input}")
                 if window is not None:
                     self._record_current_integration_action(
@@ -418,7 +447,8 @@ class IntegSettingsPanel(QDialog):
                     )
             elif mode_text == "RMS":
                 self.integ_mode = 'rms'
-                self.integrated_data = compute_moment(app_state, moment_type="rms", axis=self.integ_axis, clip_threshold=clip_threshold)
+                if not self._compute_integration_map(app_state, "rms", clip_threshold):
+                    return
                 # Note: Legacy RMS had a print message about RMS value.
                 # Ideally we should show it in UI, but `integrated_data` is a map.
                 # Usecase computes MAP. Global RMS value needs separate call if desired.
@@ -431,7 +461,8 @@ class IntegSettingsPanel(QDialog):
                     )
             elif mode_text == "Sigma (Std Dev)":
                 self.integ_mode = 'sigma'
-                self.integrated_data = compute_moment(app_state, moment_type="sigma", axis=self.integ_axis, clip_threshold=clip_threshold)
+                if not self._compute_integration_map(app_state, "sigma", clip_threshold):
+                    return
                 window = self.show_in_new_window(f"Sigma: {self.min_input} to {self.max_input}")
                 if window is not None:
                     self._record_current_integration_action(
@@ -443,7 +474,8 @@ class IntegSettingsPanel(QDialog):
             # A radio button is selected
             if self.integration_radio.isChecked():
                 self.integ_mode = 'int'
-                self.integrated_data = compute_moment(app_state, moment_type="moment0", axis=self.integ_axis, clip_threshold=clip_threshold)
+                if not self._compute_integration_map(app_state, "moment0", clip_threshold):
+                    return
                 window = self.show_in_new_window(f"Integration: {self.min_input} to {self.max_input}")
                 if window is not None:
                     self._record_current_integration_action(
@@ -452,7 +484,8 @@ class IntegSettingsPanel(QDialog):
                     )
             elif self.moment1_radio.isChecked():
                 self.integ_mode = 'mom1'
-                self.integrated_data = compute_moment(app_state, moment_type="moment1", axis=self.integ_axis, clip_threshold=clip_threshold)
+                if not self._compute_integration_map(app_state, "moment1", clip_threshold):
+                    return
                 window = self.show_in_new_window(f"Moment 1: {self.min_input} to {self.max_input}")
                 if window is not None:
                     self._record_current_integration_action(
@@ -461,7 +494,8 @@ class IntegSettingsPanel(QDialog):
                     )
             elif self.moment2_radio.isChecked():
                 self.integ_mode = 'mom2'
-                self.integrated_data = compute_moment(app_state, moment_type="moment2", axis=self.integ_axis, clip_threshold=clip_threshold)
+                if not self._compute_integration_map(app_state, "moment2", clip_threshold):
+                    return
                 window = self.show_in_new_window(f"Moment 2: {self.min_input} to {self.max_input}")
                 if window is not None:
                     self._record_current_integration_action(
@@ -718,9 +752,13 @@ class IntegSettingsPanel(QDialog):
         except Exception:
             pass
 
-        data = np.asarray(self.fits_viewer.data)
-        if data.ndim == 4:
-            data = data[0]
+        # Do not call np.asarray() on LazyScaledArray here: that materializes the
+        # entire cube merely to restore a 2-D result window.
+        data = self.fits_viewer.data
+        if getattr(data, "ndim", 0) == 4:
+            current_s = int(getattr(app_state, "current_s", 0) or 0)
+            current_s = max(0, min(current_s, data.shape[0] - 1))
+            data = data[current_s]
 
         plane, integ_slice = self._plane_and_slice_for_axis(axis)
         integ_mode = self._mode_from_moment_type(moment_type)
@@ -819,6 +857,21 @@ class IntegSettingsPanel(QDialog):
             x_anchor = _optional_world(x_min_text, getattr(self, "xmin_val", 0.0))
             y_anchor = _optional_world(y_min_text, getattr(self, "ymin_val", 0.0))
             z_anchor = _optional_world(z_min_text, getattr(self, "zmin_val", 0.0))
+            stokes_world_anchor = 0.0
+            if self.fits_viewer.data.ndim == 4 and self.wcs.naxis >= 4:
+                app_state = self.get_app_state()
+                current_s = int(getattr(app_state, "current_s", 0) or 0)
+                current_s = max(
+                    0,
+                    min(current_s, int(self.fits_viewer.data.shape[0]) - 1),
+                )
+                reference_pixel = [
+                    float(crpix) - 1.0 for crpix in self.wcs.wcs.crpix
+                ]
+                reference_pixel[3] = float(current_s)
+                stokes_world_anchor = float(
+                    self.wcs.wcs_pix2world([reference_pixel], 0)[0][3]
+                )
 
             if self.fits_viewer.data.ndim == 3:
                 if axis == 2:
@@ -845,20 +898,20 @@ class IntegSettingsPanel(QDialog):
                 if axis == 2:
                     x_min = _required_world(x_min_text)
                     x_max = _required_world(x_max_text)
-                    min_pixel_float = float(self.converter.world_to_pix(x_min, y_anchor, z_anchor, 0)[0])
-                    max_pixel_float = float(self.converter.world_to_pix(x_max, y_anchor, z_anchor, 0)[0])
+                    min_pixel_float = float(self.converter.world_to_pix(x_min, y_anchor, z_anchor, stokes_world_anchor)[0])
+                    max_pixel_float = float(self.converter.world_to_pix(x_max, y_anchor, z_anchor, stokes_world_anchor)[0])
                     self.min_input, self.max_input = x_min_text, x_max_text
                 elif axis == 1:
                     y_min = _required_world(y_min_text)
                     y_max = _required_world(y_max_text)
-                    min_pixel_float = float(self.converter.world_to_pix(x_anchor, y_min, z_anchor, 0)[1])
-                    max_pixel_float = float(self.converter.world_to_pix(x_anchor, y_max, z_anchor, 0)[1])
+                    min_pixel_float = float(self.converter.world_to_pix(x_anchor, y_min, z_anchor, stokes_world_anchor)[1])
+                    max_pixel_float = float(self.converter.world_to_pix(x_anchor, y_max, z_anchor, stokes_world_anchor)[1])
                     self.min_input, self.max_input = y_min_text, y_max_text
                 elif axis == 0:
                     z_min = _required_world(z_min_text)
                     z_max = _required_world(z_max_text)
-                    min_pixel_float = float(self.converter.world_to_pix(x_anchor, y_anchor, z_min, 0)[2])
-                    max_pixel_float = float(self.converter.world_to_pix(x_anchor, y_anchor, z_max, 0)[2])
+                    min_pixel_float = float(self.converter.world_to_pix(x_anchor, y_anchor, z_min, stokes_world_anchor)[2])
+                    max_pixel_float = float(self.converter.world_to_pix(x_anchor, y_anchor, z_max, stokes_world_anchor)[2])
                     self.min_input, self.max_input = z_min_text, z_max_text
                 else:
                     raise ValueError
@@ -870,7 +923,6 @@ class IntegSettingsPanel(QDialog):
         
         if min_pixel_float > max_pixel_float:
             min_pixel_float, max_pixel_float = max_pixel_float, min_pixel_float
-        if max_pixel_float == self.data.shape[axis] - 0.5: max_pixel_float -= 0.00001
         
         # We now return the raw float values for the usecase layer to handle fractional logic.
         # But we still need ints for local clamping checks below?
@@ -971,7 +1023,15 @@ class IntegSettingsPanel(QDialog):
 
     def closeEvent(self, event):
         live_windows = [w for w in self.integ_result_windows if w is not None]
-        if live_windows:
+        # When the owning FITS window is closing, its document-family teardown
+        # will close every integration result immediately after this panel.
+        # Asking whether to keep those results would therefore offer two
+        # choices with the same outcome.  Keep the choice only when the user
+        # closes the Integration panel itself.
+        owner_is_closing = bool(
+            getattr(self.fits_viewer, "_is_app_closing", False)
+        )
+        if live_windows and not owner_is_closing:
             choice = confirm_pending_close(
                 self,
                 "Close Integration Panel",
@@ -993,7 +1053,7 @@ class IntegSettingsPanel(QDialog):
                     self._action_record_tag,
                     action_name="compute_moment",
                 )
-        else:
+        elif not live_windows:
             clear_action_preview_record(
                 self.fits_viewer,
                 self._action_record_tag,

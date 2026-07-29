@@ -4,11 +4,11 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal as pyqtSignal
 from PySide6.QtGui import QFont
-import numpy as np
 import ast
 from datetime import datetime
 from takefits.ui.save_fits_dialog import SaveFITS
 from takefits.ui.widget_sizing import fit_button_to_text
+from takefits.core.io.save_fits import update_datamin_datamax_if_present
 from takefits.core.history_provenance import build_processing_history_lines
 
 
@@ -258,12 +258,10 @@ class CubeArithmeticPanel(QWidget):
         from PySide6.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(self, "Load FITS for Variable B", "", "FITS Files (*.fits)", options=QFileDialog.Option.DontUseNativeDialog)
         if path:
-            from astropy.io import fits
+            from takefits.core.io.fits import load_fits
             import os
             try:
-                with fits.open(path) as hdul:
-                    data = hdul[0].data
-                    header = hdul[0].header
+                data, header, _, _ = load_fits(path, compute_wcs=False)
                 
                 self.variables["B"] = {"data": data, "header": header, "name": os.path.basename(path)}
                 self.variables["B"]["path"] = path
@@ -601,15 +599,13 @@ class CubeArithmeticPanel(QWidget):
                 if 'BUNIT' in new_header:
                     del new_header['BUNIT']
 
-            # Update data range if finite values exist; otherwise remove stale values
-            finite_mask = np.isfinite(data)
-            if np.any(finite_mask):
-                finite_data = data[finite_mask]
-                new_header['DATAMIN'] = float(finite_data.min())
-                new_header['DATAMAX'] = float(finite_data.max())
-            else:
-                new_header.pop('DATAMIN', None)
-                new_header.pop('DATAMAX', None)
+            # Avoid a full boolean mask and boolean-indexed data copy.
+            update_datamin_datamax_if_present(
+                new_header,
+                data,
+                ensure=True,
+                drop_if_all_invalid=True,
+            )
             
             for entry in build_processing_history_lines(self.fits_viewer):
                 new_header.add_history(entry)

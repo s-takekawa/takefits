@@ -2,11 +2,17 @@
 from __future__ import annotations
 
 import os
+import warnings
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.logic.data_tools import (
+    _get_available_memory_bytes,
+    format_nbytes,
+    is_lazy_scaled,
+)
 from .utils import axis_pixel_to_world, axis_world_to_pixel, update_datamin_datamax_if_present
 
 
@@ -189,8 +195,27 @@ def _format_history_range_from_pixel_range(
     if state.wcs is not None:
         wcs_axis = {0: 2, 1: 1, 2: 0}.get(int(integration_axis), 2)
         try:
-            world_lo = axis_pixel_to_world(state, lo, wcs_axis)
-            world_hi = axis_pixel_to_world(state, hi, wcs_axis)
+            reference_pixel = None
+            if state.wcs.naxis >= 4 and getattr(state.data, "ndim", 0) == 4:
+                reference_pixel = [
+                    crpix - 1 for crpix in state.wcs.wcs.crpix
+                ]
+                reference_pixel[3] = max(
+                    0,
+                    min(int(state.current_s), int(state.data.shape[0]) - 1),
+                )
+            world_lo = axis_pixel_to_world(
+                state,
+                lo,
+                wcs_axis,
+                reference_pixel=reference_pixel,
+            )
+            world_hi = axis_pixel_to_world(
+                state,
+                hi,
+                wcs_axis,
+                reference_pixel=reference_pixel,
+            )
             return f"{_format_history_scalar(world_lo)} to {_format_history_scalar(world_hi)}"
         except Exception:
             pass
@@ -303,7 +328,9 @@ def _moment_bunit(state: AppState, moment_type: str, integration_axis: int) -> s
 
 def _get_integration_pixel_range(
     state: AppState,
-    axis: int = 0
+    axis: int = 0,
+    *,
+    axis_len: Optional[int] = None,
 ) -> Tuple[int, int, float, float]:
     """
     Get pixel range for integration, handling fractional boundaries.
@@ -315,7 +342,9 @@ def _get_integration_pixel_range(
     if state.data is None:
         raise ValueError("No data loaded")
 
-    axis_len = state.data.shape[axis]
+    if axis_len is None:
+        axis_len = state.data.shape[axis]
+    axis_len = int(axis_len)
 
     # Get pixel limits from state (now supports float)
     min_pixel_float = 0.0
@@ -381,7 +410,79 @@ def _get_integration_pixel_range(
     return min_pixel, max_pixel, min_fraction, max_fraction
 
 
-def compute_moment(
+def _integration_indices_and_weights(
+    state: AppState,
+    *,
+    axis: int,
+    axis_len: int,
+    pixel_range: Optional[Tuple[float, float]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Resolve a continuous pixel range into exact pixel-overlap weights.
+
+    Pixel centres are integers and their cells span ``i - 0.5`` to
+    ``i + 0.5``.  An omitted bound uses the outer edge of the data, so the
+    default operation includes every pixel at full weight.  A range wholly
+    outside the cube yields one zero-weight placeholder; callers consequently
+    return an all-NaN map without touching an unbounded slice.
+    """
+    axis_len = int(axis_len)
+    if axis_len <= 0:
+        raise ValueError("Cannot integrate an empty axis")
+
+    if pixel_range is None:
+        lower = (
+            -0.5
+            if state.integ_min_pix is None
+            else float(state.integ_min_pix)
+        )
+        upper = (
+            float(axis_len) - 0.5
+            if state.integ_max_pix is None
+            else float(state.integ_max_pix)
+        )
+    else:
+        if len(pixel_range) != 2:
+            raise ValueError("pixel_range must contain exactly two values")
+        lower = float(pixel_range[0])
+        upper = float(pixel_range[1])
+
+    if not np.isfinite(lower) or not np.isfinite(upper):
+        raise ValueError("Integration pixel range must be finite")
+    if lower > upper:
+        lower, upper = upper, lower
+
+    clipped_lower = max(lower, -0.5)
+    clipped_upper = min(upper, float(axis_len) - 0.5)
+    if clipped_upper <= clipped_lower:
+        nearest = int(np.clip(round((lower + upper) * 0.5), 0, axis_len - 1))
+        return (
+            np.asarray([nearest], dtype=np.int64),
+            np.asarray([0.0], dtype=np.float64),
+        )
+
+    first = max(0, int(np.floor(clipped_lower + 0.5)))
+    stop = min(axis_len, int(np.ceil(clipped_upper + 0.5)))
+    indices = np.arange(first, stop, dtype=np.int64)
+    left_edges = indices.astype(np.float64) - 0.5
+    right_edges = left_edges + 1.0
+    weights = np.minimum(clipped_upper, right_edges) - np.maximum(
+        clipped_lower,
+        left_edges,
+    )
+    np.maximum(weights, 0.0, out=weights)
+
+    positive = weights > 0.0
+    if np.any(positive):
+        return indices[positive], weights[positive]
+
+    nearest = int(np.clip(round((lower + upper) * 0.5), 0, axis_len - 1))
+    return (
+        np.asarray([nearest], dtype=np.int64),
+        np.asarray([0.0], dtype=np.float64),
+    )
+
+
+def _compute_moment_legacy(
     state: AppState,
     moment_type: str = "moment0",
     axis: int = 0,
@@ -813,6 +914,495 @@ def compute_moment(
 
     raise ValueError(f"Unknown moment type: {moment_type}")
 
+
+# Keep each materialized 3-D tile comfortably below the size at which NumPy's
+# reduction temporaries become disruptive.  Tests may monkeypatch this value to
+# exercise the tiled path with small arrays.
+_MOMENT_TILE_TARGET_BYTES = 32 * 1024 * 1024
+# Peak-coordinate WCS conversion creates several coordinate arrays per output
+# pixel. Reserve this overhead even for short integration ranges so a
+# one-channel moment cannot turn into a hundreds-of-MiB coordinate tile.
+_MOMENT_TILE_OUTPUT_OVERHEAD_BYTES = 96
+_MOMENT_OUTPUT_FALLBACK_LIMIT_BYTES = 512 * 1024 * 1024
+_MOMENT_OUTPUT_RAM_FRACTION = 0.80
+
+
+def _moment_tile_target_bytes() -> int:
+    """Return the target byte size for one materialized moment tile."""
+    value = os.environ.get("TAKEFITS_MOMENT_TILE_MB")
+    if value is not None:
+        try:
+            size_mb = int(value)
+        except (TypeError, ValueError):
+            size_mb = 0
+        if size_mb > 0:
+            return size_mb * 1024 * 1024
+    return _MOMENT_TILE_TARGET_BYTES
+
+
+def _ensure_moment_output_memory_budget(output_shape: Tuple[int, int]) -> None:
+    """Preflight the result and GUI image copies before allocating them."""
+    output_pixels = int(output_shape[0]) * int(output_shape[1])
+    output_bytes = output_pixels * np.dtype(np.float64).itemsize
+    # The returned map, Matplotlib image copy, and previous displayed image can
+    # coexist during a GUI update. Include one tile for compute scratch.
+    working_bytes = 3 * output_bytes + _moment_tile_target_bytes()
+    available = _get_available_memory_bytes()
+    if available is None:
+        limit = _MOMENT_OUTPUT_FALLBACK_LIMIT_BYTES
+    else:
+        limit = max(
+            1 * 1024 * 1024,
+            int(available * _MOMENT_OUTPUT_RAM_FRACTION),
+        )
+    if working_bytes <= limit:
+        return
+    raise MemoryError(
+        "Moment map cannot safely allocate the requested output "
+        f"({int(output_shape[0]):,} x {int(output_shape[1]):,}, "
+        f"{format_nbytes(output_bytes)}; estimated working set "
+        f"{format_nbytes(working_bytes)}). The current available-memory safety "
+        f"limit is {format_nbytes(limit)}. Cut out a smaller spatial region first."
+    )
+
+
+def _iter_moment_tiles(
+    data_shape: Tuple[int, int, int],
+    axis: int,
+    min_pix: int,
+    max_pix: int,
+):
+    """Yield bounded input/output slices for a 3-D moment reduction.
+
+    Tiling both non-integrated dimensions is important for cubes whose
+    integration axis is X or Y: a row-only strategy can still leave a single
+    tile hundreds of MiB wide.
+    """
+    output_axes = [dim for dim in range(3) if dim != axis]
+    output_shape = (int(data_shape[output_axes[0]]), int(data_shape[output_axes[1]]))
+    integration_len = max(1, int(max_pix) - int(min_pix) + 1)
+    bytes_per_output_pixel = (
+        integration_len * np.dtype(np.float64).itemsize
+        + _MOMENT_TILE_OUTPUT_OVERHEAD_BYTES
+    )
+    max_pixels = max(1, _moment_tile_target_bytes() // max(1, bytes_per_output_pixel))
+
+    if output_shape[1] <= max_pixels:
+        col_step = output_shape[1]
+        row_step = max(1, min(output_shape[0], max_pixels // max(1, col_step)))
+    else:
+        row_step = 1
+        col_step = max_pixels
+
+    for row_start in range(0, output_shape[0], row_step):
+        row_stop = min(output_shape[0], row_start + row_step)
+        for col_start in range(0, output_shape[1], col_step):
+            col_stop = min(output_shape[1], col_start + col_step)
+            input_slices = [slice(None)] * 3
+            input_slices[axis] = slice(min_pix, max_pix + 1)
+            input_slices[output_axes[0]] = slice(row_start, row_stop)
+            input_slices[output_axes[1]] = slice(col_start, col_stop)
+            output_slices = (
+                slice(row_start, row_stop),
+                slice(col_start, col_stop),
+            )
+            yield tuple(input_slices), output_slices, output_axes
+
+
+def _materialize_moment_tile(
+    data,
+    input_slices,
+    *,
+    clip_threshold: Optional[float],
+) -> np.ndarray:
+    """Read, scale, sanitize, and optionally clip one bounded 3-D tile."""
+    source = data[input_slices]
+    if is_lazy_scaled(source):
+        # LazyScaledArray already owns the newly scaled float64 buffer.
+        values = np.asarray(source, dtype=np.float64)
+    else:
+        # FITS memmaps are read-only/copy-on-write and must never be modified by
+        # clipping or NaN normalization.
+        values = np.array(source, dtype=np.float64, copy=True)
+
+    with np.errstate(invalid="ignore"):
+        bad = ~np.isfinite(values)
+        bad |= values < -100000
+        if clip_threshold is not None:
+            bad |= values < float(clip_threshold)
+    if np.any(bad):
+        values[bad] = np.nan
+    return values
+
+
+def _weighted_tile_sum(values: np.ndarray, coefficients: np.ndarray, axis: int) -> np.ndarray:
+    """Reduce a NaN-free tile with 1-D coefficients without a 3-D product."""
+    moved = np.moveaxis(values, axis, 0)
+    return np.einsum(
+        "i,i...->...",
+        np.asarray(coefficients, dtype=np.float64),
+        moved,
+        dtype=np.float64,
+        casting="unsafe",
+        optimize=False,
+    )
+
+
+def _weighted_valid_sum(valid: np.ndarray, weights: np.ndarray, axis: int) -> np.ndarray:
+    """Return the fractional count of valid samples for every output pixel."""
+    moved = np.moveaxis(valid, axis, 0)
+    return np.einsum(
+        "i,i...->...",
+        np.asarray(weights, dtype=np.float64),
+        moved,
+        dtype=np.float64,
+        casting="unsafe",
+        optimize=False,
+    )
+
+
+def _any_positive_weight_valid(valid: np.ndarray, weights: np.ndarray, axis: int) -> np.ndarray:
+    """Return whether any positive-weight sample is valid per output pixel."""
+    moved = np.moveaxis(valid, axis, 0)
+    result = np.zeros(moved.shape[1:], dtype=bool)
+    for index, weight in enumerate(weights):
+        if weight > 0.0:
+            result |= moved[index]
+    return result
+
+
+def _moment_world_coordinates(
+    state: AppState,
+    axis: int,
+    indices: np.ndarray,
+) -> np.ndarray:
+    """Return integration-axis world coordinates using the legacy WCS anchor."""
+    wcs = state.wcs
+    if wcs is None:
+        return indices.astype(np.float64)
+
+    data_to_wcs_axis = {0: 2, 1: 1, 2: 0}
+    wcs_axis = data_to_wcs_axis.get(axis, axis)
+    num_wcs_axes = int(wcs.naxis)
+    pixel_coords = np.zeros((indices.size, num_wcs_axes), dtype=np.float64)
+    pixel_coords[:, wcs_axis] = indices
+    for idx in range(num_wcs_axes):
+        if idx != wcs_axis:
+            pixel_coords[:, idx] = wcs.wcs.crpix[idx] - 1
+    if (
+        num_wcs_axes >= 4
+        and getattr(state.data, "ndim", 0) == 4
+    ):
+        pixel_coords[:, 3] = max(
+            0,
+            min(int(state.current_s), int(state.data.shape[0]) - 1),
+        )
+    world_coords = wcs.wcs_pix2world(pixel_coords, 0)
+    return np.asarray(world_coords[:, wcs_axis], dtype=np.float64)
+
+
+def _peak_coordinate_tile(
+    state: AppState,
+    *,
+    axis: int,
+    min_pix: int,
+    local_peak_indices: np.ndarray,
+    output_slices,
+    output_axes,
+    all_nan_mask: np.ndarray,
+) -> np.ndarray:
+    """Convert a bounded tile of peak indices to pixel/world coordinates."""
+    global_peak_indices = np.asarray(local_peak_indices, dtype=np.int64) + int(min_pix)
+    tile_shape = global_peak_indices.shape
+    grid_indices = np.indices(tile_shape, dtype=np.float64)
+    pixel_coords_numpy = np.zeros((global_peak_indices.size, 3), dtype=np.float64)
+
+    for grid_axis, data_axis in enumerate(output_axes):
+        start = int(output_slices[grid_axis].start or 0)
+        pixel_coords_numpy[:, data_axis] = grid_indices[grid_axis].reshape(-1) + start
+    pixel_coords_numpy[:, axis] = global_peak_indices.reshape(-1)
+
+    wcs = state.wcs
+    if wcs is None:
+        result = global_peak_indices.astype(np.float64)
+    else:
+        num_wcs_axes = int(wcs.naxis)
+        pixel_coords_fits = np.zeros(
+            (pixel_coords_numpy.shape[0], num_wcs_axes),
+            dtype=np.float64,
+        )
+        for wcs_axis in range(num_wcs_axes):
+            pixel_coords_fits[:, wcs_axis] = wcs.wcs.crpix[wcs_axis] - 1
+        if (
+            num_wcs_axes >= 4
+            and getattr(state.data, "ndim", 0) == 4
+        ):
+            pixel_coords_fits[:, 3] = max(
+                0,
+                min(int(state.current_s), int(state.data.shape[0]) - 1),
+            )
+        for data_axis in range(3):
+            wcs_axis = 2 - data_axis
+            if wcs_axis < num_wcs_axes:
+                pixel_coords_fits[:, wcs_axis] = pixel_coords_numpy[:, data_axis]
+        world_coords = wcs.wcs_pix2world(pixel_coords_fits, 0)
+        target_wcs_axis = {0: 2, 1: 1, 2: 0}.get(axis, axis)
+        result = np.asarray(
+            world_coords[:, target_wcs_axis],
+            dtype=np.float64,
+        ).reshape(tile_shape)
+
+    result = np.asarray(result, dtype=np.float64)
+    result[all_nan_mask] = np.nan
+    return result
+
+
+def compute_moment(
+    state: AppState,
+    moment_type: str = "moment0",
+    axis: int = 0,
+    clip_threshold: Optional[float] = None,
+    pixel_range: Optional[Tuple[float, float]] = None,
+    world_range: Optional[Tuple[Union[float, str], Union[float, str]]] = None,
+) -> np.ndarray:
+    """Compute a moment map with a bounded-memory tiled reduction.
+
+    Only a small 3-D tile is materialized at once, so FITS memmaps and
+    ``LazyScaledArray`` remain useful even when the source cube is many GiB.
+    Accumulation is float64 for stable results; the unavoidable resident output
+    is only the final 2-D map.
+    """
+    if state.data is None:
+        raise ValueError("No data loaded")
+
+    data = state.data
+    if data.ndim == 4:
+        current_s = max(0, min(int(state.current_s), data.shape[0] - 1))
+        data = data[current_s]
+    if data.ndim != 3:
+        raise ValueError(f"Expected 3D data cube, got {data.ndim}D")
+
+    try:
+        axis = int(axis)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("axis must be 0, 1, or 2") from exc
+    if axis not in (0, 1, 2):
+        raise ValueError("axis must be 0, 1, or 2")
+
+    canonical = _canonical_moment_type(moment_type)
+    supported = {
+        "moment0",
+        "moment1",
+        "moment2",
+        "average",
+        "peak",
+        "peak_coord",
+        "median",
+        "rms",
+        "sigma",
+    }
+    if canonical not in supported:
+        raise ValueError(f"Unknown moment type: {moment_type}")
+    if clip_threshold is not None and not np.isfinite(float(clip_threshold)):
+        raise ValueError("clip_threshold must be finite")
+
+    use_pixel_range = pixel_range
+    if use_pixel_range is None and world_range is not None:
+        if state.wcs is None:
+            raise ValueError("WCS is required for world_range conversion")
+        wcs_axis = data.ndim - 1 - axis
+        min_world, max_world = world_range
+        reference_pixel = None
+        if state.wcs.naxis >= 4 and getattr(state.data, "ndim", 0) == 4:
+            reference_pixel = [
+                crpix - 1 for crpix in state.wcs.wcs.crpix
+            ]
+            reference_pixel[3] = max(
+                0,
+                min(int(state.current_s), int(state.data.shape[0]) - 1),
+            )
+        min_pix_w = axis_world_to_pixel(
+            state,
+            min_world,
+            wcs_axis,
+            reference_pixel=reference_pixel,
+        )
+        max_pix_w = axis_world_to_pixel(
+            state,
+            max_world,
+            wcs_axis,
+            reference_pixel=reference_pixel,
+        )
+        if min_pix_w > max_pix_w:
+            min_pix_w, max_pix_w = max_pix_w, min_pix_w
+        use_pixel_range = (min_pix_w, max_pix_w)
+
+    indices, weights = _integration_indices_and_weights(
+        state,
+        axis=axis,
+        axis_len=data.shape[axis],
+        pixel_range=use_pixel_range,
+    )
+    min_pix = int(indices[0])
+    max_pix = int(indices[-1])
+
+    output_shape = tuple(data.shape[dim] for dim in range(3) if dim != axis)
+    _ensure_moment_output_memory_budget(output_shape)
+    result = np.empty(output_shape, dtype=np.float64)
+    world_coords = None
+    if canonical in {"moment1", "moment2"}:
+        world_coords = _moment_world_coordinates(state, axis, indices)
+
+    for input_slices, output_slices, output_axes in _iter_moment_tiles(
+        tuple(int(size) for size in data.shape),
+        axis,
+        min_pix,
+        max_pix,
+    ):
+        values = _materialize_moment_tile(
+            data,
+            input_slices,
+            clip_threshold=clip_threshold,
+        )
+        valid = ~np.isnan(values)
+        positive_weight_shape = [1, 1, 1]
+        positive_weight_shape[axis] = weights.size
+        valid &= (weights > 0.0).reshape(positive_weight_shape)
+
+        if canonical in {"peak", "peak_coord", "median"}:
+            any_valid = np.any(valid, axis=axis)
+        else:
+            any_valid = _any_positive_weight_valid(valid, weights, axis)
+
+        if canonical == "peak":
+            values[~valid] = -np.inf
+            tile_result = np.max(values, axis=axis)
+            tile_result[~any_valid] = np.nan
+
+        elif canonical == "median":
+            values[~valid] = np.nan
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                tile_result = np.nanmedian(values, axis=axis)
+            tile_result[~any_valid] = np.nan
+
+        elif canonical == "peak_coord":
+            values[~valid] = -np.inf
+            local_peak_indices = np.argmax(values, axis=axis)
+            tile_result = _peak_coordinate_tile(
+                state,
+                axis=axis,
+                min_pix=min_pix,
+                local_peak_indices=local_peak_indices,
+                output_slices=output_slices,
+                output_axes=output_axes,
+                all_nan_mask=~any_valid,
+            )
+
+        else:
+            values[~valid] = 0.0
+            if canonical == "moment0":
+                tile_result = _weighted_tile_sum(values, weights, axis)
+                tile_result[~any_valid] = np.nan
+
+            elif canonical == "average":
+                tile_result = _weighted_tile_sum(values, weights, axis)
+                valid_weight = _weighted_valid_sum(valid, weights, axis)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    tile_result /= valid_weight
+                tile_result[~any_valid] = np.nan
+
+            elif canonical == "moment1":
+                intensity_sum = _weighted_tile_sum(values, weights, axis)
+                reference_coord = float(world_coords[0])
+                coordinate_offsets = world_coords - reference_coord
+                numerator = _weighted_tile_sum(
+                    values,
+                    weights * coordinate_offsets,
+                    axis,
+                )
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    tile_result = reference_coord + numerator / intensity_sum
+                world_min = float(np.nanmin(world_coords))
+                world_max = float(np.nanmax(world_coords))
+                tile_result[
+                    (tile_result < world_min) | (tile_result > world_max)
+                ] = np.nan
+
+            elif canonical == "moment2":
+                intensity_sum = _weighted_tile_sum(values, weights, axis)
+                reference_coord = float(world_coords[0])
+                coordinate_offsets = world_coords - reference_coord
+                numerator = _weighted_tile_sum(
+                    values,
+                    weights * coordinate_offsets,
+                    axis,
+                )
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    mean_offset = numerator / intensity_sum
+
+                moved_values = np.moveaxis(values, axis, 0)
+                variance_numerator = np.zeros_like(mean_offset, dtype=np.float64)
+                scratch = np.empty_like(mean_offset, dtype=np.float64)
+                for index, weight in enumerate(weights):
+                    if weight <= 0.0:
+                        continue
+                    np.subtract(
+                        coordinate_offsets[index],
+                        mean_offset,
+                        out=scratch,
+                    )
+                    np.square(scratch, out=scratch)
+                    scratch *= moved_values[index]
+                    variance_numerator += weight * scratch
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    variance = variance_numerator / intensity_sum
+                tiny_negative = (variance < 0.0) & (
+                    variance
+                    >= -np.finfo(np.float64).eps
+                    * np.maximum(1.0, np.square(mean_offset))
+                    * 8.0
+                )
+                variance[tiny_negative] = 0.0
+                variance[variance < 0.0] = np.nan
+                tile_result = np.sqrt(variance)
+
+            elif canonical == "rms":
+                sum_weights = _weighted_valid_sum(valid, weights, axis)
+                np.square(values, out=values)
+                squared_sum = _weighted_tile_sum(values, weights, axis)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    tile_result = np.sqrt(squared_sum / sum_weights)
+
+            else:  # sigma
+                sum_weights = _weighted_valid_sum(valid, weights, axis)
+                weighted_sum = _weighted_tile_sum(values, weights, axis)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    weighted_mean = weighted_sum / sum_weights
+
+                moved_values = np.moveaxis(values, axis, 0)
+                moved_valid = np.moveaxis(valid, axis, 0)
+                variance_sum = np.zeros_like(weighted_mean, dtype=np.float64)
+                for index, weight in enumerate(weights):
+                    if weight <= 0.0:
+                        continue
+                    moved_values[index] -= weighted_mean
+                    moved_values[index][~moved_valid[index]] = 0.0
+                    np.square(moved_values[index], out=moved_values[index])
+                    variance_sum += weight * moved_values[index]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    variance = variance_sum / sum_weights
+                tile_result = np.sqrt(variance)
+
+        result[output_slices] = tile_result
+
+    if canonical == "moment0" and state.wcs is not None:
+        try:
+            result *= abs(state.wcs.wcs.cdelt[2 - axis])
+        except (AttributeError, IndexError):
+            pass
+    return result
+
 def export_moment_map_fits(
     state: AppState,
     output_path: str,
@@ -1027,7 +1617,15 @@ def export_moment_fits(
     update_datamin_datamax_if_present(header, moment_data)
 
     # Write file
-    hdu = fits.PrimaryHDU(data=moment_data.astype(np.float32), header=header)
-    hdu.writeto(output_path, overwrite=True)
+    from takefits.core.io.save_fits import atomic_write_fits
+
+    hdu = fits.PrimaryHDU(
+        data=moment_data.astype(np.float32, copy=False),
+        header=header,
+    )
+    atomic_write_fits(
+        output_path,
+        lambda temporary: hdu.writeto(temporary, overwrite=True),
+    )
 
     return output_path

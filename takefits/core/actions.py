@@ -11,20 +11,32 @@ class Action:
     description: str
     handler: Callable
     parameters: Dict[str, Any] = field(default_factory=dict)
+    cli_supported: bool = True
     
     def to_schema(self) -> Dict[str, Any]:
         """Convert to OpenAI-compatible function schema."""
-        return {
+        schema = {
             "name": self.name,
             "description": self.description,
             "parameters": self.parameters
         }
+        if not self.cli_supported:
+            schema["x-cli-supported"] = False
+        return schema
 
 class ActionRegistry:
     def __init__(self):
         self._actions: Dict[str, Action] = {}
 
-    def register(self, name: str, description: str, handler: Callable, params_schema: Optional[Dict[str, Any]] = None):
+    def register(
+        self,
+        name: str,
+        description: str,
+        handler: Callable,
+        params_schema: Optional[Dict[str, Any]] = None,
+        *,
+        cli_supported: bool = True,
+    ):
         """
         Register a new action.
         
@@ -36,8 +48,17 @@ class ActionRegistry:
         """
         if params_schema is None:
             params_schema = self._introspect_schema(handler)
-            
-        action = Action(name=name, description=description, handler=handler, parameters=params_schema)
+        params_schema = dict(params_schema)
+        if params_schema.get("type") == "object":
+            params_schema.setdefault("additionalProperties", False)
+
+        action = Action(
+            name=name,
+            description=description,
+            handler=handler,
+            parameters=params_schema,
+            cli_supported=cli_supported,
+        )
         self._actions[name] = action
 
     def get_action(self, name: str) -> Optional[Action]:
@@ -212,6 +233,65 @@ def _export_pv_from_result(
     )
 
 
+def _export_spectrum_from_result(
+    state: AppState,
+    result: Any,
+    output_path: str,
+    xlabel: Optional[str] = None,
+    ylabel: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Export the spectrum produced by the preceding spectrum action."""
+    unit = ""
+    if isinstance(result, dict):
+        if "spectrum" not in result or "velocity" not in result:
+            raise ValueError(
+                "export_spectrum requires a preceding get_spectrum or "
+                "get_region_spectrum action."
+            )
+        spectrum_data = np.asanyarray(result["spectrum"])
+        velocity_values = np.asanyarray(result["velocity"])
+        unit = str(result.get("unit") or "")
+    else:
+        spectrum_data = np.asanyarray(result)
+        if spectrum_data.ndim != 1:
+            raise ValueError(
+                "export_spectrum requires a one-dimensional spectrum result."
+            )
+        velocity_values = _usecases().spectral_axis_values(
+            state, int(spectrum_data.size)
+        )
+        unit = _usecases().spectral_axis_unit(
+            state, int(spectrum_data.size), fallback="pixel"
+        )
+
+    spectrum_data = np.asarray(spectrum_data, dtype=float).ravel()
+    velocity_values = np.asarray(velocity_values, dtype=float).ravel()
+    if spectrum_data.size != velocity_values.size:
+        raise ValueError(
+            "Spectrum and spectral-axis arrays must have the same length."
+        )
+
+    export_metadata = dict(metadata or {})
+    if getattr(state, "filepath", None):
+        export_metadata.setdefault("filename", str(state.filepath))
+
+    if xlabel is None:
+        xlabel = "Channel" if not unit or unit == "pixel" else f"Spectral axis [{unit}]"
+    if ylabel is None:
+        bunit = str((state.header or {}).get("BUNIT", "") or "").strip()
+        ylabel = f"Intensity [{bunit}]" if bunit else "Intensity"
+
+    return _usecases().export_spectrum(
+        spectrum_data=spectrum_data,
+        velocity_values=velocity_values,
+        output_path=output_path,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        metadata=export_metadata,
+    )
+
+
 def _apply_baseline_subtraction_with_result(
     state: AppState,
     world_ranges: List[List[float]],
@@ -253,7 +333,10 @@ def register_default_actions(registry: ActionRegistry):
             "type": "object",
             "properties": {
                 "filepath": {"type": "string", "description": "Absolute path to the FITS file."},
-                "hdu": {"type": "integer", "description": "HDU index (default 0)."},
+                "hdu": {
+                    "type": "integer",
+                    "description": "Explicit HDU index; omitted to auto-select the first image HDU.",
+                },
                 "compute_wcs": {"type": "boolean", "description": "Whether to compute WCS (default True)."}
             },
             "required": ["filepath"]
@@ -300,7 +383,13 @@ def register_default_actions(registry: ActionRegistry):
         params_schema={
             "type": "object",
             "properties": {
-                "moment_type": {"type": "string", "enum": ["moment0", "moment1", "moment2", "average", "peak", "rms"]},
+                "moment_type": {
+                    "type": "string",
+                    "enum": [
+                        "moment0", "moment1", "moment2", "average", "peak",
+                        "peak_coord", "median", "rms", "sigma",
+                    ],
+                },
                 "axis": {"type": "integer", "description": "Axis to integrate along (0=z, 1=y, 2=x)."},
                 "pixel_range": {
                     "type": "array",
@@ -345,6 +434,14 @@ def register_default_actions(registry: ActionRegistry):
                 "vertices_world": {"type": "array", "items": {"type": "array", "minItems": 2}},
                 "spline_type": {"type": "string", "enum": ["none", "catmull_rom", "bspline"], "description": "Polyline curve: 'catmull_rom' curves through the nodes, 'bspline' approximates (smooths) them, 'none' keeps straight segments."},
                 "smoothness": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "Spline roundness 0..1 for a curve spline_type (1=full curve, 0=straight)."},
+                "start_world": {"type": "array", "minItems": 2, "maxItems": 2},
+                "end_world": {"type": "array", "minItems": 2, "maxItems": 2},
+                "smooth": {"type": "boolean"},
+                "position_unit": {
+                    "type": "string",
+                    "enum": ["pixel", "pix", "arcsec", "arcmin", "deg"],
+                    "description": "Recorded/displayed path-position unit.",
+                },
                 "sample_axis": {"type": "string", "enum": ["position", "phi"]}
             },
             "required": []
@@ -378,8 +475,8 @@ def register_default_actions(registry: ActionRegistry):
 
     registry.register(
         name="export_spectrum",
-        description="Export spectrum to text file.",
-        handler=_usecase_handler("export_spectrum"),
+        description="Export the preceding spectrum result to a text file.",
+        handler=_export_spectrum_from_result,
         params_schema={
             "type": "object",
             "properties": {
@@ -389,12 +486,12 @@ def register_default_actions(registry: ActionRegistry):
                 "metadata": {"type": "object"}
             },
             "required": ["output_path"]
-        }
+        },
     )
     
     registry.register(
         name="export_figure",
-        description="Export a matplotlib figure to file.",
+        description="Export a live matplotlib figure to file (GUI-only).",
         handler=_usecase_handler("export_figure"),
          params_schema={
             "type": "object",
@@ -404,7 +501,8 @@ def register_default_actions(registry: ActionRegistry):
                 "transparent": {"type": "boolean"}
             },
             "required": ["output_path"]
-        }
+        },
+        cli_supported=False,
     )
 
     registry.register(
@@ -447,10 +545,90 @@ def register_default_actions(registry: ActionRegistry):
             "type": "object",
             "properties": {
                 "x": {"type": "integer", "description": "X pixel coordinate."},
-                "y": {"type": "integer", "description": "Y pixel coordinate."}
+                "y": {"type": "integer", "description": "Y pixel coordinate."},
+                "world_x": {
+                    "description": "X world coordinate as a number or coordinate string."
+                },
+                "world_y": {
+                    "description": "Y world coordinate as a number or coordinate string."
+                },
             },
             "required": []
         }
+    )
+
+    # Analysis helpers reachable from CLI/AI (TF-303)
+    registry.register(
+        name="estimate_noise",
+        description=(
+            "Estimate the 1-sigma noise (rms) of the loaded cube. Use it to "
+            "express contour levels or mask thresholds as a multiple of the rms."
+        ),
+        handler=_usecase_handler("estimate_noise"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "enum": ["diff_mad", "mad", "std"],
+                    "description": "Robust estimator (default diff_mad).",
+                },
+                "spectral_axis": {
+                    "type": "integer",
+                    "description": "Spectral axis index for diff-MAD (default -3).",
+                },
+            },
+            "required": [],
+        },
+    )
+
+    registry.register(
+        name="get_region_spectrum",
+        description="Average the spectrum over a region and return it as lists.",
+        handler=_usecase_handler("get_region_spectrum"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "region": {
+                    "type": "object",
+                    "description": "Region spec (same payload as add_region).",
+                }
+            },
+            "required": ["region"],
+        },
+    )
+
+    registry.register(
+        name="fit_spectrum_gaussian",
+        description=(
+            "Fit Gaussian components to a spectrum taken from a region, a pixel, "
+            "or the current cursor position."
+        ),
+        handler=_usecase_handler("fit_spectrum_gaussian"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "X pixel of the spectrum."},
+                "y": {"type": "integer", "description": "Y pixel of the spectrum."},
+                "region": {
+                    "type": "object",
+                    "description": "Region spec; averages the spectrum over it.",
+                },
+                "n_components": {
+                    "type": "integer",
+                    "description": "Fixed component count (with auto_components false).",
+                },
+                "auto_components": {"type": "boolean"},
+                "max_components": {"type": "integer"},
+                "fit_baseline": {"type": "boolean"},
+                "baseline_fixed": {"type": "number"},
+                "allow_negative": {"type": "boolean"},
+                "noise_sigma": {"type": "number"},
+                "min_sigma": {"type": "number"},
+                "max_sigma": {"type": "number"},
+            },
+            "required": [],
+        },
     )
 
     # --- Phase 9a: Tier 1 Usecases ---
@@ -515,6 +693,40 @@ def register_default_actions(registry: ActionRegistry):
         }
     )
 
+    # Render styling overrides (TF-302)
+    registry.register(
+        name="set_render_config",
+        description=(
+            "Override figure styling for headless image export: ticks, tick "
+            "labels, axis labels, fonts, colorbar, and coordinate format. Keys "
+            "are takefits config keys (for example tick_labelsize, tick_font, "
+            "axislabel_fontsize, colorbar_label, colorbar_tick_labelsize, "
+            "decimal, cbar_pos_x). Unknown keys are rejected."
+        ),
+        handler=_usecase_handler("set_render_config"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "overrides": {
+                    "type": "object",
+                    "description": "Sparse mapping of config key -> value.",
+                },
+                "replace": {
+                    "type": "boolean",
+                    "description": "Discard previous overrides instead of merging.",
+                },
+            },
+            "required": ["overrides"],
+        },
+    )
+
+    registry.register(
+        name="clear_render_config",
+        description="Remove all render styling overrides and use the stored config.",
+        handler=_usecase_handler("clear_render_config"),
+        params_schema={"type": "object", "properties": {}, "required": []},
+    )
+
     # Smoothing
     registry.register(
         name="apply_smoothing",
@@ -526,7 +738,11 @@ def register_default_actions(registry: ActionRegistry):
                 "kernel_type": {"type": "string", "enum": ["gaussian", "boxcar", "hanning"]},
                 "smoothness_x": {"type": "number", "description": "Kernel width in pixels (X)."},
                 "smoothness_y": {"type": "number", "description": "Kernel width in pixels (Y)."},
-                "smoothness_z": {"type": "number", "description": "Kernel width in pixels (Z)."}
+                "smoothness_z": {"type": "number", "description": "Kernel width in pixels (Z)."},
+                "handle_nan": {
+                    "type": "boolean",
+                    "description": "Preserve NaNs using weighted interpolation.",
+                },
             },
             "required": []
         }
@@ -545,6 +761,18 @@ def register_default_actions(registry: ActionRegistry):
                 "current_bmaj": {"type": "number", "description": "Current BMAJ in arcsec (optional override)."},
                 "current_bmin": {"type": "number", "description": "Current BMIN in arcsec (optional override)."},
                 "current_bpa": {"type": "number", "description": "Current BPA in degrees (optional override)."},
+                "bunit": {
+                    "type": "string",
+                    "description": "Recorded source brightness unit for history replay.",
+                },
+                "beam_unit_scale": {
+                    "type": "number",
+                    "description": "Recorded beam-area scale for history replay.",
+                },
+                "beam_unit_scale_basis": {
+                    "type": "string",
+                    "description": "Recorded beam-area scale provenance.",
+                },
             },
             "required": ["target_bmaj", "target_bmin"],
         },
@@ -731,7 +959,21 @@ def register_default_actions(registry: ActionRegistry):
                 "min_delta_sigma": {"type": "number", "description": "Min delta in sigma."},
                 "min_npix": {"type": "integer", "description": "Min pixels per structure."},
                 "output_mode": {"type": "string", "enum": ["leaves", "roots", "all"]},
-                "use_scimes": {"type": "boolean", "description": "Whether to use SCIMES."}
+                "use_scimes": {"type": "boolean", "description": "Whether to use SCIMES."},
+                "scimes_criteria": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "SCIMES clustering criteria.",
+                },
+                "scimes_user_k": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Target cluster count (0=automatic).",
+                },
+                "scimes_save_isol": {
+                    "type": "boolean",
+                    "description": "Include isolated leaves in the result.",
+                },
             },
             "required": ["rms"]
         }
@@ -794,7 +1036,11 @@ def register_default_actions(registry: ActionRegistry):
                         "maxItems": 2
                     },
                     "description": "List of (min, max) in world coordinates for each axis."
-                }
+                },
+                "region": {
+                    "type": "object",
+                    "description": "Region spec used to mask pixels outside the region.",
+                },
             },
             "required": []
         }
@@ -910,7 +1156,13 @@ def register_default_actions(registry: ActionRegistry):
             "type": "object",
             "properties": {
                 "output_path": {"type": "string"},
-                "moment_type": {"type": "string", "enum": ["moment0", "moment1", "moment2", "average", "peak"]},
+                "moment_type": {
+                    "type": "string",
+                    "enum": [
+                        "moment0", "moment1", "moment2", "average", "peak",
+                        "peak_coord", "median", "rms", "sigma",
+                    ],
+                },
                 "axis": {"type": "integer"},
                 "cmap": {"type": "string"},
                 "pixel_range": {
@@ -918,7 +1170,12 @@ def register_default_actions(registry: ActionRegistry):
                     "items": {"type": "number"},
                     "minItems": 2, "maxItems": 2
                 },
+                "world_range": {
+                    "type": "array",
+                    "minItems": 2, "maxItems": 2
+                },
                 "title": {"type": "string"},
+                "origin": {"type": "string", "enum": ["lower", "upper"]},
                 "grid": {"type": "boolean", "description": "Draw the WCS coordinate grid overlay (TF-404)."},
                 "grid_frame": {
                     "type": "string",
@@ -928,6 +1185,31 @@ def register_default_actions(registry: ActionRegistry):
                 "grid_keep_native": {
                     "type": "boolean",
                     "description": "Keep the native grid beneath a non-native XY overlay."
+                },
+                "vmin": {"type": "number", "description": "Lower intensity limit (null autoscales)."},
+                "vmax": {"type": "number", "description": "Upper intensity limit (null autoscales)."},
+                "figsize": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2,
+                    "description": "Figure size in inches [width, height]. Default [8, 6]."
+                },
+                "dpi": {"type": "integer"},
+                "draw_markers": {
+                    "type": "boolean",
+                    "description": "Draw state markers on the XY image (default true)."
+                },
+                "draw_regions": {
+                    "type": "boolean",
+                    "description": "Draw state regions on the XY image (default true)."
+                },
+                "draw_beam": {
+                    "type": "boolean",
+                    "description": "Draw the beam ellipse (default true)."
+                },
+                "draw_contours": {
+                    "type": "boolean",
+                    "description": "Draw configured contour overlays (default true)."
                 }
             },
             "required": ["output_path"]
@@ -942,7 +1224,13 @@ def register_default_actions(registry: ActionRegistry):
             "type": "object",
             "properties": {
                 "output_path": {"type": "string"},
-                "moment_type": {"type": "string", "enum": ["moment0", "moment1", "moment2", "average", "peak"]},
+                "moment_type": {
+                    "type": "string",
+                    "enum": [
+                        "moment0", "moment1", "moment2", "average", "peak",
+                        "peak_coord", "median", "rms", "sigma",
+                    ],
+                },
                 "axis": {"type": "integer"},
                 "pixel_range": {
                     "type": "array",
@@ -980,11 +1268,243 @@ def register_default_actions(registry: ActionRegistry):
                 "end_channel": {"type": "integer"},
                 "interval": {"type": "number"},
                 "mode": {"type": "string", "enum": ["slice", "average", "integrate"]},
+                "axis": {"type": "integer"},
                 "ncols": {"type": "integer"},
-                "cmap": {"type": "string"}
+                "cmap": {"type": "string"},
+                "start_world": {"type": "number"},
+                "end_world": {"type": "number"},
+                "interval_world": {"type": "number"},
+                "vmin": {"type": "number", "description": "Lower intensity limit."},
+                "vmax": {"type": "number", "description": "Upper intensity limit."},
+                "dpi": {"type": "integer"},
+                "figsize": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2,
+                    "description": "Figure size in inches. Default [ncols*3, nrows*3]."
+                },
+                "title": {"type": "string"},
+                "draw_markers": {
+                    "type": "boolean",
+                    "description": "Draw state markers on the tiles (default true)."
+                },
+                "draw_regions": {
+                    "type": "boolean",
+                    "description": "Draw state regions on the tiles (default true)."
+                },
+                "draw_beam": {
+                    "type": "boolean",
+                    "description": "Draw the beam ellipse (default true)."
+                },
+                "draw_contours": {
+                    "type": "boolean",
+                    "description": "Draw configured contour overlays (default true)."
+                },
+                "marker_plane_prefix": {
+                    "type": "string",
+                    "description": (
+                        "Plane-id prefix for channel-map annotations "
+                        "(default 'channel_xy'). '<prefix>_global_<i>' targets "
+                        "tile i; the bare prefix targets every tile."
+                    )
+                }
             },
             "required": ["output_path"]
         }
+    )
+
+    registry.register(
+        name="export_pv_image",
+        description=(
+            "Compute a PV diagram and export it as an image. Position/velocity "
+            "axes match export_pv_fits."
+        ),
+        handler=_usecase_handler("export_pv_image"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "output_path": {"type": "string"},
+                "x0": {"type": "number"}, "y0": {"type": "number"},
+                "x1": {"type": "number"}, "y1": {"type": "number"},
+                "width": {"type": "number", "description": "Slit width in pixels."},
+                "num_samples": {"type": "integer"},
+                "sample_spacing_pix": {"type": "number"},
+                "weight_mode": {"type": "integer"},
+                "start_world": {"type": "array", "minItems": 2},
+                "end_world": {"type": "array", "minItems": 2},
+                "path_type": {
+                    "type": "string",
+                    "enum": ["straight", "polyline", "ellipse", "ellipse_arc"],
+                },
+                "center": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                },
+                "semi_major_px": {"type": "number"},
+                "semi_minor_px": {"type": "number"},
+                "pa_rad": {"type": "number"},
+                "start_phi_rad": {"type": "number"},
+                "end_phi_rad": {"type": "number"},
+                "vertices": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                    },
+                    "minItems": 2,
+                },
+                "vertices_world": {
+                    "type": "array",
+                    "items": {"type": "array", "minItems": 2},
+                    "minItems": 2,
+                },
+                "spline_type": {
+                    "type": "string",
+                    "enum": ["none", "catmull_rom", "bspline"],
+                },
+                "smoothness": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                },
+                "smooth": {"type": "boolean"},
+                "sample_axis": {
+                    "type": "string",
+                    "enum": ["position", "phi"],
+                },
+                "is_swapped": {
+                    "type": "boolean",
+                    "description": "Put velocity on the horizontal axis.",
+                },
+                "cmap": {"type": "string"},
+                "vmin": {"type": "number"},
+                "vmax": {"type": "number"},
+                "dpi": {"type": "integer"},
+                "figsize": {
+                    "type": "array", "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2,
+                },
+                "title": {"type": "string"},
+                "draw_beam": {"type": "boolean"},
+                "draw_contours": {"type": "boolean"},
+                "history_entries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "position_origin": {"type": "string", "enum": ["start", "center"]},
+                "position_unit": {
+                    "type": "string",
+                    "enum": ["pix", "arcsec", "arcmin", "deg"],
+                },
+                "x_axis_mode": {"type": "string", "enum": ["position", "phi"]},
+                "path_length_px": {"type": "number"},
+                "phi_start_deg": {"type": "number"},
+                "phi_end_deg": {"type": "number"},
+            },
+            "required": ["output_path"],
+        },
+    )
+
+    registry.register(
+        name="export_spectrum_image",
+        description=(
+            "Plot a spectrum from a pixel or a region and export it as an image."
+        ),
+        handler=_usecase_handler("export_spectrum_image"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "output_path": {"type": "string"},
+                "x": {"type": "integer"}, "y": {"type": "integer"},
+                "region": {
+                    "type": "object",
+                    "description": "Region spec; averages the spectrum over it.",
+                },
+                "dpi": {"type": "integer"},
+                "figsize": {
+                    "type": "array", "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2,
+                },
+                "title": {"type": "string"},
+                "xlabel": {"type": "string"}, "ylabel": {"type": "string"},
+                "color": {"type": "string"},
+                "linewidth": {"type": "number"},
+                "drawstyle": {"type": "string"},
+                "xlim": {
+                    "type": "array", "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2,
+                },
+                "ylim": {
+                    "type": "array", "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2,
+                },
+                "show_zero_line": {"type": "boolean"},
+                "fit": {
+                    "type": "boolean",
+                    "description": "Overlay a Gaussian fit of the same spectrum.",
+                },
+                "fit_kwargs": {
+                    "type": "object",
+                    "description": "Arguments forwarded to Gaussian fitting.",
+                },
+                "fit_color": {"type": "string"},
+                "fit_linewidth": {"type": "number"},
+            },
+            "required": ["output_path"],
+        },
+    )
+
+    # Contour overlays (TF-303)
+    registry.register(
+        name="set_contours",
+        description=(
+            "Replace the contour overlay specs. Each spec contours the rendered "
+            "image itself, or names an external FITS to overlay by world "
+            "coordinate. Levels come from sigma_levels (n x rms), explicit "
+            "levels, or level_min/level_max/level_step."
+        ),
+        handler=_usecase_handler("set_contours"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "contours": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "List of contour specs (dicts).",
+                }
+            },
+            "required": ["contours"],
+        },
+    )
+
+    registry.register(
+        name="add_contour",
+        description="Append one contour overlay spec.",
+        handler=_usecase_handler("add_contour"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "contour": {
+                    "type": "object",
+                    "description": (
+                        "Contour spec. Keys: plane, filepath (external FITS), "
+                        "channel, sigma_levels, rms, levels, level_min, "
+                        "level_max, level_step, include_negative, color, "
+                        "linewidth, linestyle, negative_linestyle, smoothing."
+                    ),
+                }
+            },
+            "required": ["contour"],
+        },
+    )
+
+    registry.register(
+        name="clear_contours",
+        description="Remove all contour overlay specs.",
+        handler=_usecase_handler("clear_contours"),
+        params_schema={"type": "object", "properties": {}, "required": []},
     )
 
     # --- Annotations (Regions / Markers) ---

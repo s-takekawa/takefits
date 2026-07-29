@@ -32,6 +32,12 @@ from takefits.core.usecases.clump import (
     export_clump_mask,
 )
 from takefits.logic.clump_worker import ClumpWorker
+from takefits.logic.data_tools import (
+    ensure_operation_memory_budget,
+    estimate_materialized_nbytes,
+    format_nbytes,
+    is_lazy_scaled,
+)
 from takefits.logic.progress import CancellationToken
 
 
@@ -39,6 +45,7 @@ from takefits.logic.progress import CancellationToken
 # thread unwinds, so Qt never deletes a still-running QThread.  Each entry is a
 # (QThread, ClumpWorker) tuple removed once the thread finishes.
 _DETACHED_CLUMP_JOBS: set = set()
+_WORKSPACE_MASK_MAX_RAW_BYTES = 256 * 1024 ** 2
 from takefits.core.history_provenance import build_processing_history_lines
 from takefits.core.contour_manager import ContourManager, ContourParameters, ContourSegment, ContourItemState, ContourState
 from takefits.tools.base_panel import (
@@ -1076,10 +1083,13 @@ class ClumpFindingPanel(QWidget):
     def get_analysis_data(self):
         """Return 2D image or 3D cube for analysis."""
         if self.data.ndim == 2:
-            return self.data.copy()
+            return self.data if is_lazy_scaled(self.data) else self.data.copy()
 
         cube = self.cube if self.cube is not None else self.data
-        return np.array(cube, copy=False)
+        # A scaled memmap cannot satisfy NumPy 2's ``copy=False`` contract.
+        # Keep it lazy here; the worker usecase performs the memory preflight
+        # and materializes it off the GUI thread.
+        return cube if is_lazy_scaled(cube) else np.asarray(cube)
 
     def run_identification(self):
         """Start the selected clump-finding algorithm on a worker thread."""
@@ -1557,18 +1567,24 @@ class ClumpFindingPanel(QWidget):
         if self.result_mask is None:
             return None
         base = self.fits_viewer.data
-        mask = self.result_mask.astype(np.float32, copy=False)
-        if base.ndim == mask.ndim:
-            out = mask.copy()
-            out[out == 0] = np.nan
-            return out
-        if base.ndim == 4 and mask.ndim == 3:
-            out = np.zeros(base.shape, dtype=np.float32)
-            out[0] = mask
-            out[out == 0] = np.nan
-            return out
-        out = mask.copy()
-        out[out == 0] = np.nan
+        mask = np.asanyarray(self.result_mask)
+        output_shape = base.shape if base.ndim == 4 and mask.ndim == 3 else mask.shape
+        output_count = int(np.prod(output_shape, dtype=np.int64))
+        mask_count = int(mask.size)
+        ensure_operation_memory_budget(
+            output_count * np.dtype(np.float32).itemsize
+            + mask_count * np.dtype(np.bool_).itemsize,
+            operation_name="Clump label display",
+            guidance=(
+                "Close unused result windows or make a smaller cutout before "
+                "displaying the label cube."
+            ),
+        )
+
+        out = np.full(output_shape, np.nan, dtype=np.float32)
+        target = out[0] if base.ndim == 4 and mask.ndim == 3 else out
+        nonzero = mask != 0
+        np.copyto(target, mask, where=nonzero, casting="unsafe")
         return out
 
     def display_as_label_cube(self):
@@ -2183,7 +2199,36 @@ class ClumpFindingPanel(QWidget):
     def _serialize_workspace_array_payload(array):
         if array is None:
             return None
+        projected_bytes = estimate_materialized_nbytes(array)
+        shape = tuple(int(dim) for dim in getattr(array, "shape", ()) or ())
+        dtype = str(getattr(array, "dtype", "unknown"))
+        if (
+            projected_bytes is not None
+            and int(projected_bytes) > _WORKSPACE_MASK_MAX_RAW_BYTES
+        ):
+            return {
+                "encoding": "omitted-large-array",
+                "reason": (
+                    "Clump mask was omitted from workspace state because its "
+                    "raw array exceeds the safe serialization limit."
+                ),
+                "shape": list(shape),
+                "dtype": dtype,
+                "nbytes": int(projected_bytes),
+                "limit_bytes": int(_WORKSPACE_MASK_MAX_RAW_BYTES),
+            }
         try:
+            if projected_bytes is not None:
+                # np.save + BytesIO.getvalue + zlib + base64 can briefly retain
+                # roughly five raw-array equivalents for incompressible labels.
+                ensure_operation_memory_budget(
+                    int(projected_bytes) * 5,
+                    operation_name="Clump workspace serialization",
+                    guidance=(
+                        "Save/export the clump mask as FITS instead of embedding "
+                        "it in the workspace."
+                    ),
+                )
             arr = np.asarray(array)
             buffer = io.BytesIO()
             np.save(buffer, arr, allow_pickle=False)
@@ -2191,6 +2236,16 @@ class ClumpFindingPanel(QWidget):
             return {
                 "encoding": "npy+zlib+base64",
                 "payload": base64.b64encode(compressed).decode("ascii"),
+            }
+        except MemoryError as exc:
+            return {
+                "encoding": "omitted-large-array",
+                "reason": str(exc),
+                "shape": list(shape),
+                "dtype": dtype,
+                "nbytes": (
+                    None if projected_bytes is None else int(projected_bytes)
+                ),
             }
         except Exception:
             return None
@@ -2254,10 +2309,15 @@ class ClumpFindingPanel(QWidget):
 
         source_mask = self._base_result_mask if self._base_result_mask is not None else self.result_mask
         mask_payload = self._serialize_workspace_array_payload(source_mask)
-        if mask_payload is not None:
+        if (
+            isinstance(mask_payload, dict)
+            and mask_payload.get("encoding") == "npy+zlib+base64"
+        ):
             state["result_mask"] = mask_payload
             unique = np.unique(source_mask)
             state["detected_count"] = int(np.count_nonzero(unique > 0))
+        elif isinstance(mask_payload, dict):
+            state["result_mask_omitted"] = mask_payload
         return state
 
     def restore_workspace_state(self, state):

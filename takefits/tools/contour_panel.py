@@ -45,6 +45,7 @@ from takefits.core.contour_external import (
     default_levels,
     describe_source,
     estimate_rms,
+    preview_contour_plane,
     sigma_levels,
     smooth_plane,
 )
@@ -740,7 +741,18 @@ class ContourPanel(QDialog):
         if params is None:
             return
 
-        compute_contours(layer_ids, params, overlay_ids)
+        try:
+            compute_contours(layer_ids, params, overlay_ids)
+        except MemoryError as exc:
+            QMessageBox.warning(self, "Contours", str(exc))
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Contours",
+                f"Failed to generate contours:\n{exc}",
+            )
+            return
         self.refresh_targets()
 
     def clear_contours(self) -> None:
@@ -1539,8 +1551,6 @@ class ExternalFitsContourDialog(QDialog):
             plane = self._state.get_slice_2d('xy')
         except Exception:
             plane = None
-        if plane is not None:
-            plane = np.asarray(plane, dtype=float)
         self._plane_cache = {channel: plane}
         return plane
 
@@ -1549,9 +1559,9 @@ class ExternalFitsContourDialog(QDialog):
         if plane is None or plane.ndim != 2 or plane.size == 0:
             self._preview_stride = 1
             return None
-        stride = max(1, int(np.ceil(max(plane.shape) / self._PREVIEW_MAX_DIM)))
+        preview, stride = preview_contour_plane(plane, self._PREVIEW_MAX_DIM)
         self._preview_stride = stride
-        return plane[::stride, ::stride]
+        return preview
 
     # ----- defaults / prefill -----
 

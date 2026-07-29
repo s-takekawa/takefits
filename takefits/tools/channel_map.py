@@ -8,6 +8,7 @@ import os
 import json
 import uuid
 import re
+import warnings
 
 import astropy.units as u
 import numpy as np
@@ -37,6 +38,73 @@ from takefits.core.action_session import ActionSession
 from takefits.core.actions import ActionRegistry, register_default_actions
 from takefits.tools.base_panel import record_action_preview, clear_action_preview_record
 from takefits.tools.panel_helpers import _resolve_xz_subwindow, _resolve_z_view_limits
+
+
+_CHANNEL_MAP_MAX_SAMPLES = 1_000_000
+
+
+def _bounded_channel_data_sample(images, max_samples=_CHANNEL_MAP_MAX_SAMPLES):
+    """Return a bounded, approximately uniform sample across channel images."""
+    arrays = [np.asanyarray(image) for image in list(images or [])]
+    total = sum(int(array.size) for array in arrays)
+    if total <= 0:
+        return np.asarray([], dtype=float)
+
+    max_samples = max(1, int(max_samples))
+    if total <= max_samples:
+        flattened = [np.asarray(array).reshape(-1) for array in arrays if array.size]
+        if len(flattened) == 1:
+            return flattened[0]
+        return np.concatenate(flattened)
+
+    stride = max(1, (total + max_samples - 1) // max_samples)
+    offset = 0
+    sampled = []
+    sample_count = 0
+    for array in arrays:
+        size = int(array.size)
+        first = (-offset) % stride
+        if first < size and sample_count < max_samples:
+            indices = np.arange(first, size, stride, dtype=np.intp)
+            remaining = max_samples - sample_count
+            if indices.size > remaining:
+                indices = indices[:remaining]
+            values = np.asarray(array).flat[indices]
+            sampled.append(values)
+            sample_count += int(values.size)
+        offset += size
+
+    if not sampled:
+        return np.asarray([], dtype=float)
+    if len(sampled) == 1:
+        return sampled[0]
+    return np.concatenate(sampled)
+
+
+def _channel_data_minmax(images):
+    """Compute exact extrema tile-by-tile without stacking all images."""
+    data_min = np.inf
+    data_max = -np.inf
+    found = False
+    for image in list(images or []):
+        array = np.asanyarray(image)
+        if array.size == 0:
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            try:
+                tile_min = float(np.nanmin(array))
+                tile_max = float(np.nanmax(array))
+            except (TypeError, ValueError):
+                continue
+        if np.isnan(tile_min) or np.isnan(tile_max):
+            continue
+        data_min = min(data_min, tile_min)
+        data_max = max(data_max, tile_max)
+        found = True
+    if not found:
+        return np.nan, np.nan
+    return data_min, data_max
 
 
 def _axis_length_for_channel_map(fits_viewer, axis_number):
@@ -183,7 +251,8 @@ class ChannelMapWindow(QMainWindow):
         self.fits_viewer = fits_viewer
         self.subwindows = subwindows
         self.ch_imdata = ch_imdata
-        self.flattened_chdata = np.array(self.ch_imdata).flatten()
+        self._channel_data_range = _channel_data_minmax(self.ch_imdata)
+        self.flattened_chdata = _bounded_channel_data_sample(self.ch_imdata)
         self.range_label = range_label
         self.tiles_x = tiles_x
         self.tiles_y = tiles_y
@@ -1286,11 +1355,8 @@ class ChannelMapWindow(QMainWindow):
 
     # Marker ActionSession bridge ---------------------------------------
     def _setup_marker_action_bridge(self):
-        source_data = getattr(self.fits_viewer, "data", None)
-        if source_data is None:
-            source_data = np.asarray(self.ch_imdata) if self.ch_imdata else np.zeros((1, 1), dtype=float)
         self.app_state = create_app_state(
-            data=np.asarray(source_data),
+            data=self.flattened_chdata,
             header=getattr(self.fits_viewer, "header", None),
             wcs=self.wcs,
             filepath=getattr(self.fits_viewer, "filename", None),
@@ -1538,7 +1604,7 @@ class ChannelMapWindow(QMainWindow):
         total_images = len(self.ch_imdata)
         self.im_list = []
         self.ch_labels = []
-        vmin, vmax = np.nanmin(self.flattened_chdata), np.nanmax(self.flattened_chdata)
+        vmin, vmax = self._channel_data_range
         for idx, ax in enumerate(self.axes):
             global_index = start_index + idx
             if global_index < total_images:
@@ -2424,6 +2490,7 @@ class ChannelMapWindow(QMainWindow):
                 mode=ColorMode.CHANNEL,
                 fits_viewer=self,
                 data=self.flattened_chdata,
+                data_range=self._channel_data_range,
                 config=self.config,
                 color_pattern= self.color_pattern,
                 filename = self.fits_viewer.filename,

@@ -54,6 +54,7 @@ import json
 import math
 import time
 import zlib
+import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
 from functools import partial
@@ -1651,7 +1652,7 @@ class MainWindow(FITSViewer):
         _add("marker_panel", getattr(self, "marker_panel", None))
         _add("regrid_panel", getattr(self, "_regrid_panel", None))
 
-        if self.data.ndim > 2:
+        if getattr(getattr(self, "data", None), "ndim", 0) > 2:
             _add("subwindow:xz", getattr(self, "subwindow1", None))
             _add("subwindow:zy", getattr(self, "subwindow2", None))
 
@@ -2737,6 +2738,10 @@ class MainWindow(FITSViewer):
         return restored
 
     def eventFilter(self, _obj, event):
+        if getattr(self, "_is_app_closing", False) or getattr(
+            self, "_heavy_data_disposed", False
+        ):
+            return super().eventFilter(_obj, event)
         if event is None:
             return super().eventFilter(_obj, event)
         event_type = event.type()
@@ -8482,7 +8487,155 @@ class MainWindow(FITSViewer):
                 pass
         return True
 
+    def dispose_heavy_data(self, related_holders=None):
+        """Idempotently detach cube-sized objects after an accepted close.
+
+        Qt signal connections can keep a closed Python wrapper alive. Clearing
+        the large NumPy/memmap references here is therefore distinct from
+        garbage-collecting the wrapper, and is especially important on Windows
+        where a surviving memmap also keeps the source FITS file locked.
+
+        ``related_holders`` is captured before owned windows are closed. Some
+        derived Qt windows use ``WA_DeleteOnClose`` and may already be awaiting
+        deferred deletion by the time this method runs, so only their plain
+        Python data attributes are touched. Matplotlib artist cleanup is
+        restricted to the MainWindow and its persistent SubWindows.
+        """
+        if getattr(self, "_heavy_data_disposed", False):
+            return
+        self._heavy_data_disposed = True
+
+        figure_holders = [self]
+        for name in ("subwindow1", "subwindow2"):
+            value = getattr(self, name, None)
+            if value is not None:
+                figure_holders.append(value)
+        figure_holders.extend(list(getattr(self, "subwindows", []) or []))
+
+        holders = list(figure_holders)
+        if related_holders is None:
+            try:
+                related_holders = self._collect_workspace_windows_by_token().values()
+            except Exception:
+                related_holders = ()
+        holders.extend(holder for holder in related_holders if holder is not None)
+
+        unique_holders = []
+        seen = set()
+        for holder in holders:
+            if holder is None or id(holder) in seen:
+                continue
+            seen.add(id(holder))
+            unique_holders.append(holder)
+
+        figure_holder_ids = {id(holder) for holder in figure_holders}
+        placeholder = np.full((1, 1), np.nan, dtype=np.float32)
+        heavy_attrs = (
+            "data",
+            "original_data",
+            "cube",
+            "integrated_data",
+            "masked_data",
+            "smoothed_data",
+            "scaling_reference_data",
+            "_data",
+            "_active_plot_source_data",
+            "_last_subtracted_data",
+            "_previous_data_snapshot",
+            "baseline_model_data",
+            "_baseline_data",
+            "analysis_data",
+            "result_mask",
+            "_base_result_mask",
+            "current_mask",
+            "ch_imdata",
+            "flattened_chdata",
+            "variables",
+            "original_data_map",
+            "_large_data_slice_cache",
+        )
+        for holder in unique_holders:
+            try:
+                holder_attrs = vars(holder)
+            except Exception:
+                holder_attrs = {}
+
+            displaymap = holder_attrs.get("displaymap")
+            if displaymap is not None:
+                try:
+                    displaymap_attrs = vars(displaymap)
+                except Exception:
+                    displaymap_attrs = {}
+                for name in ("data", "imdata"):
+                    if name in displaymap_attrs:
+                        displaymap_attrs[name] = None
+
+            if id(holder) in figure_holder_ids:
+                figures = []
+                for name in ("fig", "figure"):
+                    figure = holder_attrs.get(name)
+                    if figure is not None and figure not in figures:
+                        figures.append(figure)
+                for figure in figures:
+                    try:
+                        for axis in list(getattr(figure, "axes", []) or []):
+                            for image in list(getattr(axis, "images", []) or []):
+                                image.set_data(placeholder)
+                    except Exception:
+                        pass
+
+            for name in heavy_attrs:
+                if name in holder_attrs:
+                    holder_attrs[name] = None
+
+            app_state = holder_attrs.get("app_state")
+            try:
+                app_state_attrs = vars(app_state)
+            except Exception:
+                app_state_attrs = {}
+            if "data" in app_state_attrs:
+                app_state_attrs["data"] = None
+
+            session = holder_attrs.get("action_session")
+            try:
+                session_attrs = vars(session)
+            except Exception:
+                session_attrs = {}
+            for state_name in ("state", "_initial_state_seed"):
+                state = session_attrs.get(state_name)
+                try:
+                    state_attrs = vars(state)
+                except Exception:
+                    state_attrs = {}
+                if "data" in state_attrs:
+                    state_attrs["data"] = None
+            if "last_result" in session_attrs:
+                session_attrs["last_result"] = None
+
+    def _defer_close_for_running_regrid(self, event) -> bool:
+        """Keep the document alive while its non-cancellable regrid job runs."""
+        thread = getattr(self, "_regrid_thread", None)
+        try:
+            running = thread is not None and thread.isRunning()
+        except RuntimeError:
+            running = False
+        if not running:
+            return False
+
+        QMessageBox.information(
+            self,
+            "Regrid In Progress",
+            "This FITS window cannot be closed until the running regrid "
+            "operation finishes. The Regrid panel itself may still be closed "
+            "while processing continues.",
+        )
+        event.ignore()
+        return True
+
     def closeEvent(self, event):
+        if self._defer_close_for_running_regrid(event):
+            return
+
         # Suppress this window's own deferred callbacks while it tears down.
         self._is_app_closing = True
         app = QApplication.instance()
@@ -8515,6 +8668,13 @@ class MainWindow(FITSViewer):
         # when other MainWindows remain open. On the last window the app quit
         # below would also handle it, but doing it uniformly keeps teardown
         # predictable.
+        try:
+            related_data_holders = tuple(
+                self._collect_workspace_windows_by_token().values()
+            )
+        except Exception:
+            related_data_holders = ()
+
         if not self._close_owned_windows():
             self._is_app_closing = False
             if app is not None and is_last_window:
@@ -8576,16 +8736,9 @@ class MainWindow(FITSViewer):
                 self._registered_in_window_registry = False
             except Exception:
                 pass
-        # NOTE: disconnecting the two process-global connections above stops a
-        # closed window from doing per-event work, which is what mattered for
-        # performance. The Python wrapper itself is NOT freed after close: the
-        # window's object graph is pinned by many C++-held signal->lambda
-        # connections (buttons, menu actions, managers, subwindows, panels,
-        # coordinator, toolbar) that Python's gc cannot break, and the data cube
-        # is additionally retained through numpy views (.base) that
-        # gc.get_referrers cannot even enumerate. Fully reclaiming the window +
-        # cube needs a dedicated dispose() protocol across the UI. See the
-        # xfail regression target in tests/test_window_memory.py.
+        self.dispose_heavy_data(related_data_holders)
+        # The Qt/Python wrapper can still be pinned by signal-to-lambda
+        # connections, but cube/memmap ownership is explicitly detached above.
         if app is not None and is_last_window:
             print("\n\nProgram exited.")
             app.quit()

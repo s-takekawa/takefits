@@ -138,3 +138,23 @@ def _find_marker_index(state: AppState, marker_id: str) -> Optional[int]:
             return idx
     return None
 
+
+
+def set_contours(state: AppState, contours: Sequence[Dict[str, Any]]) -> AppState:
+    """Replace the contour overlay specs (TF-303)."""
+    state.contours = [dict(entry) for entry in (contours or [])]
+    return state
+
+
+def add_contour(state: AppState, contour: Dict[str, Any]) -> AppState:
+    """Append one contour overlay spec."""
+    if not isinstance(contour, dict):
+        raise TypeError("contour must be a mapping")
+    state.contours = list(state.contours or []) + [dict(contour)]
+    return state
+
+
+def clear_contours(state: AppState) -> AppState:
+    """Remove all contour overlay specs."""
+    state.contours = []
+    return state

@@ -6,9 +6,124 @@ from typing import Any, Dict, Literal, Optional, Tuple
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.logic.data_tools import (
+    ensure_operation_memory_budget,
+    estimate_materialized_nbytes,
+    is_lazy_scaled,
+    materialize_elementwise_inputs,
+)
 
 
 SmoothingKernel = Literal["gaussian", "boxcar", "hanning"]
+
+
+def _array_element_count(data: Any) -> int:
+    """Return an array-like's element count without coercing lazy FITS data."""
+    size = getattr(data, "size", None)
+    if size is not None:
+        return max(0, int(size))
+    shape = tuple(int(dim) for dim in getattr(data, "shape", ()) or ())
+    return int(np.prod(shape, dtype=np.int64)) if shape else 0
+
+
+def _smoothing_working_bytes(
+    data: Any,
+    *,
+    kernel_type: str,
+    smoothness_x: float,
+    smoothness_y: float,
+    smoothness_z: float,
+) -> int:
+    """Conservatively price smoothing outputs and full-array temporaries."""
+    count = _array_element_count(data)
+    source_bytes = int(estimate_materialized_nbytes(data) or 0)
+    lazy_input_bytes = source_bytes if is_lazy_scaled(data) else 0
+    float64_bytes = count * np.dtype(np.float64).itemsize
+    bool_bytes = count * np.dtype(bool).itemsize
+
+    no_op = (
+        kernel_type != "hanning"
+        and float(smoothness_x) == 0.0
+        and float(smoothness_y) == 0.0
+        and float(smoothness_z) == 0.0
+    )
+    if no_op:
+        return lazy_input_bytes + source_bytes
+
+    if kernel_type == "hanning":
+        # The numerator and denominator are convolved in place, then the
+        # numerator becomes the returned normalized result.
+        phase_bytes = (2 * float64_bytes) + (2 * bool_bytes)
+        return lazy_input_bytes + int(phase_bytes * 1.25)
+
+    if float(smoothness_z) > 0.0 and int(getattr(data, "ndim", 0)) >= 3:
+        # Gaussian/boxcar kernels are separable.  The bounded path retains one
+        # float64 numerator, one float64 weight cube, and validity state.
+        phase_bytes = (2 * float64_bytes) + (2 * bool_bytes)
+        return lazy_input_bytes + int(phase_bytes * 1.25)
+
+    # Spatial smoothing is plane-wise. The persistent output is full-sized;
+    # FFT/padding scratch is bounded to one trailing image plane.
+    shape = tuple(int(dim) for dim in getattr(data, "shape", ()) or ())
+    plane_count = (
+        int(shape[-2]) * int(shape[-1])
+        if len(shape) >= 2
+        else count
+    )
+    plane_scratch = plane_count * 64
+    return lazy_input_bytes + float64_bytes + bool_bytes + plane_scratch
+
+
+def ensure_smoothing_memory_budget(
+    data: Any,
+    *,
+    kernel_type: str = "gaussian",
+    smoothness_x: float = 1.0,
+    smoothness_y: float = 1.0,
+    smoothness_z: float = 0.0,
+    operation_name: str = "Smoothing",
+) -> None:
+    """Reject an unsafe smoothing request before allocating or materializing."""
+    ensure_operation_memory_budget(
+        _smoothing_working_bytes(
+            data,
+            kernel_type=kernel_type,
+            smoothness_x=smoothness_x,
+            smoothness_y=smoothness_y,
+            smoothness_z=smoothness_z,
+        ),
+        operation_name=operation_name,
+        guidance=(
+            "Use Tools > Cutout, fewer channels, or a smaller spatial region "
+            "before smoothing."
+        ),
+    )
+
+
+def _prepare_smoothing_input(
+    data: Any,
+    *,
+    kernel_type: str,
+    smoothness_x: float,
+    smoothness_y: float,
+    smoothness_z: float,
+    operation_name: str,
+) -> np.ndarray:
+    """Preflight then materialize a lazy scaled input exactly once."""
+    ensure_smoothing_memory_budget(
+        data,
+        kernel_type=kernel_type,
+        smoothness_x=smoothness_x,
+        smoothness_y=smoothness_y,
+        smoothness_z=smoothness_z,
+        operation_name=operation_name,
+    )
+    prepared, = materialize_elementwise_inputs(
+        data,
+        operation_name=operation_name,
+        output_array_count=1.0,
+    )
+    return prepared
 
 
 def _is_per_beam_bunit(bunit: Any) -> bool:
@@ -161,6 +276,44 @@ def _apply_planewise(
     return out
 
 
+def _separable_axis_kernels(kernel: np.ndarray) -> Tuple[np.ndarray, ...]:
+    """Recover normalized 1-D factors from a separable smoothing kernel."""
+    kernel = np.asarray(kernel, dtype=np.float64)
+    vectors = []
+    centers = tuple(int(size // 2) for size in kernel.shape)
+    for axis in range(kernel.ndim):
+        index = list(centers)
+        index[axis] = slice(None)
+        vector = np.asarray(kernel[tuple(index)], dtype=np.float64).copy()
+        total = float(np.sum(vector))
+        if not np.isfinite(total) or total == 0.0:
+            raise ValueError("Smoothing kernel is not separable")
+        vector /= total
+        vectors.append(vector)
+    return tuple(vectors)
+
+
+def _convolve_separable_in_place(
+    values: np.ndarray,
+    kernels: Tuple[np.ndarray, ...],
+    *,
+    mode: str,
+) -> np.ndarray:
+    """Apply trailing-axis 1-D kernels while reusing one full-size array."""
+    from scipy.ndimage import convolve1d
+
+    first_axis = values.ndim - len(kernels)
+    for offset, kernel in enumerate(kernels):
+        convolve1d(
+            values,
+            kernel,
+            axis=first_axis + offset,
+            mode=mode,
+            output=values,
+        )
+    return values
+
+
 def compute_smoothed(
     data: np.ndarray,
     kernel_type: str = "gaussian",
@@ -183,9 +336,22 @@ def compute_smoothed(
     Returns:
         Smoothed data array (same shape as input)
     """
-    from scipy.signal import fftconvolve
     from scipy.ndimage import convolve1d
     from astropy.convolution import Gaussian1DKernel, Gaussian2DKernel, CustomKernel
+
+    if kernel_type not in ("gaussian", "boxcar", "hanning"):
+        raise ValueError(f"Unknown kernel type: {kernel_type}")
+    if kernel_type == "hanning" and data.ndim < 3:
+        raise ValueError("Hanning smoothing is available only for 3D/4D cubes")
+
+    data = _prepare_smoothing_input(
+        data,
+        kernel_type=kernel_type,
+        smoothness_x=smoothness_x,
+        smoothness_y=smoothness_y,
+        smoothness_z=smoothness_z,
+        operation_name="Smoothing",
+    )
 
     if kernel_type != "hanning" and smoothness_x == 0 and smoothness_y == 0 and smoothness_z == 0:
         return data.copy()
@@ -196,9 +362,6 @@ def compute_smoothed(
     use_nan_aware = handle_nan and bool(has_nan)
 
     if kernel_type == "hanning":
-        if data.ndim < 3:
-            raise ValueError("Hanning smoothing is available only for 3D/4D cubes")
-
         # FITS cubes are expected as (z, y, x) or (s, z, y, x); smooth along z.
         spectral_axis = data.ndim - 3
         hanning_weights = np.array([0.25, 0.5, 0.25], dtype=np.float64)
@@ -207,16 +370,38 @@ def compute_smoothed(
             valid_mask = np.isfinite(data)
             if not np.any(valid_mask):
                 return np.full(data.shape, np.nan, dtype=np.float64)
-            data_filled = np.where(valid_mask, data, 0.0)
-            numer = convolve1d(data_filled, hanning_weights, axis=spectral_axis, mode="reflect")
-            denom = convolve1d(valid_mask.astype(np.float32), hanning_weights, axis=spectral_axis, mode="reflect")
-            out = np.full(data.shape, np.nan, dtype=np.float64)
-            np.divide(numer, denom, out=out, where=denom > 1e-12)
-            out[~valid_mask] = np.nan
-            return out
+            numer = np.where(valid_mask, data, 0.0).astype(np.float64, copy=False)
+            denom = valid_mask.astype(np.float64)
+            convolve1d(
+                numer,
+                hanning_weights,
+                axis=spectral_axis,
+                mode="reflect",
+                output=numer,
+            )
+            convolve1d(
+                denom,
+                hanning_weights,
+                axis=spectral_axis,
+                mode="reflect",
+                output=denom,
+            )
+            np.divide(numer, denom, out=numer, where=denom > 1e-12)
+            numer[denom <= 1e-12] = np.nan
+            numer[~valid_mask] = np.nan
+            return numer
 
-        data_clean = np.nan_to_num(data, nan=0.0) if has_nan else np.asarray(data)
-        return convolve1d(data_clean, hanning_weights, axis=spectral_axis, mode="reflect")
+        data_clean = np.array(data, dtype=np.float64, copy=True)
+        if has_nan:
+            np.nan_to_num(data_clean, copy=False, nan=0.0)
+        convolve1d(
+            data_clean,
+            hanning_weights,
+            axis=spectral_axis,
+            mode="reflect",
+            output=data_clean,
+        )
+        return data_clean
 
     # Build kernel for spatial smoothing
     if kernel_type == "gaussian":
@@ -282,42 +467,34 @@ def compute_smoothed(
         data_clean = np.nan_to_num(data, nan=0.0) if has_nan else np.asarray(data)
         return _apply_planewise(convolver, data_clean, nan_aware=False)
 
-    # Whole-array FFT convolution for 3D (spectral-mixing) kernels.
-    kernel_shape = kernel_array.shape
-    pad_width = [(0, 0)] * (data.ndim - len(kernel_shape)) + [(s // 2, s // 2) for s in kernel_shape]
-
-    kernel_nd = kernel_array
-    while kernel_nd.ndim < data.ndim:
-        kernel_nd = kernel_nd[None, ...]
-
-    slices = tuple(slice(p[0], -p[1] if p[1] != 0 else None) for p in pad_width)
+    # Spectral-mixing Gaussian and boxcar kernels are separable. Applying one
+    # axis at a time avoids the padded real/complex whole-cube arrays created
+    # by fftconvolve. ``mirror`` matches np.pad(..., mode="reflect") used by
+    # the established FFT implementation.
+    axis_kernels = _separable_axis_kernels(kernel_array)
 
     if use_nan_aware:
-        # NaN-aware smoothing via weighted convolution:
-        # smoothed = conv(data * valid) / conv(valid)
         valid_mask = np.isfinite(data)
         if not np.any(valid_mask):
             return np.full(data.shape, np.nan, dtype=np.float64)
 
-        data_filled = np.where(valid_mask, data, 0.0)
-        data_padded = np.pad(data_filled, pad_width=pad_width, mode='reflect')
-        valid_padded = np.pad(valid_mask.astype(np.float32), pad_width=pad_width, mode='reflect')
+        numer = np.where(valid_mask, data, 0.0).astype(np.float64, copy=False)
+        weights = valid_mask.astype(np.float64)
+        _convolve_separable_in_place(numer, axis_kernels, mode="mirror")
+        _convolve_separable_in_place(weights, axis_kernels, mode="mirror")
+        np.divide(numer, weights, out=numer, where=weights > 1e-12)
+        numer[weights <= 1e-12] = np.nan
+        numer[~valid_mask] = np.nan
+        return numer
 
-        smoothed_padded = fftconvolve(data_padded, kernel_nd, mode='same')
-        weight_padded = fftconvolve(valid_padded, kernel_nd, mode='same')
-        smoothed = smoothed_padded[slices]
-        weights = weight_padded[slices]
-
-        out = np.full(data.shape, np.nan, dtype=np.float64)
-        np.divide(smoothed, weights, out=out, where=weights > 1e-12)
-        out[~valid_mask] = np.nan
-        return out
-
-    # Whole-array convolution without NaN interpolation
-    data_clean = np.nan_to_num(data, nan=0.0) if has_nan else np.asarray(data)
-    data_padded = np.pad(data_clean, pad_width=pad_width, mode='reflect')
-    smoothed_padded = fftconvolve(data_padded, kernel_nd, mode='same')
-    return smoothed_padded[slices]
+    data_clean = np.array(data, dtype=np.float64, copy=True)
+    if has_nan:
+        np.nan_to_num(data_clean, copy=False, nan=0.0)
+    return _convolve_separable_in_place(
+        data_clean,
+        axis_kernels,
+        mode="mirror",
+    )
 
 
 def compute_smoothed_to_resolution(
@@ -406,8 +583,16 @@ def compute_smoothed_to_resolution(
     if data.ndim not in (2, 3, 4):
         raise ValueError(f"Unsupported data dimensionality: {data.ndim}")
 
+    data = _prepare_smoothing_input(
+        data,
+        kernel_type="gaussian",
+        smoothness_x=float(sigma_kernel_x),
+        smoothness_y=float(sigma_kernel_y),
+        smoothness_z=0.0,
+        operation_name="Target-resolution smoothing",
+    )
     convolver = _ReflectFFTConvolver(kernel.array, data.shape[-2:])
-    smoothed = _apply_planewise(convolver, np.asarray(data), nan_aware=True)
+    smoothed = _apply_planewise(convolver, data, nan_aware=True)
 
     if beam_unit_scale != 1.0:
         smoothed = smoothed * beam_unit_scale

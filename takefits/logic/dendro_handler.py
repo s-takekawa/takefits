@@ -499,14 +499,14 @@ class DendroHandler:
         
         counter = 1
         for struct in target_structures:
-            m = struct.get_mask()
-            
+            indices = struct.indices()
+
             if mode == 'all':
                 # Use the dendrogram structure ID directly for traceability
                 idx = struct.idx + 1 # 1-based
-                mask[m] = idx
+                mask[indices] = idx
             else:
-                mask[m] = counter
+                mask[indices] = counter
                 counter += 1
 
         return mask

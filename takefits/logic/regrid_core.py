@@ -24,7 +24,12 @@ _os_for_threads.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 _os_for_threads.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from reproject import reproject_interp
-from takefits.logic.data_tools import LazyScaledArray, _get_total_ram_bytes
+from takefits.logic.data_tools import (
+    LazyScaledArray,
+    _get_available_memory_bytes,
+    _get_total_ram_bytes,
+    ensure_operation_memory_budget,
+)
 
 _SPLINE_ORDER_MAP = {
     "nearest": 0,
@@ -37,7 +42,7 @@ _MASK_DIVIDE_EPS = 1e-6
 
 # Out-of-core output: when the regridded cube would not comfortably fit in RAM,
 # stream it to a disk-backed memmap instead of allocating it all in memory.
-_OUT_OF_CORE_RAM_FRACTION = 0.5          # disk-stream if output >= this * total RAM
+_OUT_OF_CORE_RAM_FRACTION = 0.5          # disk-stream if output >= this * available RAM
 _OUT_OF_CORE_FALLBACK_BYTES = 6 * 1024 ** 3   # used when total RAM is undetectable
 _CHUNKED_EXTREMA_BYTES = 1 * 1024 ** 3   # compute extrema plane-by-plane above this
 
@@ -990,27 +995,46 @@ class RegridEngine:
         return final_data, template_header, target_wcs
 
 
-    def _load_template_header(self, template_path: str) -> Tuple[fits.Header, Tuple[int, ...]]: 
-        with fits.open(template_path, memmap=False) as hdulist:
-            image_hdu = None
+    def _load_template_header(self, template_path: str) -> Tuple[fits.Header, Tuple[int, ...]]:
+        # Shape probing is header-only.  Accessing ``hdu.data`` here can
+        # unexpectedly scale/decompress a multi-gigabyte template even though
+        # regridding only needs its target WCS and NAXISn cards.
+        with fits.open(
+            template_path,
+            memmap=True,
+            do_not_scale_image_data=True,
+            lazy_load_hdus=True,
+        ) as hdulist:
             for hdu in hdulist:
-                if hdu.data is not None:
-                    image_hdu = hdu
-                    break
-            if image_hdu is None:
-                raise ValueError("Template FITS does not contain an image HDU with data.")
+                if not getattr(hdu, "is_image", False):
+                    continue
+                header = hdu.header.copy()
+                try:
+                    naxis = int(header.get("NAXIS", 0))
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "Template FITS header has invalid NAXIS information."
+                    )
+                if naxis <= 0:
+                    continue
 
-            header = image_hdu.header.copy()
-            if not header.get("NAXIS"):
-                raise ValueError("Template FITS header is missing NAXIS information.")
+                try:
+                    axis_lengths = [
+                        int(header[f"NAXIS{axis}"])
+                        for axis in range(1, naxis + 1)
+                    ]
+                except (KeyError, TypeError, ValueError):
+                    raise ValueError(
+                        "Template FITS header is missing valid NAXISn dimensions."
+                    )
+                shape = tuple(reversed(axis_lengths))
+                if any(dim <= 0 for dim in shape):
+                    raise ValueError("Template FITS data has an invalid shape.")
 
-            self._normalize_template_velocity_axis(header)
-            
-            shape = tuple(int(dim) for dim in np.shape(image_hdu.data))
-            if any(dim <= 0 for dim in shape):
-                raise ValueError("Template FITS data has an invalid shape.")
+                self._normalize_template_velocity_axis(header)
+                return header, shape
 
-            return header, shape
+        raise ValueError("Template FITS does not contain an image HDU with data.")
 
     def _normalize_template_velocity_axis(self, header: fits.Header):
         axes = self._header_axis_count(header)
@@ -2794,9 +2818,9 @@ class RegridEngine:
         if self.out_of_core is False:
             return False
         nbytes = self._shape_nbytes(shape, dtype)
-        total_ram = _detect_total_ram_bytes()
-        if total_ram:
-            threshold = int(total_ram * _OUT_OF_CORE_RAM_FRACTION)
+        available_ram = _get_available_memory_bytes()
+        if available_ram is not None:
+            threshold = int(available_ram * _OUT_OF_CORE_RAM_FRACTION)
         else:
             threshold = _OUT_OF_CORE_FALLBACK_BYTES
         return nbytes >= threshold
@@ -2808,13 +2832,82 @@ class RegridEngine:
         interpolation that expands a lazily-scaled cube to one float64 array.
         """
         nbytes = self._shape_nbytes(np.shape(self.original_data), np.float64)
-        total_ram = _detect_total_ram_bytes()
+        available_ram = _get_available_memory_bytes()
         limit = (
-            int(total_ram * _OUT_OF_CORE_RAM_FRACTION)
-            if total_ram
+            int(available_ram * _OUT_OF_CORE_RAM_FRACTION)
+            if available_ram is not None
             else _OUT_OF_CORE_FALLBACK_BYTES
         )
         return nbytes >= limit
+
+    def _manual_high_order_working_set_bytes(
+        self, shape_out: Sequence[int]
+    ) -> int:
+        """Conservatively price manual spline interpolation's combined arrays."""
+        input_shape = tuple(int(dim) for dim in np.shape(self.original_data))
+        input_count = math.prod(input_shape)
+        output_shape = tuple(int(dim) for dim in shape_out)
+        output_count = math.prod(output_shape)
+
+        try:
+            source_dtype = np.dtype(getattr(self.original_data, "dtype"))
+            source_itemsize = max(1, int(source_dtype.itemsize))
+        except (TypeError, ValueError):
+            source_itemsize = np.dtype(np.float64).itemsize
+
+        materialized_input = (
+            input_count * np.dtype(np.float64).itemsize
+            if isinstance(self.original_data, LazyScaledArray)
+            else 0
+        )
+        # Worst-case NaN handling retains a boolean mask, a float32 mask used
+        # for reprojection, and a filled source copy.
+        nan_work = input_count * (
+            np.dtype(np.bool_).itemsize
+            + np.dtype(np.float32).itemsize
+            + source_itemsize
+        )
+
+        # The optimized high-order path edge-pads every axis by 12 pixels, then
+        # keeps the padded source and float32 spline-filter output together.
+        padded_count = math.prod(int(dim) + 24 for dim in input_shape)
+        spline_work = padded_count * (
+            source_itemsize + np.dtype(np.float32).itemsize
+        )
+        output_bytes = (
+            output_count * self._preferred_float_dtype().itemsize
+        )
+
+        if len(output_shape) >= 3:
+            spectral_wcs_axis = self._spectral_axis_index()
+            if spectral_wcs_axis is None:
+                spectral_wcs_axis = self.original_wcs.wcs.naxis - 1
+            spectral_numpy_axis = len(output_shape) - 1 - spectral_wcs_axis
+            plane_pixels = math.prod(
+                dim
+                for index, dim in enumerate(output_shape)
+                if index != spectral_numpy_axis
+            )
+        else:
+            plane_pixels = output_count
+
+        # Spatial grids plus target/world/source coordinate matrices remain
+        # live through the worker loop.  Bounded futures can additionally hold
+        # roughly two results for each of up to eight workers.
+        coordinate_work = plane_pixels * 96
+        in_flight_planes = (
+            plane_pixels
+            * self._preferred_float_dtype().itemsize
+            * 16
+        )
+        return int(
+            materialized_input
+            + nan_work
+            + spline_work
+            + output_bytes
+            + coordinate_work
+            + in_flight_planes
+        )
 
     def _allocate_output(self, shape, dtype) -> np.ndarray:
         """Allocate the regrid output in RAM, or as a disk-backed memmap.
@@ -3194,6 +3287,16 @@ class RegridEngine:
         
         # Prepare data: fill NaNs if necessary for pre-filtering
         input_data = self.original_data
+        if prefilter:
+            ensure_operation_memory_budget(
+                self._manual_high_order_working_set_bytes(shape_out),
+                operation_name="Bicubic/Biquadratic manual regrid",
+                guidance=(
+                    "Use Bilinear or Nearest interpolation, or make a smaller "
+                    "cutout before regridding."
+                ),
+            )
+
         if (
             prefilter
             and getattr(input_data, "ndim", 0) >= 3

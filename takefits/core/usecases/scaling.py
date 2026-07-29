@@ -4,10 +4,16 @@ from __future__ import annotations
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.logic.data_tools import materialize_elementwise_inputs
 
 
 def compute_scaled(data: np.ndarray, scale_factor: float) -> np.ndarray:
     """Return a scaled copy of the input data."""
+    (data,) = materialize_elementwise_inputs(
+        data,
+        operation_name="Scaling",
+        output_array_count=1,
+    )
     return data * float(scale_factor)
 
 

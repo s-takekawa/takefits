@@ -688,7 +688,8 @@ class ControlPanel(QWidget):
             self.color_settings_panel, self.scaling_panel, self.unit_conversion_panel,
             self.integ_settings_panel, self.chmap_settings_panel,
             self.smooth_settings_panel, self.baseline_panel, self.spec_window, self.pvd_panel,
-            self.contour_panel, self.arithmetic_panel, self.clump_finding_panel
+            self.mask_settings_panel, self.contour_panel, self.arithmetic_panel,
+            self.clump_finding_panel
         ]
         for panel in panels_to_close:
             if panel:

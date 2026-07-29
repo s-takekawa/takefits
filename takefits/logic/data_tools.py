@@ -48,6 +48,169 @@ def _get_total_ram_bytes() -> int | None:
         return None
 
 
+def _linux_cgroup_available_bytes() -> int | None:
+    """Return the remaining Linux cgroup memory allowance, when constrained."""
+    candidates = (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        (
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ),
+    )
+    for limit_path, usage_path in candidates:
+        try:
+            with open(limit_path, "r", encoding="ascii") as handle:
+                limit_text = handle.read().strip()
+            if not limit_text or limit_text.lower() == "max":
+                continue
+            with open(usage_path, "r", encoding="ascii") as handle:
+                usage_text = handle.read().strip()
+            limit = int(limit_text)
+            usage = int(usage_text)
+            # Some cgroup-v1 hosts expose an effectively-unlimited sentinel
+            # close to LONG_MAX. Ignore it rather than reporting exabytes free.
+            if limit <= 0 or limit >= (1 << 60):
+                continue
+            return max(0, limit - max(0, usage))
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _macos_available_memory_bytes() -> int | None:
+    """Return reclaimable physical memory reported by the Mach kernel."""
+    try:
+        import ctypes
+
+        class _VMStatistics64(ctypes.Structure):
+            _fields_ = [
+                ("free_count", ctypes.c_uint32),
+                ("active_count", ctypes.c_uint32),
+                ("inactive_count", ctypes.c_uint32),
+                ("wire_count", ctypes.c_uint32),
+                ("zero_fill_count", ctypes.c_uint64),
+                ("reactivations", ctypes.c_uint64),
+                ("pageins", ctypes.c_uint64),
+                ("pageouts", ctypes.c_uint64),
+                ("faults", ctypes.c_uint64),
+                ("cow_faults", ctypes.c_uint64),
+                ("lookups", ctypes.c_uint64),
+                ("hits", ctypes.c_uint64),
+                ("purges", ctypes.c_uint64),
+                ("purgeable_count", ctypes.c_uint32),
+                ("speculative_count", ctypes.c_uint32),
+                ("decompressions", ctypes.c_uint64),
+                ("compressions", ctypes.c_uint64),
+                ("swapins", ctypes.c_uint64),
+                ("swapouts", ctypes.c_uint64),
+                ("compressor_page_count", ctypes.c_uint32),
+                ("throttled_count", ctypes.c_uint32),
+                ("external_page_count", ctypes.c_uint32),
+                ("internal_page_count", ctypes.c_uint32),
+                ("total_uncompressed_pages_in_compressor", ctypes.c_uint64),
+            ]
+
+        libc = ctypes.CDLL(None)
+        libc.mach_host_self.restype = ctypes.c_uint32
+        libc.host_page_size.argtypes = (
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        )
+        libc.host_page_size.restype = ctypes.c_int
+        libc.host_statistics64.argtypes = (
+            ctypes.c_uint32,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int32),
+            ctypes.POINTER(ctypes.c_uint32),
+        )
+        libc.host_statistics64.restype = ctypes.c_int
+        host = libc.mach_host_self()
+        page_size = ctypes.c_uint32()
+        if libc.host_page_size(host, ctypes.byref(page_size)) != 0:
+            return None
+
+        stats = _VMStatistics64()
+        count = ctypes.c_uint32(
+            ctypes.sizeof(stats) // ctypes.sizeof(ctypes.c_uint32)
+        )
+        # HOST_VM_INFO64 is the stable Mach flavor for vm_statistics64_data_t.
+        if libc.host_statistics64(
+            host,
+            4,
+            ctypes.cast(ctypes.byref(stats), ctypes.POINTER(ctypes.c_int32)),
+            ctypes.byref(count),
+        ) != 0:
+            return None
+
+        # Inactive pages can be reclaimed without swapping. Keeping purgeable
+        # and compressed pages out of this estimate avoids double-counting.
+        available_pages = int(stats.free_count) + int(stats.inactive_count)
+        if available_pages <= 0 or page_size.value <= 0:
+            return None
+        available = available_pages * int(page_size.value)
+        total = _get_total_ram_bytes()
+        if total is not None and available > total:
+            return None
+        return available
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _get_available_memory_bytes() -> int | None:
+    """Return currently available physical memory, respecting Linux cgroups."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(stat)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+            return None
+
+        if sys.platform == "darwin":
+            available = _macos_available_memory_bytes()
+            if available is not None:
+                return available
+            # Mach APIs can be unavailable in restricted runtimes. A fraction
+            # of detected physical RAM is still preferable to treating every
+            # Mac as a fixed 512 MiB machine.
+            total = _get_total_ram_bytes()
+            return None if total is None else max(1, int(total) // 4)
+
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        available_pages = os.sysconf("SC_AVPHYS_PAGES")
+        available = (
+            int(available_pages) * int(page_size)
+            if available_pages > 0 and page_size > 0
+            else None
+        )
+        if sys.platform.startswith("linux"):
+            cgroup_available = _linux_cgroup_available_bytes()
+            if cgroup_available is not None:
+                return (
+                    cgroup_available
+                    if available is None
+                    else min(available, cgroup_available)
+                )
+        return available
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def _auto_large_data_threshold_mb() -> int:
     """Return a Large Data Mode threshold in MiB based on system RAM.
 
@@ -77,12 +240,11 @@ LARGE_DATA_MODE_NO_MEMMAP_THRESHOLD_BYTES = (
     DEFAULT_LARGE_DATA_NO_MEMMAP_THRESHOLD_MB * 1024 * 1024
 )
 
-# Size threshold (bytes) above which load_fits keeps a raw memmap and applies
-# BZERO/BSCALE lazily per-slice instead of letting astropy materialise the
-# entire scaled array.  Files below this use the traditional eager path
-# (memmap=False with astropy handling BZERO/BSCALE/BLANK), which is fast
-# enough for files that fit comfortably in memory.
-LAZY_SCALING_THRESHOLD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+# Projected materialized-size threshold above which load_fits keeps a raw
+# memmap and applies BZERO/BSCALE lazily per slice.  This intentionally matches
+# the general 1 GiB memory-map threshold: a 1 GiB int16 scaled FITS would
+# otherwise become roughly 4 GiB of float64 before any analysis begins.
+LAZY_SCALING_THRESHOLD_BYTES = MEMMAP_THRESHOLD_BYTES
 
 # Keep browse-mode display work near screen resolution.
 DEFAULT_LARGE_DATA_DISPLAY_MAX_DIM = 2048
@@ -190,11 +352,16 @@ class LazyScaledArray:
             return np.nan
         return float(raw) * self._bscale + self._bzero
 
-    def __array__(self, dtype=None):
-        """Support ``np.asarray(obj)`` — materialises the entire array."""
+    def __array__(self, dtype=None, copy=None):
+        """Support NumPy array coercion while honoring NumPy 2's copy contract."""
+        if copy is False:
+            raise ValueError(
+                "LazyScaledArray cannot provide scaled data without copying; "
+                "request a bounded slice instead"
+            )
         result = self._apply_scaling(self._raw)
         if dtype is not None:
-            return result.astype(dtype)
+            return result.astype(dtype, copy=False)
         return result
 
     def reshape(self, *args, **kwargs):
@@ -247,6 +414,17 @@ def estimate_array_nbytes(array: np.ndarray | np.memmap | LazyScaledArray | None
         return None
 
 
+def estimate_materialized_nbytes(
+    array: np.ndarray | np.memmap | LazyScaledArray | None,
+) -> int | None:
+    """Estimate bytes if *array* is realized as its public NumPy dtype."""
+    if array is None:
+        return None
+    if isinstance(array, LazyScaledArray):
+        return int(array.size) * np.dtype(np.float64).itemsize
+    return estimate_array_nbytes(array)
+
+
 def format_nbytes(num_bytes: int | None) -> str:
     """Return a compact human-readable byte string."""
     if num_bytes is None:
@@ -263,6 +441,138 @@ def format_nbytes(num_bytes: int | None) -> str:
     if unit_index == 0:
         return f"{int(value)} {units[unit_index]}"
     return f"{value:.1f} {units[unit_index]}"
+
+
+def ensure_operation_memory_budget(
+    required_bytes: int,
+    *,
+    operation_name: str,
+    available_fraction: float = 0.8,
+    fallback_limit_bytes: int = 512 * 1024 * 1024,
+    guidance: str | None = None,
+) -> None:
+    """Reject an unsafe allocation before NumPy can exhaust process memory.
+
+    ``required_bytes`` should describe the operation's peak *additional*
+    working set, including its result and temporary arrays.  The dynamic limit
+    is a conservative fraction of currently available physical memory; on
+    Linux it also respects a cgroup limit, and on Windows it uses
+    ``GlobalMemoryStatusEx``.  A fixed fallback keeps the failure mode safe on
+    platforms where available memory cannot be queried.
+    """
+    try:
+        required = max(0, int(required_bytes))
+        fraction = float(available_fraction)
+        fallback = max(1, int(fallback_limit_bytes))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Memory-budget inputs must be finite numeric values") from exc
+
+    if not math.isfinite(fraction) or fraction <= 0.0 or fraction > 1.0:
+        raise ValueError("available_fraction must be in the range (0, 1]")
+
+    available = _get_available_memory_bytes()
+    limit = (
+        max(1, int(available * fraction))
+        if available is not None
+        else fallback
+    )
+    if required <= limit:
+        return
+
+    suggestion = guidance or (
+        "Cut out a smaller cube or spatial region first, then retry the operation."
+    )
+    raise MemoryError(
+        f"{operation_name} cannot safely allocate its estimated working set "
+        f"({format_nbytes(required)}). The current available-memory safety "
+        f"limit is {format_nbytes(limit)}. {suggestion}"
+    )
+
+
+def materialize_elementwise_inputs(
+    *arrays: Any,
+    operation_name: str,
+    output_array_count: float = 1.0,
+    extra_working_bytes: int = 0,
+) -> tuple[Any, ...]:
+    """Preflight elementwise outputs and materialize lazy scaled inputs once.
+
+    Ordinary NumPy arrays are returned unchanged so their established dtype and
+    arithmetic behaviour stay intact.  Result and temporary arrays are priced
+    conservatively at no less than float64 per element.  When a
+    :class:`LazyScaledArray` is present, the estimate additionally includes
+    its projected float64 materialization.  The preflight runs before either
+    NumPy arithmetic or ``LazyScaledArray.__array__``.
+    """
+    lazy_arrays = [array for array in arrays if is_lazy_scaled(array)]
+
+    try:
+        result_count = float(output_array_count)
+        extra_bytes = max(0, int(extra_working_bytes))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Working-set estimates must be finite numeric values") from exc
+    if not math.isfinite(result_count) or result_count < 0.0:
+        raise ValueError("output_array_count must be a finite non-negative value")
+
+    projected_output_sizes = []
+    for array in arrays:
+        if array is None:
+            continue
+        try:
+            element_count = int(array.size)
+            public_itemsize = int(np.dtype(array.dtype).itemsize)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            continue
+        projected_output_sizes.append(
+            max(0, element_count) * max(np.dtype(np.float64).itemsize, public_itemsize)
+        )
+
+    lazy_bytes = sum(
+        int(estimate_materialized_nbytes(array) or 0)
+        for array in lazy_arrays
+    )
+    output_basis = max(projected_output_sizes) if projected_output_sizes else 0
+    output_bytes = int(math.ceil(output_basis * result_count))
+    required_bytes = lazy_bytes + output_bytes + extra_bytes
+
+    ensure_operation_memory_budget(
+        required_bytes,
+        operation_name=operation_name,
+        guidance=(
+            "Cut out a smaller cube or spatial region first, or use a machine "
+            "with more available memory."
+        ),
+    )
+
+    materialized_by_id: dict[int, np.ndarray] = {}
+    prepared = []
+    for array in arrays:
+        if not is_lazy_scaled(array):
+            prepared.append(array)
+            continue
+        identity = id(array)
+        materialized = materialized_by_id.get(identity)
+        if materialized is None:
+            materialized = np.asarray(array, dtype=np.float64)
+            materialized_by_id[identity] = materialized
+        prepared.append(materialized)
+    return tuple(prepared)
+
+
+def create_preview_snapshot(data: Any, *, operation_name: str) -> Any:
+    """Copy a preview source only after checking the whole-array allocation."""
+    if is_lazy_scaled(data):
+        return data
+    snapshot_bytes = int(estimate_materialized_nbytes(data) or 0)
+    ensure_operation_memory_budget(
+        snapshot_bytes,
+        operation_name=f"{operation_name} preview snapshot",
+        guidance=(
+            "Close unused analysis windows, make a smaller cutout, or free "
+            "memory before opening this editable preview."
+        ),
+    )
+    return data.copy()
 
 
 def _parse_header_float(header: Any, key: str, default: float) -> float | None:
@@ -336,7 +646,8 @@ def build_large_data_profile(
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Describe whether the array should surface as Large Data Mode."""
-    approx_bytes = estimate_array_nbytes(array)
+    source_bytes = estimate_array_nbytes(array)
+    materialized_bytes = estimate_materialized_nbytes(array)
     has_scaling_keywords = header_has_scaling_keywords(header)
     regular_threshold_bytes = _threshold_bytes_from_config(
         config,
@@ -353,31 +664,40 @@ def build_large_data_profile(
         if has_scaling_keywords
         else regular_threshold_bytes
     )
-    enabled = approx_bytes is not None and approx_bytes >= threshold_bytes
+    enabled = (
+        materialized_bytes is not None
+        and materialized_bytes >= threshold_bytes
+    )
 
-    if approx_bytes is None:
+    if materialized_bytes is None:
         reason = "Large Data Mode unavailable because data size could not be estimated."
     elif has_scaling_keywords and enabled:
         reason = (
-            f"estimated size {format_nbytes(approx_bytes)} exceeds "
+            f"projected materialized size {format_nbytes(materialized_bytes)} exceeds "
             f"{format_nbytes(threshold_bytes)} and FITS scaling keywords limit "
             "the fast memmap path"
         )
     elif enabled:
         reason = (
-            f"estimated size {format_nbytes(approx_bytes)} exceeds "
+            f"estimated size {format_nbytes(materialized_bytes)} exceeds "
             f"{format_nbytes(threshold_bytes)}"
         )
     else:
         reason = (
-            f"estimated size {format_nbytes(approx_bytes)} is within the "
+            f"estimated size {format_nbytes(materialized_bytes)} is within the "
             f"{format_nbytes(threshold_bytes)} Large Data Mode threshold"
         )
 
     return {
         "enabled": bool(enabled),
-        "estimated_size_bytes": approx_bytes,
-        "estimated_size_text": format_nbytes(approx_bytes),
+        # Keep the historical key as the RAM-risk estimate used for the mode
+        # decision, while exposing the source/memmap footprint separately.
+        "estimated_size_bytes": materialized_bytes,
+        "estimated_size_text": format_nbytes(materialized_bytes),
+        "source_size_bytes": source_bytes,
+        "source_size_text": format_nbytes(source_bytes),
+        "materialized_size_bytes": materialized_bytes,
+        "materialized_size_text": format_nbytes(materialized_bytes),
         "threshold_bytes": threshold_bytes,
         "threshold_text": format_nbytes(threshold_bytes),
         "has_scaling_keywords": bool(has_scaling_keywords),

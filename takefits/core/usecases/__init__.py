@@ -37,12 +37,19 @@ from .pv import (
     normalize_pv_x_axis_mode,
     position_axis_bounds,
     position_from_fraction,
+    resolve_pv_path_geometry,
     sample_count_from_spacing,
+    build_pv_header,
     sample_path_points,
     set_pv_endpoints,
     straight_line_from_center,
 )
-from .visualization import export_moment_image, export_channel_map_image
+from .visualization import (
+    export_moment_image,
+    export_channel_map_image,
+    export_pv_image,
+    export_spectrum_image,
+)
 from .smoothing import (
     SmoothingKernel,
     beam_unit_scale_for_target_resolution,
@@ -60,6 +67,7 @@ from .mask import (
     MOMENT_MASK_PRESETS,
     get_moment_mask_preset,
     estimate_noise_sigma,
+    estimate_noise,
     compute_masked,
     compute_moment_mask,
     apply_mask_threshold,
@@ -72,7 +80,12 @@ from .spectrum import (
     GaussianFitResult,
     get_spectrum,
     get_averaged_spectrum,
+    get_region_spectrum,
+    spectral_axis_unit,
+    spectral_axis_values,
+    spectral_unit_string,
     fit_gaussian_spectrum,
+    fit_spectrum_gaussian,
     export_spectrum,
 )
 from .baseline import (
@@ -106,13 +119,23 @@ from .utils import (
     get_axis_ctype,
     update_datamin_datamax_if_present,
 )
+from .render_config import (
+    COLORBAR_AUTO_LAYOUT_KEYS,
+    clear_render_config,
+    colorbar_auto_layout_requested,
+    resolve_render_config,
+    set_render_config,
+)
 from .annotations import (
+    add_contour,
     add_marker,
     add_region,
+    clear_contours,
     clear_markers,
     clear_regions,
     delete_marker,
     delete_region,
+    set_contours,
     set_markers,
     set_regions,
     update_marker,
@@ -122,7 +145,7 @@ from .annotations import (
 
 def load_fits_data(
     filepath: str,
-    hdu: int = 0,
+    hdu: Optional[int] = None,
     compute_wcs: bool = True
 ) -> AppState:
     """
@@ -132,7 +155,7 @@ def load_fits_data(
 
     Args:
         filepath: Path to the FITS file
-        hdu: HDU index to load (default 0)
+        hdu: Explicit HDU index, or None to auto-select the first image HDU
         compute_wcs: Whether to compute WCS (default True)
 
     Returns:
@@ -140,7 +163,11 @@ def load_fits_data(
     """
     from takefits.core.io.fits import load_fits
 
-    data, header, wcs, spectral_metadata = load_fits(filepath, compute_wcs=compute_wcs)
+    data, header, wcs, spectral_metadata = load_fits(
+        filepath,
+        compute_wcs=compute_wcs,
+        hdu=hdu,
+    )
 
     return create_app_state(
         data=data,

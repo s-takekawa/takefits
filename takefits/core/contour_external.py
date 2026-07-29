@@ -24,6 +24,7 @@ from takefits.core.contour_manager import (
     ContourState,
     _frame_name_from_wcs,
     _pixel_coords_to_world,
+    ensure_contour_memory_budget,
 )
 
 
@@ -167,7 +168,20 @@ def _slice_xy_plane(state, channel: Optional[int]) -> np.ndarray:
     data2d = state.get_slice_2d('xy')
     if data2d is None or getattr(data2d, "ndim", 0) != 2 or data2d.size == 0:
         raise ExternalContourError("Could not extract a 2D image plane for contours.")
-    return np.asarray(data2d, dtype=float)
+    return data2d
+
+
+def preview_contour_plane(data2d, max_dimension: int = 512):
+    """Materialize only a bounded, strided preview of a 2D contour source."""
+    if data2d is None or getattr(data2d, "ndim", 0) != 2:
+        return None, 1
+    shape = getattr(data2d, "shape", ())
+    if len(shape) != 2 or int(shape[0]) <= 0 or int(shape[1]) <= 0:
+        return None, 1
+    limit = max(1, int(max_dimension))
+    stride = max(1, int(np.ceil(max(shape) / limit)))
+    preview = data2d[::stride, ::stride]
+    return np.asarray(preview, dtype=float), stride
 
 
 def smooth_plane(data2d, sigma: float):
@@ -239,7 +253,14 @@ def build_contour_state_from_app_state(
     # world coordinates; celestial alignment is only meaningful for xy.
     wcs_cel = _celestial_wcs(getattr(state, "wcs", None)) if plane == "xy" else None
 
-    data2d = smooth_plane(_slice_xy_plane(state, channel), smoothing)
+    source_plane = _slice_xy_plane(state, channel)
+    ensure_contour_memory_budget(
+        source_plane,
+        smoothing=smoothing,
+        level_count=len(level_values),
+        operation_name="External contour generation",
+    )
+    data2d = smooth_plane(np.asarray(source_plane, dtype=float), smoothing)
 
     if label is None:
         filepath = getattr(state, "filepath", None) or ""

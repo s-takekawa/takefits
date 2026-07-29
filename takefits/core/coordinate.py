@@ -1,7 +1,6 @@
 from astropy.coordinates import Angle
 from astropy import units as u
 import numpy as np
-from functools import lru_cache
 from takefits.core.wcs_frames import (
     axis_is_latitude,
     axis_is_longitude,
@@ -624,7 +623,6 @@ class Format_pix_to_wcs:
 
         return str(x), str(y)
     
-    @lru_cache(maxsize=None)
     def convert_chpix_to_world(self, plane, x, y, z):
         wcs = self.wcs
         if self.wcs.naxis == 2: return

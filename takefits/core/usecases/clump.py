@@ -8,12 +8,32 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 
 from takefits.core.app_state import AppState
-from takefits.logic.data_tools import format_nbytes, _get_total_ram_bytes
+from takefits.logic.data_tools import (
+    _get_available_memory_bytes,
+    ensure_operation_memory_budget,
+    estimate_materialized_nbytes,
+    format_nbytes,
+    is_lazy_scaled,
+    materialize_elementwise_inputs,
+)
 from takefits.logic.progress import CancellationToken, ProgressReporter
 from .utils import update_datamin_datamax_if_present
 
-_CLUMP_MASK_RAM_FRACTION = 0.25
-_CLUMP_MASK_FALLBACK_BYTES = 2 * 1024 ** 3
+_CLUMP_MASK_RAM_FRACTION = 0.8
+_CLUMP_MASK_FALLBACK_BYTES = 512 * 1024 ** 2
+_CLUMP_EXTRA_BYTES_PER_VOXEL = {
+    "clumpfind": 32,
+    "fellwalker": 56,
+    "dendrogram": 40,
+}
+_CLUMP_ESTIMATE_UNCERTAINTY_FACTOR = {
+    "clumpfind": 1.20,
+    "fellwalker": 1.20,
+    # Astrodendro's Python structure graph depends strongly on fragmentation,
+    # so retain more headroom than the dense-array algorithms.
+    "dendrogram": 1.50,
+}
+_CLUMP_LABEL_COUNT_CHUNK_BYTES = 16 * 1024 ** 2
 
 
 @dataclass
@@ -27,14 +47,14 @@ class ClumpResult:
 
 
 def _detect_total_ram_bytes() -> int | None:
-    """Best-effort total physical RAM in bytes (macOS / Linux / Windows)."""
-    return _get_total_ram_bytes()
+    """Backward-compatible memory probe used by older callers/tests."""
+    return _get_available_memory_bytes()
 
 
 def _clump_mask_memory_limit_bytes() -> int:
-    total_ram = _detect_total_ram_bytes()
-    if total_ram:
-        return int(total_ram * _CLUMP_MASK_RAM_FRACTION)
+    available_ram = _detect_total_ram_bytes()
+    if available_ram is not None:
+        return max(1, int(available_ram * _CLUMP_MASK_RAM_FRACTION))
     return _CLUMP_MASK_FALLBACK_BYTES
 
 
@@ -51,24 +71,89 @@ def _estimate_label_mask_nbytes(data) -> int | None:
     return int(count) * np.dtype(np.int32).itemsize
 
 
-def _ensure_label_mask_memory_budget(data, algorithm: str) -> None:
-    """Refuse clump finding when the required result mask cannot fit in RAM."""
-    needed = _estimate_label_mask_nbytes(data)
-    if needed is None:
-        return
-    limit = _clump_mask_memory_limit_bytes()
-    if needed <= limit:
-        return
+def _estimate_clump_working_nbytes(data, algorithm: str) -> int | None:
+    """Estimate algorithm-specific temporary/output bytes beyond the source."""
+    label_bytes = _estimate_label_mask_nbytes(data)
+    if label_bytes is None:
+        return None
+    pixel_count = label_bytes // np.dtype(np.int32).itemsize
+    key = str(algorithm or "").strip().lower()
+    extra_per_voxel = _CLUMP_EXTRA_BYTES_PER_VOXEL.get(key, 40)
+    uncertainty = _CLUMP_ESTIMATE_UNCERTAINTY_FACTOR.get(key, 1.25)
+    needed = int(np.ceil(pixel_count * int(extra_per_voxel) * uncertainty))
+    if is_lazy_scaled(data):
+        needed += int(estimate_materialized_nbytes(data) or 0)
+    return int(needed)
 
+
+def _ensure_label_mask_memory_budget(data, algorithm: str) -> None:
+    """Refuse unsafe algorithm worksets, including the result label mask."""
+    label_bytes = _estimate_label_mask_nbytes(data)
+    needed = _estimate_clump_working_nbytes(data, algorithm)
+    if label_bytes is None or needed is None:
+        return
+    pixel_count = label_bytes // np.dtype(np.int32).itemsize
+
+    limit = _clump_mask_memory_limit_bytes()
     shape = tuple(int(axis) for axis in getattr(data, "shape", ()) or ())
-    pixel_count = needed // np.dtype(np.int32).itemsize
-    raise MemoryError(
-        f"{algorithm} cannot safely run on this cube because the result label "
-        f"mask would require {format_nbytes(needed)} "
-        f"({pixel_count:,} pixels, shape={shape}) and the current safety limit "
-        f"is {format_nbytes(limit)}. Use Tools > Cutout, fewer channels, or "
-        "smaller spatial bounds before running clump finding."
+    if needed > limit:
+        raise MemoryError(
+            f"{algorithm} cannot safely run on this cube because its working "
+            f"set, including the result label mask, is estimated at "
+            f"{format_nbytes(needed)} ({pixel_count:,} pixels, shape={shape}); "
+            f"the current safety limit is {format_nbytes(limit)}. Use Tools > "
+            "Cutout, fewer channels, or smaller spatial bounds before running "
+            "clump finding."
+        )
+
+    ensure_operation_memory_budget(
+        needed,
+        operation_name=algorithm,
+        guidance=(
+            "Use Tools > Cutout, fewer channels, or smaller spatial bounds "
+            "before running clump finding."
+        ),
     )
+
+
+def _prepare_clump_data(data, algorithm: str) -> np.ndarray:
+    """Preflight the algorithm then materialize a lazy cube once."""
+    _ensure_label_mask_memory_budget(data, algorithm)
+    prepared, = materialize_elementwise_inputs(
+        data,
+        operation_name=algorithm,
+        output_array_count=0.0,
+    )
+    # Re-sample currently available RAM immediately after a lazy cube has
+    # become resident. This closes most of the window in which another process
+    # can invalidate the first preflight before the algorithm allocates masks.
+    _ensure_label_mask_memory_budget(prepared, algorithm)
+    return prepared
+
+
+def _count_positive_labels(mask: np.ndarray) -> int:
+    """Count distinct positive labels without sorting a full mask copy."""
+    values = np.asarray(mask)
+    if values.size == 0:
+        return 0
+    items_per_chunk = max(
+        1,
+        _CLUMP_LABEL_COUNT_CHUNK_BYTES // max(1, int(values.dtype.itemsize)),
+    )
+    labels = set()
+    with np.nditer(
+        values,
+        flags=["external_loop", "buffered", "zerosize_ok"],
+        op_flags=["readonly"],
+        order="K",
+        buffersize=items_per_chunk,
+    ) as iterator:
+        for block in iterator:
+            for label in np.unique(block):
+                label_value = int(label)
+                if label_value > 0:
+                    labels.add(label_value)
+    return len(labels)
 
 
 def _source_data_for_mask(state: AppState, mask: np.ndarray) -> Optional[np.ndarray]:
@@ -99,23 +184,51 @@ def _clump_mask_data_for_export(state: AppState, mask: np.ndarray) -> np.ndarray
     mask_array = np.asarray(mask)
     source_data = _source_data_for_mask(state, mask_array)
     if source_data is None:
-        return mask_array.astype(np.int32)
+        return mask_array.astype(np.int32, copy=False)
 
-    if np.ma.isMaskedArray(source_data):
-        source_values = source_data.filled(np.nan)
-    else:
-        source_values = np.asarray(source_data)
+    shape = tuple(int(dim) for dim in mask_array.shape)
+    leading_shape = shape[:-2] if len(shape) >= 2 else shape
 
+    def _plane_at(array, leading_index):
+        plane = array[leading_index] if leading_index else array
+        if np.ma.isMaskedArray(plane):
+            return np.asarray(np.ma.filled(plane, np.nan))
+        return np.asarray(plane)
+
+    has_source_nan = False
     try:
-        source_nan = np.isnan(source_values)
+        for leading_index in np.ndindex(leading_shape):
+            source_plane = _plane_at(source_data, leading_index)
+            if np.isnan(source_plane).any():
+                has_source_nan = True
+                break
     except TypeError:
-        return mask_array.astype(np.int32)
+        return mask_array.astype(np.int32, copy=False)
 
-    if not np.any(source_nan):
-        return mask_array.astype(np.int32)
+    if not has_source_nan:
+        return mask_array.astype(np.int32, copy=False)
 
-    export_data = mask_array.astype(np.float32)
-    export_data[source_nan] = np.nan
+    output_bytes = mask_array.size * np.dtype(np.float32).itemsize
+    plane_pixels = (
+        int(shape[-2]) * int(shape[-1])
+        if len(shape) >= 2
+        else int(mask_array.size)
+    )
+    ensure_operation_memory_budget(
+        output_bytes + plane_pixels * np.dtype(bool).itemsize,
+        operation_name="Clump mask FITS export",
+        guidance=(
+            "Free memory or export clumps from a smaller cutout before saving."
+        ),
+    )
+
+    export_data = mask_array.astype(np.float32, copy=True)
+    for leading_index in np.ndindex(leading_shape):
+        source_plane = _plane_at(source_data, leading_index)
+        source_nan = np.isnan(source_plane)
+        if np.any(source_nan):
+            export_plane = export_data[leading_index] if leading_index else export_data
+            export_plane[source_nan] = np.nan
     return export_data
 
 
@@ -151,7 +264,7 @@ def run_clumpfind(
     data = state.data
     if data.ndim == 4:
         data = data[state.current_s]
-    _ensure_label_mask_memory_budget(data, "ClumpFind")
+    data = _prepare_clump_data(data, "ClumpFind")
 
     min_val = rms * min_threshold_sigma
     step = rms * step_sigma
@@ -162,9 +275,7 @@ def run_clumpfind(
     catalog = finder.get_catalog()
     reporter.update(100, "Done.")
 
-    n_clumps = len(np.unique(mask)) - 1  # Exclude 0 (background)
-    if n_clumps < 0:
-        n_clumps = 0
+    n_clumps = _count_positive_labels(mask)
 
     return ClumpResult(
         mask=mask,
@@ -214,7 +325,7 @@ def run_fellwalker(
     data = state.data
     if data.ndim == 4:
         data = data[state.current_s]
-    _ensure_label_mask_memory_budget(data, "FellWalker")
+    data = _prepare_clump_data(data, "FellWalker")
 
     min_val = rms * min_threshold_sigma
     min_dip = rms * min_dip_sigma
@@ -225,9 +336,7 @@ def run_fellwalker(
     catalog = walker.get_catalog()
     reporter.update(100, "Done.")
 
-    n_clumps = len(np.unique(mask)) - 1  # Exclude 0 (background)
-    if n_clumps < 0:
-        n_clumps = 0
+    n_clumps = _count_positive_labels(mask)
 
     return ClumpResult(
         mask=mask,
@@ -287,7 +396,7 @@ def run_dendrogram(
     data = state.data
     if data.ndim == 4:
         data = data[state.current_s]
-    _ensure_label_mask_memory_budget(data, "Dendrogram")
+    data = _prepare_clump_data(data, "Dendrogram")
 
     min_value = rms * min_value_sigma
     min_delta = rms * min_delta_sigma
@@ -315,9 +424,7 @@ def run_dendrogram(
     catalog = handler.get_catalog(mode=output_mode, mask=mask, reporter=reporter)
     reporter.update(100, "Done.")
 
-    n_clumps = len(np.unique(mask)) - 1  # Exclude 0 (background)
-    if n_clumps < 0:
-        n_clumps = 0
+    n_clumps = _count_positive_labels(mask)
 
     parameters = {
         "rms": rms,
@@ -437,8 +544,13 @@ def export_clump_mask(
     update_datamin_datamax_if_present(header, export_data)
 
     # Write file
+    from takefits.core.io.save_fits import atomic_write_fits
+
     hdu = fits.PrimaryHDU(data=export_data, header=header)
-    hdu.writeto(output_path, overwrite=True)
+    atomic_write_fits(
+        output_path,
+        lambda temporary: hdu.writeto(temporary, overwrite=True),
+    )
 
     return output_path
 
@@ -466,8 +578,13 @@ def export_clump_catalog(
                 f.write("# No clumps found\n")
         else:
             from astropy.io import fits
+            from takefits.core.io.save_fits import atomic_write_fits
+
             hdu = fits.BinTableHDU.from_columns([])
-            hdu.writeto(output_path, overwrite=True)
+            atomic_write_fits(
+                output_path,
+                lambda temporary: hdu.writeto(temporary, overwrite=True),
+            )
         return output_path
 
     if format == "csv":
@@ -486,12 +603,19 @@ def export_clump_catalog(
                 writer.writerow(entry)
 
     elif format == "fits":
-        from astropy.io import fits
         from astropy.table import Table
+        from takefits.core.io.save_fits import atomic_write_fits
 
         # Convert catalog to astropy Table
         table = Table(result.catalog)
-        table.write(output_path, format='fits', overwrite=True)
+        atomic_write_fits(
+            output_path,
+            lambda temporary: table.write(
+                temporary,
+                format='fits',
+                overwrite=True,
+            ),
+        )
 
     else:
         raise ValueError(f"Unknown format: {format}")

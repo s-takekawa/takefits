@@ -7,6 +7,7 @@ import ast
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.logic.data_tools import materialize_elementwise_inputs
 
 
 ArithmeticOp = Literal["add", "subtract", "multiply", "divide", "expression"]
@@ -48,6 +49,14 @@ def compute_arithmetic(
     if operation == "expression":
         if expression is None:
             raise ValueError("Expression required for 'expression' operation")
+        data_a, data_b = materialize_elementwise_inputs(
+            data_a,
+            data_b,
+            operation_name="Arithmetic expression",
+            # The evaluated expression and its mandatory float64 cast can
+            # coexist with an additional NumPy intermediate.
+            output_array_count=3,
+        )
 
         # Build evaluation context
         context = {"np": np, "A": data_a}
@@ -94,6 +103,14 @@ def compute_arithmetic(
 
         except Exception as e:
             raise ValueError(f"Expression evaluation failed: {e}")
+
+    data_a, data_b = materialize_elementwise_inputs(
+        data_a,
+        data_b,
+        operation_name="Arithmetic",
+        # Array division uses both the quotient and np.where result.
+        output_array_count=2 if operation == "divide" and data_b is not None else 1,
+    )
 
     # Simple operations
     if operation == "add":

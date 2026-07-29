@@ -273,23 +273,29 @@ class ActionSession:
         call_params = _filter_handler_kwargs(handler, params)
 
         previous_result = self.last_result
+        produces_result = _action_produces_result(name, handler)
 
-        if accepts_state and accepts_result:
-            if self.state is None:
-                raise ValueError(f"Action '{name}' requires state, but no state is loaded.")
-            if self.last_result is None:
-                raise ValueError(f"Action '{name}' requires a previous result, but none is available.")
-            result = handler(state=self.state, result=self.last_result, **call_params)
-        elif accepts_state:
-            if self.state is None:
-                raise ValueError(f"Action '{name}' requires state, but no state is loaded.")
-            result = handler(state=self.state, **call_params)
-        elif accepts_result:
-            if self.last_result is None:
-                raise ValueError(f"Action '{name}' requires a previous result, but none is available.")
-            result = handler(result=self.last_result, **call_params)
-        else:
-            result = handler(**call_params)
+        try:
+            if accepts_state and accepts_result:
+                if self.state is None:
+                    raise ValueError(f"Action '{name}' requires state, but no state is loaded.")
+                if self.last_result is None:
+                    raise ValueError(f"Action '{name}' requires a previous result, but none is available.")
+                result = handler(state=self.state, result=self.last_result, **call_params)
+            elif accepts_state:
+                if self.state is None:
+                    raise ValueError(f"Action '{name}' requires state, but no state is loaded.")
+                result = handler(state=self.state, **call_params)
+            elif accepts_result:
+                if self.last_result is None:
+                    raise ValueError(f"Action '{name}' requires a previous result, but none is available.")
+                result = handler(result=self.last_result, **call_params)
+            else:
+                result = handler(**call_params)
+        except Exception:
+            if produces_result:
+                self.last_result = None
+            raise
 
         if isinstance(result, AppState):
             self.state = result
@@ -429,6 +435,33 @@ def _handler_signature(handler: Any) -> inspect.Signature:
         target = getattr(usecases, str(lazy_name))
         return inspect.signature(target)
     return inspect.signature(handler)
+
+
+_RESULT_ACTIONS_WITHOUT_RETURN_ANNOTATION = frozenset(
+    {
+        "apply_baseline_subtraction",
+    }
+)
+
+
+def _action_produces_result(name: str, handler: Any) -> bool:
+    """Return whether a successful action replaces the exportable analysis result."""
+    if name.startswith("export_"):
+        return False
+    if name in _RESULT_ACTIONS_WITHOUT_RETURN_ANNOTATION:
+        return True
+
+    try:
+        annotation = _handler_signature(handler).return_annotation
+    except (TypeError, ValueError):
+        return False
+
+    if annotation in (inspect.Signature.empty, None, type(None), AppState):
+        return False
+    if isinstance(annotation, str):
+        normalized = annotation.strip().strip("'\"").rsplit(".", 1)[-1]
+        return normalized not in {"AppState", "None", "NoneType"}
+    return True
 
 
 def _should_preserve_last_result(name: str, result: Any, previous_result: Any) -> bool:

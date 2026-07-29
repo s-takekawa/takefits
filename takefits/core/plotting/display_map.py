@@ -249,6 +249,18 @@ class DisplayMap:
         self.x_mtick_freq = config.get('x_mtick_freq', 5)
         self.y_mtick_freq = config.get('y_mtick_freq', 5)
         self.z_mtick_freq = config.get('z_mtick_freq', 5)
+        self._mtick_freq = {
+            'x': self.x_mtick_freq,
+            'y': self.y_mtick_freq,
+            'z': self.z_mtick_freq,
+        }
+        # Major tick placement per axis; None leaves astropy WCSAxes in charge.
+        self._tick_spacing = {
+            key: config.get(f'{key}_tick_spacing') for key in ('x', 'y', 'z')
+        }
+        self._tick_number = {
+            key: config.get(f'{key}_tick_number') for key in ('x', 'y', 'z')
+        }
         
         self.tick_xlabelrotation = config.get('tick_xlabelrotation', 0)
         self.tick_ylabelrotation = config.get('tick_ylabelrotation', 0)
@@ -299,7 +311,18 @@ class DisplayMap:
         self.colorbar_label = config.get('colorbar_label', None)
         self.colorbar_label_fontsize = config.get('colorbar_label_fontsize', 12)
         self.colorbar_label_color = config.get('colorbar_label_color', 'black')
+        self.colorbar_label_fontfamily = resolve_mpl_font_family(
+            config.get('colorbar_label_fontfamily', 'DejaVu Sans')
+        )
         self.colorbar_tick_labelcolor = config.get('colorbar_tick_labelcolor', 'black')
+        # None keeps the Matplotlib default so existing configs are unchanged.
+        self.colorbar_tick_labelsize = config.get('colorbar_tick_labelsize', None)
+        # Defaults to the image tick font, which is what the previous global
+        # rcParams write effectively gave the colorbar.
+        self.colorbar_tick_labelfontfamily = resolve_mpl_font_family(
+            config.get('colorbar_tick_labelfontfamily')
+            or config.get('tick_font', 'DejaVu Sans')
+        )
         
         self.data = data
         self.wcs = wcs
@@ -625,11 +648,12 @@ class DisplayMap:
 
         self.fig = fig
         self.plane = plane
-        
-        #tick label param
-        plt.rcParams['font.family'] = self.tick_font
-        plt.rcParams['font.weight'] = self.tick_font_weight
-        
+
+        # Tick label typography is applied per coordinate below and on the
+        # colorbar axes, not through plt.rcParams. A global rcParams write
+        # leaked into every artist created afterwards (markers, titles), so a
+        # tick font choice silently overrode their own font settings.
+
         from astropy.visualization.wcsaxes import WCSAxes
         # Calculate axes position as [left, bottom, width, height] in figure coordinates.
         pos = [self.ax_pos_l, self.ax_pos_b, self.ax_pos_r - self.ax_pos_l, self.ax_pos_t - self.ax_pos_b]
@@ -714,9 +738,36 @@ class DisplayMap:
                                 width=self.colorbar_tick_width, length=self.colorbar_tick_length, color=self.colorbar_tick_color, direction=self.colorbar_tick_direction, labelcolor=self.colorbar_tick_labelcolor)
             self.cax.tick_params(axis='x', which='both', top=self.colorbar_tick_top, bottom=self.colorbar_tick_bottom, labeltop= self.colorbar_tick_labeltop, labelbottom = (not self.colorbar_tick_labeltop),
                                 width=self.colorbar_tick_width, length=self.colorbar_tick_length, color=self.colorbar_tick_color, direction=self.colorbar_tick_direction, labelcolor=self.colorbar_tick_labelcolor)
+            # The colorbar used to inherit the tick font from the global
+            # rcParams write; apply it explicitly now that the write is gone.
+            colorbar_tick_params = {
+                'labelfontfamily': self.colorbar_tick_labelfontfamily,
+            }
+            if self.colorbar_tick_labelsize is not None:
+                colorbar_tick_params['labelsize'] = self.colorbar_tick_labelsize
+            self.cax.tick_params(axis='both', which='both', **colorbar_tick_params)
             self.colorbar.outline.set_color(self.colorbar_tick_color)
             self.colorbar.outline.set_linewidth(self.colorbar_tick_width)
-            self.colorbar.set_label(self.colorbar_label, fontsize=self.colorbar_label_fontsize, color=self.colorbar_label_color)
+            self.colorbar.set_label(
+                self.colorbar_label,
+                fontsize=self.colorbar_label_fontsize,
+                color=self.colorbar_label_color,
+                fontfamily=self.colorbar_label_fontfamily,
+            )
+            # Matplotlib puts the label opposite the ticks, so a top-ticked
+            # horizontal bar drops its label between the bar and the image.
+            # Keep the label on the same side as the tick labels.
+            try:
+                if self.colorbar_orientation == 'horizontal':
+                    self.colorbar.ax.xaxis.set_label_position(
+                        'top' if self.colorbar_tick_labeltop else 'bottom'
+                    )
+                else:
+                    self.colorbar.ax.yaxis.set_label_position(
+                        'left' if self.colorbar_tick_labelleft else 'right'
+                    )
+            except Exception:
+                pass
             self.colorbar.ax.minorticks_on()
             self.colorbar.ax.tick_params(which='minor', length=self.colorbar_mtick_length, color=self.colorbar_tick_color)
             self.colorbar.ax.yaxis.set_minor_locator(mpl.ticker.AutoMinorLocator(self.colorbar_mtick_freq))
@@ -741,11 +792,17 @@ class DisplayMap:
         ax_xy = []
         for idx in np.where(disp_idx)[0]:
             self.ax.coords[idx].set_ticks_position(self.default_ticks_position)
-            self.ax.coords[idx].set_ticklabel(exclude_overlapping=True)
+            # Carry the tick typography on the coordinate itself so it survives
+            # draw-time label regeneration without a global rcParams write.
+            self.ax.coords[idx].set_ticklabel(
+                exclude_overlapping=True,
+                fontfamily=self.tick_font,
+                fontweight=self.tick_font_weight,
+            )
             self.ax.coords[idx].set_ticklabel_visible(True)
             self.ax.coords[idx].display_minor_ticks(True)
-            ax_xy.append(self.ax.coords[idx])        
-      
+            ax_xy.append(self.ax.coords[idx])
+
         if self.plane == 'zy': ax_xy.reverse()
         ax_xy[0].set_ticklabel(rotation = self.tick_xlabelrotation)
         ax_xy[1].set_ticklabel(rotation = self.tick_ylabelrotation)
@@ -756,14 +813,17 @@ class DisplayMap:
         ax_xy[1].set_axislabel_position(self.yticklabel_position)
         
         if self.plane =='xy':
-            ax_xy[0].set_minor_frequency(self.x_mtick_freq)
-            ax_xy[1].set_minor_frequency(self.y_mtick_freq)
+            axis_keys = ('x', 'y')
         elif self.plane =='xz':
-            ax_xy[0].set_minor_frequency(self.x_mtick_freq)
-            ax_xy[1].set_minor_frequency(self.z_mtick_freq)
+            axis_keys = ('x', 'z')
         elif self.plane =='zy':
-            ax_xy[0].set_minor_frequency(self.z_mtick_freq)
-            ax_xy[1].set_minor_frequency(self.y_mtick_freq)
+            axis_keys = ('z', 'y')
+        else:
+            axis_keys = ()
+
+        for coord, key in zip(ax_xy, axis_keys):
+            coord.set_minor_frequency(self._mtick_freq[key])
+            self._apply_major_tick_placement(coord, key)
 
         # Update ViewerState if provided
         if self.viewer_state is not None:
@@ -1602,6 +1662,46 @@ class DisplayMap:
         applied = self._set_native_grid(visible)
         self.update_grid_overlay_layout()
         return applied
+
+    def _apply_major_tick_placement(self, coord, axis_key: str) -> None:
+        """Honour `<axis>_tick_spacing` / `<axis>_tick_number` for one coord.
+
+        `spacing` is interpreted in the axis' displayed format unit, so the
+        number the user types matches the numbers on the tick labels. Astropy
+        rejects passing both, so spacing wins. Any failure leaves the automatic
+        placement untouched rather than breaking the render.
+        """
+        spacing = self._tick_spacing.get(axis_key)
+        number = self._tick_number.get(axis_key)
+
+        if spacing is not None:
+            try:
+                value = float(spacing)
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value > 0.0:
+                try:
+                    unit = coord.get_format_unit()
+                except Exception:
+                    unit = None
+                try:
+                    coord.set_ticks(
+                        spacing=value * unit if unit is not None else value
+                    )
+                    return
+                except Exception:
+                    pass
+
+        if number is not None:
+            try:
+                count = int(number)
+            except (TypeError, ValueError):
+                return
+            if count > 0:
+                try:
+                    coord.set_ticks(number=count)
+                except Exception:
+                    pass
 
     def update_axes_format(self):
         if not self.wcs:

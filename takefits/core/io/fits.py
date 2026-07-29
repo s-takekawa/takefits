@@ -1,6 +1,7 @@
 """Headless FITS I/O helpers (no PyQt dependencies)."""
 from __future__ import annotations
 
+import operator
 import numpy as np
 from pathlib import Path
 from astropy.io import fits
@@ -13,11 +14,131 @@ from takefits.logic.data_tools import (
     LAZY_SCALING_THRESHOLD_BYTES,
     MEMMAP_THRESHOLD_BYTES,
     LazyScaledArray,
+    _parse_header_float,
     build_large_data_profile,
     estimate_array_nbytes,
     header_has_scaling_keywords,
     is_lazy_scaled,
 )
+
+
+# Preserve the historical load-time normalization boundary while keeping the
+# scan itself chunked. Arrays above the memmap boundary stay lazy and are
+# sanitized per slice so opening a large FITS does not page the whole file in.
+_FULL_DATA_SANITIZE_MAX_BYTES = MEMMAP_THRESHOLD_BYTES
+_SANITIZE_CHUNK_TARGET_BYTES = 16 * 1024 * 1024
+
+
+def _selected_image_hdu_index(hdul, requested_hdu: int | None = None) -> int | None:
+    """Return the requested or first HDU describing a non-empty image."""
+    if requested_hdu is None:
+        candidates = enumerate(hdul)
+    else:
+        index = requested_hdu if requested_hdu >= 0 else len(hdul) + requested_hdu
+        if index < 0 or index >= len(hdul):
+            return None
+        candidates = ((index, hdul[index]),)
+
+    for index, hdu in candidates:
+        if not isinstance(hdu, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)):
+            continue
+        header = getattr(hdu, "header", None)
+        if header is None:
+            continue
+        try:
+            naxis = int(header.get("NAXIS", 0))
+            if naxis <= 0:
+                continue
+            if all(int(header.get(f"NAXIS{axis}", 0)) > 0 for axis in range(1, naxis + 1)):
+                return index
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _header_array_sizes(header) -> tuple[int, int]:
+    """Return raw storage and projected float64 scaling sizes from a header."""
+    try:
+        naxis = int(header.get("NAXIS", 0))
+        count = 1
+        for axis in range(1, naxis + 1):
+            count *= max(0, int(header.get(f"NAXIS{axis}", 0)))
+        raw_itemsize = max(1, abs(int(header.get("BITPIX", 8))) // 8)
+    except (TypeError, ValueError):
+        return 0, 0
+    raw_bytes = count * raw_itemsize
+    projected_bytes = (
+        count * np.dtype(np.float64).itemsize
+        if header_has_scaling_keywords(header)
+        else raw_bytes
+    )
+    return int(raw_bytes), int(projected_bytes)
+
+
+def _wrap_lazy_scaled_data(data, header):
+    """Wrap one selected raw image HDU with its own FITS scaling metadata."""
+    if data is None or is_lazy_scaled(data):
+        return data
+    bzero = _parse_header_float(header, "BZERO", 0.0)
+    bscale = _parse_header_float(header, "BSCALE", 1.0)
+    bzero = 0.0 if bzero is None else bzero
+    bscale = 1.0 if bscale is None else bscale
+    blank = None
+    if "BLANK" in header:
+        try:
+            blank = int(header["BLANK"])
+        except (TypeError, ValueError):
+            blank = None
+    return LazyScaledArray(data, bzero=bzero, bscale=bscale, blank=blank)
+
+
+def _iter_buffered_chunks(array, *, readwrite: bool):
+    """Yield bounded 1-D buffers over an arbitrary-strided ndarray."""
+    itemsize = max(1, int(np.dtype(array.dtype).itemsize))
+    buffer_items = max(1, _SANITIZE_CHUNK_TARGET_BYTES // itemsize)
+    op_flags = ["readwrite"] if readwrite else ["readonly"]
+    with np.nditer(
+        array,
+        flags=["external_loop", "buffered", "zerosize_ok"],
+        op_flags=op_flags,
+        order="K",
+        buffersize=buffer_items,
+    ) as iterator:
+        for chunk in iterator:
+            yield chunk
+
+
+def _chunk_has_invalid_values(data) -> bool:
+    """Scan for Takefits sentinels/non-finite values with bounded masks."""
+    integer = np.issubdtype(data.dtype, np.integer)
+    for chunk in _iter_buffered_chunks(data, readwrite=False):
+        with np.errstate(invalid="ignore"):
+            bad = chunk < -100000
+            if not integer:
+                bad |= ~np.isfinite(chunk)
+        if np.any(bad):
+            return True
+    return False
+
+
+def _sanitize_loaded_data(data):
+    """Sanitize a modest array in bounded chunks, copying only when required."""
+    if data is None or getattr(data, "size", 0) == 0:
+        return data, False
+    if not _chunk_has_invalid_values(data):
+        return data, False
+
+    if not np.issubdtype(data.dtype, np.floating):
+        data = data.astype(np.float32)
+    elif not data.flags.writeable:
+        data = np.array(data, copy=True)
+
+    for chunk in _iter_buffered_chunks(data, readwrite=True):
+        with np.errstate(invalid="ignore"):
+            bad = (chunk < -100000) | ~np.isfinite(chunk)
+        if np.any(bad):
+            chunk[bad] = np.nan
+    return data, True
 
 
 def _slice_singleton_axis(data, axis):
@@ -222,7 +343,7 @@ class FITSLoadError(Exception):
         self.detail = detail
         super().__init__(message)
 
-def load_fits(filename, compute_wcs=True):
+def load_fits(filename, compute_wcs=True, hdu: int | None = None):
     """
     Load a FITS file and process header/data.
     Optionally compute WCS and perform velocity unit conversion.
@@ -234,6 +355,18 @@ def load_fits(filename, compute_wcs=True):
 
     if not path.is_file():
         raise FITSLoadError("Path is not a file", filename=path, kind="not_file")
+
+    requested_hdu = None
+    if hdu is not None:
+        try:
+            requested_hdu = operator.index(hdu)
+        except TypeError as err:
+            raise FITSLoadError(
+                "HDU index must be an integer",
+                filename=path,
+                kind="invalid_hdu",
+                detail=str(err),
+            ) from err
 
     open_kwargs = dict(
         mode='readonly',
@@ -247,44 +380,38 @@ def load_fits(filename, compute_wcs=True):
     def _open_fits(**kw):
         return fits.open(path, **kw)
 
-    # --- Quick file-size check to decide whether a header probe is worthwhile ---
-    # Only probe when the file on disk could plausibly exceed the lazy-scaling
-    # threshold.  For smaller files the normal open → reactive-retry path is
-    # sufficient and avoids an extra fits.open() call.
-    _probe_file_bytes = 0
+    # Probe once a file could expand past the lazy threshold in the worst case
+    # (int8 -> float64 is 8x). This closes the former 1–2 GiB gap where scaled
+    # files skipped lazy scaling and were eagerly expanded to several GiB.
+    _probe_materialized_bytes = 0
     _probe_needs_scaling = False
+    _probe_hdu_index = None
     _file_size_on_disk = 0
     try:
         _file_size_on_disk = path.stat().st_size
     except Exception:
         pass
 
-    if _file_size_on_disk >= LAZY_SCALING_THRESHOLD_BYTES:
-        # Probe header to detect scaling keywords and estimate data size.
+    probe_threshold = max(1, LAZY_SCALING_THRESHOLD_BYTES // 8)
+    if _file_size_on_disk >= probe_threshold:
+        # Probe only the image HDU the loader will actually return. Scaling
+        # keywords in an unrelated extension must not change the open strategy.
         try:
             with fits.open(path, mode='readonly', memmap=True, lazy_load=True,
                            ignore_missing_end=True, ignore_missing_simple=True) as probe:
-                for _hdu in probe:
-                    _hdr = getattr(_hdu, "header", None)
-                    if _hdr is None:
-                        continue
-                    if not _probe_needs_scaling and header_has_scaling_keywords(_hdr):
-                        _probe_needs_scaling = True
-                h = probe[0].header
-                naxis = int(h.get('NAXIS', 0))
-                if naxis == 0 and len(probe) > 1:
-                    h = probe[1].header
-                    naxis = int(h.get('NAXIS', 0))
-                if naxis > 0:
-                    bitpix = abs(int(h.get('BITPIX', 8)))
-                    _probe_file_bytes = bitpix // 8
-                    for ax in range(1, naxis + 1):
-                        _probe_file_bytes *= int(h.get(f'NAXIS{ax}', 1))
+                _probe_hdu_index = _selected_image_hdu_index(probe, requested_hdu)
+                if _probe_hdu_index is not None:
+                    h = probe[_probe_hdu_index].header
+                    _probe_needs_scaling = header_has_scaling_keywords(h)
+                    _, _probe_materialized_bytes = _header_array_sizes(h)
         except Exception:
             pass
 
         # Decide open strategy up-front to avoid close-and-reopen cycles.
-        if _probe_needs_scaling and _probe_file_bytes >= LAZY_SCALING_THRESHOLD_BYTES:
+        if (
+            _probe_needs_scaling
+            and _probe_materialized_bytes >= LAZY_SCALING_THRESHOLD_BYTES
+        ):
             open_kwargs["do_not_scale_image_data"] = True
             lazy_scaling_active = True
 
@@ -301,7 +428,11 @@ def load_fits(filename, compute_wcs=True):
         message = str(err)
         if "Cannot load a memory-mapped image" in message:
             # Fallback: astropy cannot memmap scaled data despite our probe.
-            if not lazy_scaling_active and _probe_file_bytes >= LAZY_SCALING_THRESHOLD_BYTES:
+            if (
+                not lazy_scaling_active
+                and _probe_needs_scaling
+                and _probe_materialized_bytes >= LAZY_SCALING_THRESHOLD_BYTES
+            ):
                 open_kwargs["do_not_scale_image_data"] = True
                 lazy_scaling_active = True
             else:
@@ -324,23 +455,25 @@ def load_fits(filename, compute_wcs=True):
                 detail=message,
             ) from err
     else:
-        # Reactive fallback for files where no probe was done: if the open
-        # succeeded with memmap but scaling keywords are present, astropy
-        # will fail or produce wrong results when data is accessed.  Re-open
-        # with memmap disabled so astropy can handle BZERO/BSCALE/BLANK.
+        # Reactive fallback for files where no probe was done or the probe
+        # failed. Inspect only the selected image HDU.
         if not lazy_scaling_active and open_kwargs.get("memmap", True):
-            requires_scaling = False
-            for hdu in hdulist:
-                hdr = getattr(hdu, "header", None)
-                if hdr is None:
-                    continue
-                if header_has_scaling_keywords(hdr):
-                    requires_scaling = True
-                    break
+            selected_index = _selected_image_hdu_index(hdulist, requested_hdu)
+            selected_header = (
+                hdulist[selected_index].header
+                if selected_index is not None
+                else None
+            )
+            requires_scaling = header_has_scaling_keywords(selected_header)
             if requires_scaling:
                 hdulist.close()
-                open_kwargs["memmap"] = False
-                open_kwargs["lazy_load"] = False
+                _, projected_bytes = _header_array_sizes(selected_header)
+                if projected_bytes >= LAZY_SCALING_THRESHOLD_BYTES:
+                    open_kwargs["do_not_scale_image_data"] = True
+                    lazy_scaling_active = True
+                else:
+                    open_kwargs["memmap"] = False
+                    open_kwargs["lazy_load"] = False
                 try:
                     hdulist = _open_fits(**open_kwargs)
                 except Exception as retry_err:
@@ -358,28 +491,33 @@ def load_fits(filename, compute_wcs=True):
         )
 
     with hdulist as hdul:
-        data = hdul[0].data
-        header = hdul[0].header
+        selected_hdu_index = _selected_image_hdu_index(hdul, requested_hdu)
+        if selected_hdu_index is None:
+            message = (
+                f"Requested HDU {requested_hdu} does not contain non-empty image data"
+                if requested_hdu is not None
+                else "FITS file contains no non-empty image HDU"
+            )
+            raise FITSLoadError(
+                message,
+                filename=path,
+                kind="invalid_hdu" if requested_hdu is not None else "no_image",
+            )
+        selected_hdu = hdul[selected_hdu_index]
+        data = selected_hdu.data
+        header = selected_hdu.header
+        if selected_hdu_index != 0 and requested_hdu is None:
+            print(
+                "\033[1;33m\033[1mWarning: Primary HDU has no image data. "
+                f"Using image HDU {selected_hdu_index}.\033[0m"
+            )
 
         # Wrap raw memmap in LazyScaledArray when lazy scaling is active.
         if lazy_scaling_active and data is not None:
-            from takefits.logic.data_tools import _parse_header_float
-            bzero = _parse_header_float(header, "BZERO", 0.0)
-            if bzero is None:
-                bzero = 0.0
-            bscale = _parse_header_float(header, "BSCALE", 1.0)
-            if bscale is None:
-                bscale = 1.0
-            blank = None
-            if "BLANK" in header:
-                try:
-                    blank = int(header["BLANK"])
-                except (TypeError, ValueError):
-                    blank = None
-            data = LazyScaledArray(data, bzero=bzero, bscale=bscale, blank=blank)
+            data = _wrap_lazy_scaled_data(data, header)
             print(
-                f"\033[96m  BZERO={bzero}, BSCALE={bscale}"
-                + (f", BLANK={blank}" if blank is not None else "")
+                f"\033[96m  BZERO={data._bzero}, BSCALE={data._bscale}"
+                + (f", BLANK={data._blank}" if data._blank is not None else "")
                 + "\033[0m"
             )
 
@@ -413,29 +551,26 @@ def load_fits(filename, compute_wcs=True):
                 f"\033[93mDetected large FITS data cube (~{approx_gib:.2f} GiB). "
                 "Using memory-mapped lazy loading.\033[0m"
             )
-        
-        # Check if primary HDU is empty; use the next HDU if needed
-        if header.get('NAXIS', 0) == 0:
-            data = hdul[1].data
-            header = hdul[1].header
-            # Re-wrap in LazyScaledArray if lazy scaling is active for the
-            # replacement HDU data (the original wrap targeted HDU[0]).
-            if lazy_scaling_active and data is not None and not is_lazy_scaled(data):
-                bzero = _parse_header_float(header, "BZERO", 0.0)
-                if bzero is None:
-                    bzero = 0.0
-                bscale = _parse_header_float(header, "BSCALE", 1.0)
-                if bscale is None:
-                    bscale = 1.0
-                blank = None
-                if "BLANK" in header:
-                    try:
-                        blank = int(header["BLANK"])
-                    except (TypeError, ValueError):
-                        blank = None
-                data = LazyScaledArray(data, bzero=bzero, bscale=bscale, blank=blank)
-            print("\033[1;33m\033[1mWarning: NAXIS was 0. Using data from the next HDU.\033[0m")
-        
+
+        # Full-cube masks caused several hundred MiB of transient allocations.
+        # Preserve the historical below-memmap sanitization behavior, but scan
+        # and replace through bounded iterator buffers. Lazy/scaled arrays and
+        # arrays above the memmap boundary are normalized per slice instead.
+        if is_lazy_scaled(data):
+            spectral_metadata['_needs_per_slice_sanitize'] = True
+        elif (
+            data_nbytes is None
+            or data_nbytes <= _FULL_DATA_SANITIZE_MAX_BYTES
+        ):
+            data, replaced_invalid = _sanitize_loaded_data(data)
+            if replaced_invalid:
+                print(
+                    "\033[1;33m\033[1mWarning: Replaced invalid or infinite "
+                    "data values with NaN.\033[0m"
+                )
+        else:
+            spectral_metadata['_needs_per_slice_sanitize'] = True
+
         # Frequency conversion using FreqToVelocity
         converter = FreqToVelocity(header)
         if converter.converted:
@@ -487,36 +622,6 @@ def load_fits(filename, compute_wcs=True):
         large_data_profile = build_large_data_profile(data, header=header)
         spectral_metadata['large_data_mode'] = bool(large_data_profile.get('enabled'))
         spectral_metadata['large_data_profile'] = large_data_profile
-
-        # Replace invalid data values (< -100000) with NaN.
-        # Skip for LazyScaledArray (BLANK is handled by scaling; per-slice
-        # sanitisation covers remaining invalid values) and for arrays
-        # larger than the memmap threshold.
-        if is_lazy_scaled(data):
-            spectral_metadata['_needs_per_slice_sanitize'] = True
-        else:
-            allow_full_scan = data_nbytes is None or data_nbytes <= MEMMAP_THRESHOLD_BYTES
-
-            if allow_full_scan:
-                with np.errstate(invalid="ignore"):
-                    invalid_mask = data < -100000
-
-                if np.any(invalid_mask):
-                    if not np.issubdtype(data.dtype, np.floating):
-                        data = data.astype(np.float32)
-                    data[invalid_mask] = np.nan
-                    print("\033[1;33m\033[1mWarning: Replaced invalid data values (< -100000) with NaN.\033[0m")
-
-                with np.errstate(invalid="ignore"):
-                    inf_mask = np.isinf(data)
-
-                if np.any(inf_mask):
-                    if not np.issubdtype(data.dtype, np.floating):
-                        data = data.astype(np.float32)
-                    data[inf_mask] = np.nan
-                    print("\033[1;33m\033[1mWarning: Replaced infinite data values with NaN.\033[0m")
-            else:
-                spectral_metadata['_needs_per_slice_sanitize'] = True
 
     wcs = None
     if compute_wcs:
