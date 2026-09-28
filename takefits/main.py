@@ -47,6 +47,18 @@ def _build_argument_parser(*, prog: str = "takefits") -> argparse.ArgumentParser
         action="version",
         version=APP_VERSION_TEXT,
     )
+    parser.add_argument(
+        "--spectral-axis",
+        "--spec",
+        dest="spectral_axis",
+        choices=("vel", "freq"),
+        help=(
+            "How radio cubes open in this launch: vel converts frequency axes to radio velocity, "
+            "freq keeps frequency axes and converts radio-velocity (VRAD) axes to frequency "
+            "(both need a rest frequency). Overrides the Preferences once; workspaces keep "
+            "their saved mode."
+        ),
+    )
     return parser
 
 
@@ -258,11 +270,40 @@ def choose_fits_file(runtime):
     return filename
 
 
+def _launch_frequency_axis(filename, workspace_path, spectral_axis, app_config_path) -> str:
+    """How the first launch target opens: its workspace record, the option, or the Preferences."""
+    from takefits.core.spectral_open import (
+        LAUNCH_SPECTRAL_AXIS,
+        preferred_frequency_axis,
+        workspace_frequency_axis,
+    )
+
+    if workspace_path:
+        if spectral_axis:
+            print("\033[93mThe workspace opens in the spectral-axis mode it was saved with; "
+                  "--spectral-axis is ignored for it.\033[0m")
+        return workspace_frequency_axis(workspace_path)
+    if spectral_axis:
+        return LAUNCH_SPECTRAL_AXIS[spectral_axis]
+    try:
+        from takefits.core.config import ConfigManager
+
+        config = ConfigManager(app_config_path("config.yaml")).config
+    except Exception:
+        config = None
+    return preferred_frequency_axis(config)
+
+
 def launch_gui(
     filename: str | None,
     workspace_path: str | None,
     extra_launch_targets: list[tuple[str, str | None]] | None = None,
+    *,
+    spectral_axis: str | None = None,
 ) -> int:
+    """``spectral_axis`` is the --spectral-axis value ('vel' / 'freq') for this launch."""
+    from takefits.core.spectral_open import LAUNCH_SPECTRAL_AXIS
+
     runtime = _load_gui_runtime()
 
     print(APP_VERSION_TEXT)
@@ -345,14 +386,25 @@ def launch_gui(
             self.thread.wait()
             if self.remaining_launch_targets:
                 runtime.QTimer.singleShot(0, self.open_remaining_targets)
+            else:
+                self._release_main_win()
+
+        def _release_main_win(self):
+            # The WindowRegistry keeps the window alive while it is open; this
+            # controller lives for the whole session, so holding the window
+            # here as well would keep it after it is closed.
+            self.main_win = None
 
         def open_remaining_targets(self):
             if self.main_win is None:
                 return
+            launch_mode = LAUNCH_SPECTRAL_AXIS.get(spectral_axis) if spectral_axis else None
             for target_filename, target_workspace_path in list(self.remaining_launch_targets):
                 path = target_workspace_path or target_filename
                 try:
-                    opened = self.main_win.open_path_in_new_window(path, main_only=True)
+                    opened = self.main_win.open_path_in_new_window(
+                        path, main_only=True, frequency_axis=launch_mode
+                    )
                     if opened is None:
                         print(f"[takefits] Failed to open additional file: {path}", file=sys.stderr)
                 except Exception as exc:
@@ -370,6 +422,7 @@ def launch_gui(
                     runtime.QTimer.singleShot(0, lambda: manager.sync_now(main_win))
             except Exception:
                 pass
+            self._release_main_win()
             # All launch files loaded -> ready divider.
             print_ready_separator()
 
@@ -382,7 +435,10 @@ def launch_gui(
             self.app.exit(1)
 
     thread = runtime.QThread()
-    worker = runtime.FITSWorker(filename)
+    worker = runtime.FITSWorker(
+        filename,
+        frequency_axis=_launch_frequency_axis(filename, workspace_path, spectral_axis, runtime.app_config_path),
+    )
     controller = StartupController(app, thread, filename, workspace_path, extra_launch_targets)
     worker.moveToThread(thread)
 
@@ -472,9 +528,11 @@ def main(argv=None, *, gui_launcher=None, prog: str | None = None) -> int:
 
     if gui_launcher is None:
         gui_launcher = launch_gui
+    # Passed only when given, so launchers without the option keep working.
+    options = {"spectral_axis": args.spectral_axis} if getattr(args, "spectral_axis", None) else {}
     if extra_launch_targets:
-        return int(gui_launcher(filename, workspace_path, extra_launch_targets) or 0)
-    return int(gui_launcher(filename, workspace_path) or 0)
+        return int(gui_launcher(filename, workspace_path, extra_launch_targets, **options) or 0)
+    return int(gui_launcher(filename, workspace_path, **options) or 0)
 
 
 def main_dev(argv=None, *, gui_launcher=None) -> int:

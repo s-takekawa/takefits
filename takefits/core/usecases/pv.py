@@ -8,6 +8,7 @@ import numpy as np
 from scipy.ndimage import map_coordinates
 
 from takefits.core.app_state import AppState
+from takefits.core.spectral_units import axis_step, display_numbers_unit, display_wcs, kms_per_unit, spectral_wcs_axis
 from takefits.logic.data_tools import (
     _get_available_memory_bytes,
     format_nbytes,
@@ -1591,10 +1592,10 @@ def export_pv_fits(
 
             if pixel_scale_deg is None and state.wcs.wcs.cdelt is not None:
                 cdelt = state.wcs.wcs.cdelt
-                # Use first two axes
+                # Use first two axes (CDELT, or the CD matrix rows)
                 if len(cdelt) >= 2:
-                    cdelt1 = abs(cdelt[0])
-                    cdelt2 = abs(cdelt[1])
+                    cdelt1 = abs(axis_step(state.wcs, 0))
+                    cdelt2 = abs(axis_step(state.wcs, 1))
                     unit_str = str(state.wcs.wcs.cunit[0]).lower() if state.wcs.wcs.cunit else ''
                     if unit_str in ('deg', 'degree', 'degrees'):
                         pixel_scale_deg = (cdelt1 + cdelt2) / 2.0
@@ -1651,35 +1652,70 @@ def export_pv_fits(
     vel_crval = 0.0
     vel_cdelt = 1.0
     vel_crpix = 1.0
+    spectral_length = None
+    numbers_unit = ""
 
     if state.wcs and state.wcs.wcs.naxis >= 3:
-        # Try to find spectral axis
-        spec_axis = -1
-        for i, ctype in enumerate(state.wcs.wcs.ctype):
-            if any(x in ctype.upper() for x in ['VEL', 'FREQ', 'VRAD', 'VOPT']):
-                spec_axis = i
-                break
+        # wcslib's spectral axis (WAVE too), else a velocity-like CTYPE
+        # such as 'VEL' that wcslib does not treat as spectral
+        spec_axis = spectral_wcs_axis(state.wcs, getattr(state, "spectral_metadata", None))
+        if spec_axis is None:
+            spec_axis = -1
+            for i, ctype in enumerate(state.wcs.wcs.ctype):
+                if any(x in ctype.upper() for x in ['VEL', 'FREQ', 'VRAD', 'VOPT']):
+                    spec_axis = i
+                    break
 
         if spec_axis != -1:
             vel_axis_index = spec_axis
             vel_ctype = state.wcs.wcs.ctype[vel_axis_index]
-            vel_crval = state.wcs.wcs.crval[vel_axis_index]
-            vel_cdelt = state.wcs.wcs.cdelt[vel_axis_index]
-            vel_crpix = state.wcs.wcs.crpix[vel_axis_index]
+            # numbers in the display unit, which CUNIT below names
+            shown = display_wcs(state.wcs, getattr(state, "spectral_metadata", None))
+            vel_crval = shown.wcs.crval[vel_axis_index]
+            vel_cdelt = axis_step(shown, vel_axis_index)
+            numbers_unit = display_numbers_unit(state.wcs, getattr(state, "spectral_metadata", None))
+            vel_crpix = shown.wcs.crpix[vel_axis_index]
             if state.wcs.wcs.cunit:
-                vel_cunit = state.wcs.wcs.cunit[vel_axis_index].to_string()
+                vel_cunit = state.wcs.wcs.cunit[vel_axis_index].to_string().replace(' ', '')  # 'm/s', not 'm / s'
+            # NumPy axes run in reverse WCS order.
+            data_shape = tuple(getattr(getattr(state, "data", None), "shape", ()) or ())
+            data_axis = len(data_shape) - 1 - spec_axis
+            if 0 <= data_axis < len(data_shape):
+                spectral_length = int(data_shape[data_axis])
+
+    # Refuse an array whose channel count shows it is in the other layout;
+    # the header would otherwise contradict the data.
+    if spectral_length is not None and data_to_save.ndim == 2:
+        velocity_axis = 1 if is_swapped else 0
+        if (
+            data_to_save.shape[velocity_axis] != spectral_length
+            and data_to_save.shape[1 - velocity_axis] == spectral_length
+        ):
+            found, expected = (
+                ("rows", "columns (NAXIS1)") if is_swapped else ("columns", "rows (NAXIS2)")
+            )
+            raise ValueError(
+                f"pv_data has its {spectral_length} spectral channels along its {found}, "
+                f"but is_swapped={bool(is_swapped)} writes velocity along its {expected}; "
+                "pass the transposed array (compute_pv returns (velocity, position))."
+            )
 
     # Attempt to use pretty unit from spectral_metadata if available
     # (This handles the case where fits_loader converted units but WCS might be raw)
     if state.spectral_metadata and 'current_axis_unit' in state.spectral_metadata:
         # If we have a formatted unit string like "Velocity [km/s]" or just "km/s"
         meta_unit = state.spectral_metadata['current_axis_unit']
-        # Try to extract content inside brackets if present
-        match = re.search(r'\[(.*?)\]', meta_unit)
+        # Try to extract content inside brackets if present (None when the
+        # loader did not identify the axis, e.g. CTYPE 'VEL')
+        match = re.search(r'\[(.*?)\]', meta_unit) if isinstance(meta_unit, str) else None
         if match:
             vel_cunit = match.group(1).strip()
-        elif meta_unit.strip():
+        elif isinstance(meta_unit, str) and meta_unit.strip():
             vel_cunit = meta_unit.strip()
+    # display_wcs keeps frequency and wavelength numbers in SI, so the header
+    # names their unit (Hz), not a GHz/MHz display label.
+    if numbers_unit and kms_per_unit(numbers_unit) is None:
+        vel_cunit = numbers_unit
 
     # --- Assign WCS keywords based on swap state ---
     if is_swapped:

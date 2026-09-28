@@ -46,6 +46,8 @@ class ConfigPanel(QWidget):
         ("Dotted", "dotted"),
         ("Dash-dot", "dashdot"),
     )
+    # Preferences read only when a file opens (no reload of open windows).
+    OPEN_TIME_KEYS = frozenset({"spectral_axis_frequency"})
     GRID_STYLE_KEYS = frozenset(
         {
             "grid_color",
@@ -487,6 +489,10 @@ class ConfigPanel(QWidget):
             self._collect_preference_updates()
         )
 
+    def _set_spectral_axis_frequency_combo(self, value):
+        index = self.spectral_axis_frequency_combo.findData(str(value or "velocity"))
+        self.spectral_axis_frequency_combo.setCurrentIndex(index if index >= 0 else 0)
+
     def create_general_tab(self):
         """Create the general settings tab."""
         page_layout = QVBoxLayout()
@@ -514,6 +520,25 @@ class ConfigPanel(QWidget):
             bool(self.config_manager.config.get('startup_show_subwindow2', False))
         )
         defaults_layout.addWidget(self.startup_show_subwindow2_checkbox, 2, 0, 1, 2)
+
+        # Whether radio cubes open in velocity or frequency (TF-415); applies to
+        # files opened after the change, so no open window reloads.
+        self.spectral_axis_frequency_combo = QComboBox()
+        self.spectral_axis_frequency_combo.addItem("Velocity (radio)", userData="velocity")
+        self.spectral_axis_frequency_combo.addItem("Frequency", userData="frequency")
+        self.spectral_axis_frequency_combo.setToolTip(
+            "Velocity (radio): frequency axes are converted to radio velocity.\n"
+            "Frequency: frequency axes stay, and radio-velocity (VRAD) axes are converted to frequency.\n"
+            "Both need a rest frequency (RESTFRQ); without one the cube opens as it is stored.\n"
+            "Optical and relativistic velocity axes always open in velocity.\n"
+            "The launch option --spectral-axis overrides this for one launch;\n"
+            "a workspace keeps the mode it was saved with."
+        )
+        self._set_spectral_axis_frequency_combo(
+            self.config_manager.config.get('spectral_axis_frequency', 'velocity')
+        )
+        defaults_layout.addWidget(QLabel('Frequency / velocity axes open as:'), 3, 0)
+        defaults_layout.addWidget(self.spectral_axis_frequency_combo, 3, 1)
 
         # Range file is managed in Range Control panel; keep this widget for
         # backward compatibility with apply/reset handlers.
@@ -1933,6 +1958,7 @@ class ConfigPanel(QWidget):
             ('range_file', self.range_file_input.text()),
             ('startup_show_subwindow1', self.startup_show_subwindow1_checkbox.isChecked()),
             ('startup_show_subwindow2', self.startup_show_subwindow2_checkbox.isChecked()),
+            ('spectral_axis_frequency', self.spectral_axis_frequency_combo.currentData() or 'velocity'),
 
             # Display settings
             ('fig_background_color', self.fig_background_color_input.currentText()),
@@ -2074,6 +2100,10 @@ class ConfigPanel(QWidget):
         )
         if not updated_keys:
             return True
+        if updated_keys.issubset(self.OPEN_TIME_KEYS):
+            # Read when a file opens; the open windows stay as they are.
+            self._form_baseline_values = dict(all_updates)
+            return True
 
         if updated_keys.issubset(self.GRID_STYLE_KEYS):
             applied = self._apply_grid_preferences_to_roots(roots)
@@ -2156,6 +2186,12 @@ class ConfigPanel(QWidget):
                     'startup_show_subwindow2',
                     self.config_manager.default_config.get('startup_show_subwindow2', False),
                 )
+            )
+        )
+        self._set_spectral_axis_frequency_combo(
+            self.config_manager.config_bu.get(
+                'spectral_axis_frequency',
+                self.config_manager.default_config.get('spectral_axis_frequency', 'velocity'),
             )
         )
         
@@ -2296,6 +2332,9 @@ class ConfigPanel(QWidget):
         )
         self.startup_show_subwindow2_checkbox.setChecked(
             bool(self.config_manager.default_config.get('startup_show_subwindow2', False))
+        )
+        self._set_spectral_axis_frequency_combo(
+            self.config_manager.default_config.get('spectral_axis_frequency', 'velocity')
         )
         
         # Display settings

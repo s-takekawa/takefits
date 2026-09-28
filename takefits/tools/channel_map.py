@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (QButtonGroup, QComboBox, QDialog, QGridLayout,
                              QVBoxLayout, QMainWindow)
 
 from takefits.core.coordinate import CoordinateConverter, Format_pix_to_wcs
+from takefits.core.spectral_units import axis_step, viewer_display_wcs
+from takefits.ui.spectral_fields import mark_spectral_field
 from takefits.core.fonts import resolve_mpl_font_family
 from takefits.core.marker import Marker, MarkerState, marker_from_state
 from takefits.core.marker_manager import MarkerManager
@@ -611,6 +613,7 @@ class ChannelMapWindow(QMainWindow):
             self.z_max_ch_input = QLineEdit()
             self.z_max_ch_input.setPlaceholderText("Z max value")
             self.z_max_ch_input.setFixedWidth(80)
+            mark_spectral_field(self.z_min_ch_input, self.z_max_ch_input)
             self.z_ch_button = QPushButton("Set Z")
 
             self.z_min_ch_input.returnPressed.connect(self.set_z_range)
@@ -3667,7 +3670,8 @@ class ChannelMapSettingPanel(QDialog):
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.fits_viewer = fits_viewer
-        self.wcs = self.fits_viewer.wcs
+        # Channel maps work in display-unit numbers (world inputs, steps, tiles).
+        self.wcs = viewer_display_wcs(self.fits_viewer)
         self.subwindows = subwindows
 
         # Default values for settings
@@ -3794,6 +3798,7 @@ class ChannelMapSettingPanel(QDialog):
         interval_label = QLabel("  Interval:")
         self.interval_edit = QLineEdit(str(self.interval_val))
         self.interval_edit.setFixedWidth(65)
+        self._mark_spectral_range_fields()
         range_layout.addWidget(self.from_edit)
         range_layout.addWidget(self.to_edit)
         range_layout.addWidget(interval_label)
@@ -3865,6 +3870,7 @@ class ChannelMapSettingPanel(QDialog):
         if not is_checked:
             return
         self.plane_num = num
+        self._mark_spectral_range_fields()
         if self.worldch_num == 0: #ch
             self.from_val =  0.5
             if self.plane_num == 0: #X-Y
@@ -3898,15 +3904,38 @@ class ChannelMapSettingPanel(QDialog):
                     self.from_val = self.converter.pix_to_world(-0.5, 0, 0, 0)[0]
                     self.to_val = self.converter.pix_to_world(_axis_last_pixel_center(self.fits_viewer, 1), 0, 0, 0)[0]
                     
-            interval_val = abs(self.wcs.wcs.cdelt[2-self.plane_num])
+            interval_val = abs(axis_step(self.wcs, 2-self.plane_num))
             axis_type = self.converter.get_axis_types()[2-self.plane_num]
-            self.interval = self.converter.format_world_coordinate(interval_val, axis_type)
+            self.interval = self._format_world_interval(interval_val, axis_type)
             
         self.from_edit.setText(str(self.from_val))
         self.to_edit.setText(str(self.to_val))
         self.interval_edit.setText(str(self.interval))
         if self.mode_num == 2:
             self.set_mode_num(2)
+
+    def _mark_spectral_range_fields(self):
+        """From / To / Interval hold spectral numbers for XY channel maps in world units."""
+        world = bool(getattr(self, "worldch_num", 1) == 1)
+        mark_spectral_field(
+            getattr(self, "from_edit", None),
+            getattr(self, "to_edit", None),
+            getattr(self, "interval_edit", None),
+            on=world and getattr(self, "plane_num", 0) == 0,
+        )
+
+    def _format_world_interval(self, interval_val, axis_type):
+        """The world interval as text: a width, so relative precision matters.
+
+        A position needs 1/10 channel; a width in that format read a 1.2699 km/s
+        channel as 1.3 (1.02 channels, a tile short) and 488.28125 kHz as 0.00049
+        GHz. Spectral widths keep 12 significant digits; spatial ones keep the
+        coordinate format (sexagesimal when chosen).
+        """
+        axis_upper = str(axis_type or "").upper()
+        if any(token in axis_upper for token in ("VRAD", "VELO", "VOPT", "FREQ", "WAVE", "AWAV")):
+            return f"{float(interval_val):.12g}"
+        return self.converter.format_world_coordinate(interval_val, axis_type)
 
     def set_worldch_num(self, num, is_checked=None):
         """Set unit selection (0 for 'ch', 1 for 'world')."""
@@ -3924,6 +3953,7 @@ class ChannelMapSettingPanel(QDialog):
         # Save current state in case we need to revert.
         previous_state = self.worldch_num  # 0 for 'ch', 1 for 'world'
         self.worldch_num = num
+        self._mark_spectral_range_fields()
     
         if self.val_radio.isChecked():
             try:
@@ -3946,7 +3976,7 @@ class ChannelMapSettingPanel(QDialog):
                     elif self.fits_viewer.data.ndim == 4:
                         from_val = self.converter.pix_to_world(0, 0, from_pix-1, 0)[2]
                         to_val = self.converter.pix_to_world(0, 0, to_pix-1, 0)[2]
-                    interval_val = abs(self.interval_pix * self.wcs.wcs.cdelt[2])
+                    interval_val = abs(self.interval_pix * axis_step(self.wcs, 2))
                     axis_type = self.converter.get_axis_types()[2]
                 elif self.plane_num == 1:
                     if self.fits_viewer.data.ndim == 3:
@@ -3955,7 +3985,7 @@ class ChannelMapSettingPanel(QDialog):
                     elif self.fits_viewer.data.ndim == 4:
                         from_val = self.converter.pix_to_world(0, from_pix-1, 0, 0)[1]
                         to_val = self.converter.pix_to_world(0, to_pix-1, 0, 0)[1]
-                    interval_val = abs(self.interval_pix * self.wcs.wcs.cdelt[1])
+                    interval_val = abs(self.interval_pix * axis_step(self.wcs, 1))
                     axis_type = self.converter.get_axis_types()[1]
                 elif self.plane_num == 2:
                     if self.fits_viewer.data.ndim == 3:
@@ -3964,12 +3994,12 @@ class ChannelMapSettingPanel(QDialog):
                     elif self.fits_viewer.data.ndim == 4:
                         from_val = self.converter.pix_to_world(from_pix-1, 0, 0, 0)[0]
                         to_val = self.converter.pix_to_world(to_pix-1, 0, 0, 0)[0]
-                    interval_val = abs(self.interval_pix * self.wcs.wcs.cdelt[0])
+                    interval_val = abs(self.interval_pix * axis_step(self.wcs, 0))
                     axis_type = self.converter.get_axis_types()[0]
                 # If conversion is successful, update text fields with world values.
                 self.from_edit.setText(str(from_val))
                 self.to_edit.setText(str(to_val))
-                self.interval_edit.setText(str(self.converter.format_world_coordinate(interval_val, axis_type)))
+                self.interval_edit.setText(str(self._format_world_interval(interval_val, axis_type)))
                 self.interval_edit.setCursorPosition(0)
                 
             except Exception as e:
@@ -3998,7 +4028,7 @@ class ChannelMapSettingPanel(QDialog):
                         from_val = self.converter.world_to_pix(self.origin_xval, self.origin_yval, from_world, 0)[2] + 1
                         to_val = self.converter.world_to_pix(self.origin_xval, self.origin_yval, to_world, 0)[2] + 1
                     axis_type = self.converter.get_axis_types()[2]
-                    self.interval_pix = float(interval_val)/self.wcs.wcs.cdelt[2]
+                    self.interval_pix = float(interval_val)/axis_step(self.wcs, 2)
     
                 elif self.plane_num == 1:
                     if self.fits_viewer.data.ndim == 3:
@@ -4011,10 +4041,10 @@ class ChannelMapSettingPanel(QDialog):
                         to_val = self.converter.world_to_pix(self.origin_xval, to_world, self.origin_zval, 0)[1] + 1
                     axis_type = self.converter.get_axis_types()[1]
                     if self.fits_viewer.config_manager.config.get('decimal'):
-                        self.interval_pix = float(interval_val)/self.wcs.wcs.cdelt[1]
+                        self.interval_pix = float(interval_val)/axis_step(self.wcs, 1)
                     else:
                         interval_val = Angle(interval_val, unit=u.deg).degree
-                        self.interval_pix = float(interval_val)/self.wcs.wcs.cdelt[1]
+                        self.interval_pix = float(interval_val)/axis_step(self.wcs, 1)
     
                 elif self.plane_num == 2:
                     if self.fits_viewer.data.ndim == 3:
@@ -4029,7 +4059,7 @@ class ChannelMapSettingPanel(QDialog):
                     
                     axis_type = self.converter.get_axis_types()[0]
                     if self.fits_viewer.config_manager.config.get('decimal'):
-                        self.interval_pix = float(interval_val)/self.wcs.wcs.cdelt[0]
+                        self.interval_pix = float(interval_val)/axis_step(self.wcs, 0)
                     else:
                         # --- Non-Decimal (HMS/DMS) Handling ---
                         interval_val_deg = None # Initialize degree value
@@ -4057,9 +4087,9 @@ class ChannelMapSettingPanel(QDialog):
                                  raise ValueError(f"Invalid degree format for interval '{interval_text}': {e}") from e
 
                         # Calculate pixel interval using the correctly parsed degree value
-                        if self.wcs.wcs.cdelt[0] == 0:
+                        if axis_step(self.wcs, 0) == 0:
                              raise ValueError("CDELT for X-axis is zero, cannot calculate pixel interval.")
-                        self.interval_pix = float(interval_val_deg) / self.wcs.wcs.cdelt[0]
+                        self.interval_pix = float(interval_val_deg) / axis_step(self.wcs, 0)
                         
                 self.from_edit.setText(str(round(float(from_val), 2)))
                 self.to_edit.setText(str(round(float(to_val), 2)))
@@ -4086,6 +4116,7 @@ class ChannelMapSettingPanel(QDialog):
             self.worldch_num = 1
         self.ch_radio.blockSignals(False)
         self.val_radio.blockSignals(False)
+        self._mark_spectral_range_fields()
 
     def set_mode_num(self, num, is_checked=None):
         """Set mode number based on selected mode radio button."""
@@ -4418,7 +4449,7 @@ class ChannelMapSettingPanel(QDialog):
         if mode == "integrate":
             try:
                 wcs_axis = 2 - axis
-                cdelt = abs(self.wcs.wcs.cdelt[wcs_axis])
+                cdelt = abs(axis_step(self.wcs, wcs_axis))
                 images = [img * cdelt for img in images]
             except Exception:
                 pass
@@ -4580,7 +4611,7 @@ class ChannelMapSettingPanel(QDialog):
             
             wcs_axis = 2 - axis # 0->2, 1->1, 2->0.
             try:
-                cdelt = abs(self.wcs.wcs.cdelt[wcs_axis])
+                cdelt = abs(axis_step(self.wcs, wcs_axis))
                 images = [img * cdelt for img in images]
             except:
                 pass

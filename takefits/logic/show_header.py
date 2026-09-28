@@ -29,6 +29,17 @@ class ShowHeader(QMainWindow):
         self.setWindowTitle(title)
 
 
+    def refresh(self):
+        """Draw the header again: the parent window's current header, at the same scroll position."""
+        header = getattr(self.parent(), 'header', None)
+        if header is not None:
+            self.header = header  # undo / redo replace the window's header object
+        bars = [self.textBrowser.verticalScrollBar(), self.textBrowser.horizontalScrollBar()]
+        positions = [bar.value() for bar in bars]
+        self.textBrowser.setHtml(self.buildHeaderHTML())
+        for bar, position in zip(bars, positions):
+            bar.setValue(position)
+
     def buildHeaderHTML(self):
         # Get the application instance to access the palette
         app = QApplication.instance()

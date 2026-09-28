@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Any, Optional, Tuple
 
-import numpy as np
+from takefits.core.spectral_units import header_axis_step
 
 
 def beam_pixel_geometry(header: Any) -> Optional[Tuple[float, float, float]]:
@@ -48,17 +48,13 @@ def beam_pixel_geometry(header: Any) -> Optional[Tuple[float, float, float]]:
         return None
 
     try:
-        cdelt1 = abs(float(header['CDELT1']))
-        cdelt2 = abs(float(header['CDELT2']))
+        # CDELT, or the CD matrix (whose omitted off-diagonal terms are 0)
+        step1, step2 = header_axis_step(header, 1), header_axis_step(header, 2)
     except Exception:
-        # Coordinates defined by a CD matrix; derive the axis scales from it.
-        try:
-            cdelt1 = float(np.hypot(header['CD1_1'], header['CD2_1']))
-            cdelt2 = float(np.hypot(header['CD1_2'], header['CD2_2']))
-        except Exception:
-            return None
-    if not cdelt1 or not cdelt2:
         return None
+    if not step1 or not step2:
+        return None
+    cdelt1, cdelt2 = abs(step1), abs(step2)
 
     return bmaj / cdelt1, bmin / cdelt2, bpa
 

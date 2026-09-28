@@ -261,7 +261,11 @@ class CubeArithmeticPanel(QWidget):
             from takefits.core.io.fits import load_fits
             import os
             try:
-                data, header, _, _ = load_fits(path, compute_wcs=False)
+                # B opens in the mode A was opened with, so the channels line up.
+                mode = (getattr(self.fits_viewer, "spectral_metadata", None) or {}).get("spectral_axis_mode") or {}
+                data, header, _, _ = load_fits(
+                    path, compute_wcs=False, frequency_axis=mode.get("frequency_axis", "velocity")
+                )
                 
                 self.variables["B"] = {"data": data, "header": header, "name": os.path.basename(path)}
                 self.variables["B"]["path"] = path

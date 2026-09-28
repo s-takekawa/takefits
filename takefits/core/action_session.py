@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from takefits.core.actions import ActionRegistry
+from takefits.core.actions import ActionRegistry, canonical_action_name
 from takefits.core.app_state import AppState
 
 _USE_CURRENT_STATE = object()
@@ -45,7 +45,7 @@ class ActionRecord:
         timestamp = str(payload.get("timestamp") or _utc_timestamp())
         tag = payload.get("tag")
         return cls(
-            action=str(action),
+            action=str(canonical_action_name(str(action))),  # a former name reads as the current one
             params=dict(params),
             timestamp=timestamp,
             tag=str(tag) if tag is not None else None,
@@ -154,6 +154,7 @@ class ActionSession:
             entries = loaded
         else:
             raise ValueError("History file must be a list or an object with 'history'")
+        entries = self._entries_in_current_spectral_unit(entries, loaded)
 
         records = [ActionRecord.from_dict(entry) for entry in entries]
 
@@ -187,6 +188,32 @@ class ActionSession:
 
         self._cursor = len(self.history)
         return list(self.history)
+
+    def _entries_in_current_spectral_unit(self, entries: Any, document: Any) -> Any:
+        """Spectral numbers of saved actions in the display unit of this session's cube.
+
+        A history records the unit it was written in (TF-415 slice A); one
+        from before that record is read in the old units (Hz / m on frequency
+        and wavelength axes).
+        """
+        from takefits.core.spectral_records import document_spectral_unit, rescale_history_entries
+        from takefits.core.spectral_units import spectral_wcs_axis, stored_spectral_factor
+
+        state = self._initial_state_seed if self._initial_state_seed is not None else self.state
+        wcs = getattr(state, "wcs", None)
+        if wcs is None or not isinstance(entries, list):
+            return entries
+        metadata = getattr(state, "spectral_metadata", None)
+        factor = stored_spectral_factor(document_spectral_unit(document), wcs, metadata)
+        if factor is None or factor == 1.0:
+            return entries
+        axis = spectral_wcs_axis(wcs, metadata)
+        return rescale_history_entries(entries, factor, 2 if axis is None else axis)
+
+    def ensure_initial_state_seed(self) -> None:
+        """Take a deferred undo seed now, before a caller changes the state in place and records it."""
+        if not self._initial_seed_set and self.state is not None:
+            self.set_initial_state_seed()
 
     def set_initial_state_seed(self, state: Any = _USE_CURRENT_STATE) -> None:
         source = self.state if state is _USE_CURRENT_STATE else state
@@ -253,7 +280,7 @@ class ActionSession:
             self.remove_record_by_tag(tag)
         self.history.append(
             ActionRecord(
-                action=name,
+                action=str(canonical_action_name(name)),
                 params=dict(params),
                 timestamp=_utc_timestamp(),
                 tag=tag,

@@ -22,6 +22,8 @@ from PySide6.QtWidgets import (
 )
 
 from takefits.core.coordinate import CoordinateConverter
+from takefits.core.spectral_units import header_axis_step, spectral_wcs_axis, viewer_display_wcs
+from takefits.ui.spectral_fields import mark_spectral_field
 from takefits.core.region import CircleRegion, EllipseRegion, RectangleRegion
 from takefits.ui.widget_sizing import fit_button_to_text
 from takefits.core.wcs_frames import (
@@ -57,9 +59,10 @@ class BaselinePanel(BaseToolPanel):
         self.y = 0
         self.z = 0
         self.active_region = None
-        self.spec_axis = int(getattr(fits_viewer.wcs.wcs, "spec", 2))
+        spec_axis = spectral_wcs_axis(fits_viewer.wcs, getattr(fits_viewer, "spectral_metadata", None))
+        self.spec_axis = 2 if spec_axis is None else spec_axis  # 'VEL' and 'VELOCITY' too
         self.velocity_values = self._spectral_world_values_for_viewer(fits_viewer, self.spec_axis)
-        self.converter = CoordinateConverter(fits_viewer.wcs, fits_viewer.displaymap.config)
+        self.converter = CoordinateConverter(viewer_display_wcs(fits_viewer), fits_viewer.displaymap.config)
 
         self._range_patches = []
         self._drag_preview_patch = None
@@ -313,7 +316,7 @@ class BaselinePanel(BaseToolPanel):
         try:
             axis_id = int(spec_axis) + 1
             crval = float(fits_viewer.header[f"CRVAL{axis_id}"])
-            cdelt = float(fits_viewer.header[f"CDELT{axis_id}"])
+            cdelt = float(header_axis_step(fits_viewer.header, axis_id))  # CDELTn or CDn_n
             crpix = float(fits_viewer.header[f"CRPIX{axis_id}"])
             return crval + (np.arange(n_channels, dtype=float) - (crpix - 1.0)) * cdelt
         except Exception:
@@ -390,6 +393,7 @@ class BaselinePanel(BaseToolPanel):
         row_layout.addWidget(to_label)
 
         max_edit = QLineEdit(str(max_text), row_widget)
+        mark_spectral_field(min_edit, max_edit)
         max_edit.setPlaceholderText("max world")
         max_edit.setFixedWidth(int(getattr(self, "_range_field_width", 92)))
         max_edit.editingFinished.connect(self._on_ranges_edited)
@@ -876,8 +880,21 @@ class BaselinePanel(BaseToolPanel):
         self._sync_coordinate_context()
         self.update_spectrum(self.x, self.y, self.z)
 
+    def refresh_spectral_axis(self):
+        """Re-read the spectral axis after it moved in place (a rest-frequency change or its undo).
+
+        The fitting windows keep their numbers (world ranges are not remapped).
+        """
+        self._sync_coordinate_context()
+        values = self._spectral_world_values_for_viewer(self.fits_viewer, self.spec_axis)
+        if np.array_equal(np.asarray(values, dtype=float), np.asarray(self.velocity_values, dtype=float)):
+            return
+        self.velocity_values = values
+        self.update_spectrum(self.x, self.y, self.z)
+        self._render_range_overlays()
+
     def _sync_coordinate_context(self):
-        wcs = getattr(self.fits_viewer, "wcs", None)
+        wcs = viewer_display_wcs(self.fits_viewer)
         if wcs is not None:
             self.converter.wcs = wcs
         displaymap = getattr(self.fits_viewer, "displaymap", None)
@@ -1068,7 +1085,11 @@ class BaselinePanel(BaseToolPanel):
         if region_spec is None:
             return None, "Unsupported region shape"
 
-        state = SimpleNamespace(data=cube, wcs=self.fits_viewer.wcs)
+        state = SimpleNamespace(
+            data=cube,
+            wcs=self.fits_viewer.wcs,
+            spectral_metadata=getattr(self.fits_viewer, "spectral_metadata", None),
+        )
         try:
             velocity, spectrum, _unit = get_averaged_spectrum(state, region_spec)
             if update_velocity and velocity is not None:

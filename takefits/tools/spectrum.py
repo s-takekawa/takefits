@@ -12,6 +12,8 @@ import os
 
 
 from takefits.core.coordinate import CoordinateConverter
+from takefits.core.spectral_units import header_axis_step, spectral_wcs_axis, viewer_display_wcs
+from takefits.ui.spectral_fields import mark_spectral_field
 from takefits.core.wcs_frames import (
     normalize_display_frame,
     plane_values_for_display,
@@ -42,7 +44,7 @@ class SpecWindow(QWidget):
         self.fits_viewer = fits_viewer
         self.wcs = self.fits_viewer.wcs
         self.config = self.fits_viewer.displaymap.config
-        self.converter = CoordinateConverter(self.wcs, self.config)
+        self.converter = CoordinateConverter(viewer_display_wcs(self.fits_viewer), self.config)
 
         # Initialize coordinates
         self.x = 0
@@ -66,15 +68,13 @@ class SpecWindow(QWidget):
 
         self.auto_y_axis = True
         self.last_update_time = 0
-        self.spec_axis = self.wcs.wcs.spec
+        # wcslib's spectral axis, else the viewer's ('VEL', 'VELOCITY')
+        spec_axis = spectral_wcs_axis(self.wcs, getattr(self.fits_viewer, "spectral_metadata", None))
+        self.spec_axis = 2 if spec_axis is None else spec_axis
         
         
-        n_channels = self.fits_viewer.header[f'NAXIS{self.spec_axis + 1}']
-        crval = self.fits_viewer.header[f'CRVAL{self.spec_axis + 1}']
-        cdelt = self.fits_viewer.header[f'CDELT{self.spec_axis + 1}'] 
-        crpix = self.fits_viewer.header[f'CRPIX{self.spec_axis + 1}'] 
-        self.velocity_values = crval + (np.arange(n_channels) - (crpix - 1)) * cdelt
-        
+        self.velocity_values = self._header_spectral_values()
+
         self.is_dragging = False
         #self.pick_radius = 5  # pixels within which a click is considered 'on the line'
         self.active_region = None
@@ -127,7 +127,7 @@ class SpecWindow(QWidget):
         config = getattr(displaymap, "config", None)
         if isinstance(config, dict):
             self.config = config
-        self.converter.wcs = self.wcs
+        self.converter.wcs = viewer_display_wcs(self.fits_viewer)
         self.converter.config = self.config
 
     def _format_title_world_coordinates(self, world_native):
@@ -218,7 +218,7 @@ class SpecWindow(QWidget):
 
         self.setLayout(layout)
         self.fig = plt.figure()
-        self.ax = self.fig.add_subplot(111, projection=self.fits_viewer.wcs, slices=self.slices)
+        self.ax = self.fig.add_subplot(111, projection=viewer_display_wcs(self.fits_viewer), slices=self.slices)
         self.ax.callbacks.connect("xlim_changed", self._on_fit_xlim_changed)
 
         self.canvas = FigureCanvas(self.fig)
@@ -240,14 +240,15 @@ class SpecWindow(QWidget):
         self.x_min_input = QLineEdit(str(self.initial_x_range[0]))
         self.x_min_input.setFixedWidth(60)
         range_layout.addWidget(self.x_min_input, 0, 1)
-        self.x_min_input.setText(f"{np.nanmin(self.velocity_values):.4g}")
+        self.x_min_input.setText(self._spectral_range_text(np.nanmin(self.velocity_values)))
     
         range_layout.addWidget(QLabel("to"), 0, 2)
     
         self.x_max_input = QLineEdit(str(self.initial_x_range[1]))
         self.x_max_input.setFixedWidth(60)
         range_layout.addWidget(self.x_max_input, 0, 3)
-        self.x_max_input.setText(f"{np.nanmax(self.velocity_values):.4g}")
+        self.x_max_input.setText(self._spectral_range_text(np.nanmax(self.velocity_values)))
+        mark_spectral_field(self.x_min_input, self.x_max_input)
 
         vline1 = QFrame()
         vline1.setFrameShape(QFrame.Shape.VLine)
@@ -923,6 +924,54 @@ class SpecWindow(QWidget):
         self.last_update_time = 0
         self.update_spectrum(self.x, self.y, self.z)
 
+    def _spectral_range_text(self, value) -> str:
+        """A spectral range-box number: 4 significant digits, more where 4 cannot tell channels apart.
+
+        The boxes are read back to set the view, so a value such as -13806.7 km/s
+        on 1.3 km/s channels (a re-referenced line) or a frequency in Hz needs
+        more digits than 4; '.4g' kept it 10 km/s off.
+        """
+        value = float(value)
+        digits = 4
+        velocity = np.asarray(self.velocity_values, dtype=float).reshape(-1)
+        if velocity.size > 1 and np.isfinite(value) and value != 0.0:
+            step = float(np.nanmedian(np.abs(np.diff(velocity))))
+            if np.isfinite(step) and step > 0:
+                digits = max(4, int(np.ceil(np.log10(abs(value) / step))) + 2)
+        return f"{value:.{min(digits, 15)}g}"
+
+    def _header_spectral_values(self):
+        """World values of the spectral channels, from the header (display unit)."""
+        header = self.fits_viewer.header
+        axis_number = self.spec_axis + 1
+        n_channels = header[f'NAXIS{axis_number}']
+        crval = header[f'CRVAL{axis_number}']
+        cdelt = header_axis_step(header, axis_number)  # CDELTn or CDn_n
+        crpix = header[f'CRPIX{axis_number}']
+        return crval + (np.arange(n_channels) - (crpix - 1)) * cdelt
+
+    def refresh_spectral_axis(self):
+        """Re-read the spectral axis after it moved in place (a rest-frequency change or its undo).
+
+        The plotted channels stay; the range boxes and a shown fit take the
+        new world values.
+        """
+        self._sync_coordinate_context()
+        try:
+            values = self._header_spectral_values()
+        except Exception:
+            return
+        if np.array_equal(np.asarray(values, dtype=float), np.asarray(self.velocity_values, dtype=float)):
+            return
+        self.velocity_values = values
+        try:
+            self.update_range_textboxes()
+        except Exception:
+            pass
+        if self.fit_result is not None and self.fit_status_label.toPlainText():
+            self.fit_status_label.setPlainText(self._format_fit_status(self.fit_result))
+        self.canvas.draw_idle()
+
     def update_spectrum(self, x, y, z):
         current_time = time.time()
         if current_time - self.last_update_time < 0.01:
@@ -1079,8 +1128,8 @@ class SpecWindow(QWidget):
             v_min = self.converter.pix_to_world(self.x, self.y, x_min, 0)[2]
             v_max = self.converter.pix_to_world(self.x, self.y, x_max, 0)[2]
 
-        self.x_min_input.setText(f"{float(v_min):.4g}")
-        self.x_max_input.setText(f"{float(v_max):.4g}")
+        self.x_min_input.setText(self._spectral_range_text(v_min))
+        self.x_max_input.setText(self._spectral_range_text(v_max))
         self.y_min_input.setText(f"{y_min:.4g}")
         self.y_max_input.setText(f"{y_max:.4g}")
 

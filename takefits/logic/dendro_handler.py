@@ -8,6 +8,7 @@ import warnings
 
 from takefits.logic.progress import OperationCancelled, ProgressReporter
 from takefits.logic.data_tools import _get_total_ram_bytes
+from takefits.core.spectral_units import header_axis_step
 
 _ASTRODENDRO_BOOL_PATCHED = False
 _SCIMES_RAM_FRACTION = 0.35
@@ -255,8 +256,8 @@ class DendroHandler:
                     metadata['spatial_scale'] = avg_scale
                 else:
                     metadata['spatial_scale'] = float(avg_scale) * u.deg
-            elif self.header and 'CDELT2' in self.header:
-                metadata['spatial_scale'] = abs(float(self.header['CDELT2'])) * u.deg
+            elif self.header and header_axis_step(self.header, 2) is not None:
+                metadata['spatial_scale'] = abs(header_axis_step(self.header, 2)) * u.deg
             else:
                 metadata['spatial_scale'] = None
 

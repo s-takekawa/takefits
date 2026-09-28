@@ -1,5 +1,8 @@
 from PySide6.QtWidgets import QWidget, QGridLayout, QLineEdit, QPushButton, QLabel, QMessageBox
 from PySide6.QtCore import Qt
+from takefits.core.spectral_records import document_spectral_unit, rescale_range_payload
+from takefits.core.spectral_units import stored_spectral_factor, viewer_display_wcs
+from takefits.ui.spectral_fields import mark_spectral_field
 from takefits.core.range_files import (
     build_range_payload,
     build_coordinate_mismatch_message,
@@ -20,7 +23,8 @@ class RangeControlPanel(QWidget):
         self.subwindows = subwindows
         self.decimal = self.fits_viewer.decimal
         self.number_decimals = self.fits_viewer.number_decimals
-        self.wcs = self.fits_viewer.wcs
+        # z ranges are typed and shown in the display unit
+        self.wcs = viewer_display_wcs(self.fits_viewer)
         self.coord_wrap = self.fits_viewer.coord_wrap
         
         self.original_xlim = self.fits_viewer.ax.get_xlim()
@@ -94,6 +98,7 @@ class RangeControlPanel(QWidget):
             self.z_max_input.setPlaceholderText("Z max")
             self.z_max_input.setFixedWidth(100)
             self.z_max_input.returnPressed.connect(self.set_z_range)
+            mark_spectral_field(self.z_min_input, self.z_max_input)
             self.z_button = QPushButton('Set Z', self)
             fit_button_to_text(self.z_button)
             self.z_button.clicked.connect(self.set_z_range)
@@ -270,7 +275,7 @@ class RangeControlPanel(QWidget):
                 descriptor = None
             if isinstance(descriptor, dict):
                 source = {}
-                for key in ('filepath', 'filename', 'wcs_signature'):
+                for key in ('filepath', 'filename', 'wcs_signature', 'spectral_axis'):
                     value = descriptor.get(key)
                     if value not in (None, '', {}):
                         source[key] = value
@@ -516,6 +521,23 @@ class RangeControlPanel(QWidget):
         if self.fits_viewer.data.ndim > 2 and zlim is not None and hasattr(self, 'z_min_input'):
             self._set_z_anchor(self.z_min_input.text())
 
+    def _payload_in_current_spectral_unit(self, payload):
+        """The saved z range in this cube's display unit.
+
+        The file records the unit of its numbers; one without that record is
+        read in the old units (Hz / m on frequency and wavelength axes).
+        Different kinds of unit are left to the coordinate check below.
+        """
+        wcs = getattr(self.fits_viewer, 'wcs', None)
+        if wcs is None or int(getattr(self.fits_viewer.data, 'ndim', 0) or 0) < 3:
+            return payload
+        factor = stored_spectral_factor(
+            document_spectral_unit(payload), wcs, getattr(self.fits_viewer, 'spectral_metadata', None)
+        )
+        if factor is None or factor == 1.0:
+            return payload
+        return rescale_range_payload(payload, factor)
+
     def load_range_button_pressed(self):
         range_path = self._get_range_file_path()
         if not range_path:
@@ -531,6 +553,7 @@ class RangeControlPanel(QWidget):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, 'Failed to Load Range', f'Could not load range file:\n{exc}')
             return
+        payload = self._payload_in_current_spectral_unit(payload)
 
         current_signature = self._current_wcs_signature()
         compatible, _reason = evaluate_range_payload_compatibility(

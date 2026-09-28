@@ -13,6 +13,8 @@ from PySide6.QtCore import QObject, Signal as pyqtSignal, Qt
 
 
 
+from .spectral_records import document_spectral_unit, rescale_marker_entry
+from .spectral_units import SPECTRAL_UNIT_KEY, spectral_unit_tag, stored_spectral_factor, viewer_display_wcs
 from .marker import (
     Marker,
     MarkerId,
@@ -414,7 +416,7 @@ class MarkerManager(QObject):
             if layer is None:
                 continue
             viewer = self._viewer_for_plane(plane_id)
-            wcs = getattr(viewer, "wcs", None)
+            wcs = viewer_display_wcs(viewer)
             frame_name = _frame_name_from_wcs(wcs)
             if frame_name:
                 layer.world_frame = frame_name
@@ -486,7 +488,7 @@ class MarkerManager(QObject):
         states = layer.states()
         viewer = self._viewer_for_plane(plane)
         format_pix = getattr(viewer, "format_pix", None) if viewer else None
-        wcs = getattr(viewer, "wcs", None) if viewer else None
+        wcs = viewer_display_wcs(viewer) if viewer else None
 
         # Attach world endpoints for lines so orientation survives frame changes on load.
         if format_pix is not None and wcs is not None:
@@ -509,15 +511,54 @@ class MarkerManager(QObject):
                 except Exception:
                     continue
 
-        return serialize_marker_states(states, plane=layer.plane, world_frame=world_frame)
+        payload = serialize_marker_states(states, plane=layer.plane, world_frame=world_frame)
+        unit = self._spectral_unit_of(viewer)
+        if unit:
+            payload[SPECTRAL_UNIT_KEY] = unit  # unit of the spectral member of XZ / ZY world pairs
+        return payload
+
+    @staticmethod
+    def _spectral_unit_of(viewer) -> str:
+        wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        if wcs is None:
+            return ""
+        try:
+            return spectral_unit_tag(wcs, getattr(viewer, "spectral_metadata", None))
+        except Exception:
+            return ""
+
+    def _payload_in_current_spectral_unit(self, payload: Dict[str, object], *, from_file: bool) -> Dict[str, object]:
+        """Marker world pairs in the host cube's display unit (TF-415 slice A).
+
+        A payload that records its unit is converted from it; an unrecorded one
+        only when it was read from a file (then in the old units), since payloads
+        built in this session are already in the display unit.
+        """
+        viewer = self.viewer
+        wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        markers = payload.get("markers") if isinstance(payload, dict) else None
+        if wcs is None or not isinstance(markers, list):
+            return payload
+        stored_unit = document_spectral_unit(payload)
+        if stored_unit is None and not from_file:
+            return payload
+        factor = stored_spectral_factor(stored_unit, wcs, getattr(viewer, "spectral_metadata", None))
+        if factor is None or factor == 1.0:
+            return payload
+        result = dict(payload)
+        result["markers"] = [rescale_marker_entry(entry, factor) for entry in markers]
+        return result
 
     def import_from_dict(
         self,
         payload: Dict[str, object],
         *,
         clear_existing: bool = True,
+        from_file: bool = False,
     ) -> PlaneId:
-        plane, world_frame, states = deserialize_marker_states(payload)
+        plane, world_frame, states = deserialize_marker_states(
+            self._payload_in_current_spectral_unit(payload, from_file=from_file)
+        )
         remapper = getattr(self.viewer, "remap_loaded_marker_state", None)
         host_viewer = self.viewer
 
@@ -599,7 +640,7 @@ class MarkerManager(QObject):
                 defaults = self._shared_world_defaults(target_plane)
 
                 viewer = self._viewer_for_plane(target_plane)
-                target_wcs = getattr(viewer, "wcs", None)
+                target_wcs = viewer_display_wcs(viewer)
                 converter = getattr(viewer, "converter", None)
                 axis_indices = self._plane_axis_indices(target_plane, target_wcs)
                 # If line markers carry world endpoints, re-derive geometry in target frame.
@@ -749,7 +790,7 @@ class MarkerManager(QObject):
         if layer is not None and layer.world_frame:
             return layer.world_frame
         viewer = self._viewer_for_plane(plane)
-        wcs = getattr(viewer, "wcs", None)
+        wcs = viewer_display_wcs(viewer)
         frame = _frame_name_from_wcs(wcs)
         if layer is not None and frame:
             layer.world_frame = frame
@@ -1471,7 +1512,7 @@ class MarkerManager(QObject):
         layer = self._layers.get(plane)
         if layer is None:
             return
-        wcs = getattr(viewer, "wcs", None)
+        wcs = viewer_display_wcs(viewer)
         frame_name = _frame_name_from_wcs(wcs)
         if frame_name and not layer.world_frame:
             layer.world_frame = frame_name
@@ -1503,7 +1544,7 @@ class MarkerManager(QObject):
                     return (wx, wy)
 
         format_pix = getattr(viewer, "format_pix", None)
-        wcs = getattr(viewer, "wcs", None)
+        wcs = viewer_display_wcs(viewer)
         if format_pix is None or wcs is None:
             return None
         base_plane = self._base_plane_for(plane)
@@ -1634,7 +1675,7 @@ class MarkerManager(QObject):
         viewer = self._viewer_for_plane(plane)
         if viewer is None:
             return None
-        wcs = getattr(viewer, "wcs", None)
+        wcs = viewer_display_wcs(viewer)
         if wcs is None:
             return None
         base_plane = self._base_plane_for(plane)

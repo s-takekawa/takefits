@@ -7,6 +7,7 @@ import numpy as np
 
 from takefits.core.app_state import AppState
 from takefits.logic.data_tools import materialize_elementwise_inputs
+from takefits.core.spectral_units import header_axis_step, rest_frequency_hz
 
 
 IntensityUnit = Literal["jy/beam", "k", "jy/pix"]
@@ -71,10 +72,11 @@ def convert_intensity_unit(
         return (np.pi * bmaj_rad * bmin_rad) / (4.0 * np.log(2.0))
 
     def get_pixel_area_sr():
-        if 'CDELT1' not in header or 'CDELT2' not in header:
-            raise ValueError("CDELT1 and CDELT2 required in header for Jy/pix conversion")
-        cdelt1_rad = np.deg2rad(float(header['CDELT1']))
-        cdelt2_rad = np.deg2rad(float(header['CDELT2']))
+        step1, step2 = header_axis_step(header, 1), header_axis_step(header, 2)
+        if step1 is None or step2 is None:
+            raise ValueError("CDELT1/CDELT2 (or a CD matrix) required in header for Jy/pix conversion")
+        cdelt1_rad = np.deg2rad(step1)
+        cdelt2_rad = np.deg2rad(step2)
         return np.abs(cdelt1_rad * cdelt2_rad)
 
     def get_freq_axis_hz():
@@ -87,8 +89,8 @@ def convert_intensity_unit(
                 spec_axis_num = i
                 break
 
-        if 'RESTFRQ' in header:
-            restfreq_hz = float(header['RESTFRQ'])
+        restfreq_hz = rest_frequency_hz(None, header)  # RESTFRQ, RESTFREQ or RESTWAV
+        if restfreq_hz is not None:
             if spec_axis_num == -1 or naxis < 3:
                 return restfreq_hz
 
@@ -97,7 +99,7 @@ def convert_intensity_unit(
                 return restfreq_hz
 
             crval = header.get(f'CRVAL{spec_axis_num}', 0)
-            cdelt = header.get(f'CDELT{spec_axis_num}', 1)
+            cdelt = header_axis_step(header, spec_axis_num) or 1
             crpix = header.get(f'CRPIX{spec_axis_num}', 1)
             axis_values = (np.arange(n_channels) - (crpix - 1)) * cdelt + crval
 
@@ -121,7 +123,7 @@ def convert_intensity_unit(
             if n_channels <= 1:
                 return crval * factor
 
-            cdelt = header.get(f'CDELT{spec_axis_num}', 1)
+            cdelt = header_axis_step(header, spec_axis_num) or 1
             crpix = header.get(f'CRPIX{spec_axis_num}', 1)
             freqs = (np.arange(n_channels) - (crpix - 1)) * cdelt + crval
             return freqs * factor

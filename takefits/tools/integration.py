@@ -11,6 +11,8 @@ from PySide6.QtWidgets import QWidget, QMainWindow, QDialog, QGridLayout, QGroup
 from PySide6.QtCore import Qt, QTimer, QSignalBlocker
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
 from takefits.core.coordinate import CoordinateConverter
+from takefits.core.spectral_units import display_numbers_unit, display_wcs, viewer_display_wcs
+from takefits.ui.spectral_fields import mark_spectral_field
 from takefits.core.region_manager import RegionManager
 from takefits.core.contour_manager import ContourManager, ContourItem
 from takefits.core.marker_manager import MarkerManager
@@ -24,7 +26,6 @@ from takefits.core.colorbar_layout import compute_colorbar_geometry, orientation
 from takefits.core.click_label_layout import compute_click_label_geometry
 from takefits.core.fonts import resolve_mpl_font_family
 from takefits.logic.add_hpbw import AddHPBW
-from astropy.io import fits
 from takefits.core.usecases import compute_moment, export_moment_fits, AppState
 from takefits.core.app_state import MarkerSpec, RegionSpec, create_app_state
 from takefits.core.action_session import ActionSession
@@ -100,7 +101,8 @@ def _resolve_plain_axis_unit(fits_viewer, subwindows, wcs, axis_to_drop):
     candidates = []
     if axis_index == 2:
         spectral_meta = getattr(fits_viewer, "spectral_metadata", None) or {}
-        candidates.append(spectral_meta.get("current_axis_unit"))
+        # the unit of the integrated numbers (Hz, not a GHz display label)
+        candidates.append(display_numbers_unit(wcs, spectral_meta))
 
     if header is not None and header_axis > 0:
         candidates.append(header.get(f"CUNIT{header_axis}"))
@@ -144,7 +146,7 @@ class IntegSettingsPanel(QDialog):
         self.initUI()
         
     def initUI(self):
-        self.converter = CoordinateConverter(self.wcs, self.fits_viewer.config_manager.config)
+        self.converter = CoordinateConverter(viewer_display_wcs(self.fits_viewer), self.fits_viewer.config_manager.config)
     
         layout = QGridLayout()
         layout.setHorizontalSpacing(3)
@@ -232,6 +234,7 @@ class IntegSettingsPanel(QDialog):
         self.z_max_input.setPlaceholderText("Z max")
         self.z_min_input.setFixedWidth(90)
         self.z_max_input.setFixedWidth(90)
+        mark_spectral_field(self.z_min_input, self.z_max_input)
 
 
         layout.addWidget(self.z_radio, 2, 0, 1, 1)
@@ -1096,7 +1099,7 @@ class IntegResultWindow(QMainWindow):
         self.integ_mode = mode
         self.config = config
         self.history_metadata = history_metadata
-        self.converter = CoordinateConverter(self.wcs, config)
+        self.converter = CoordinateConverter(self._display_wcs(), config)
         self.decimal =  config.get('decimal')
         self.auto_precision_digits = bool(config.get('auto_precision_digits', True))
         self.number_decimals = config.get('number_decimals')
@@ -1221,7 +1224,8 @@ class IntegResultWindow(QMainWindow):
         collapsed_axes = [idx for idx, role in enumerate(roles) if role == 'collapsed']
         axis_mapping = self._compute_cutout_axis_mapping()
         if dialog is None:
-            header = self.wcs.to_header()
+            shown_wcs = self._display_wcs()
+            header = shown_wcs.to_header()
             header['NAXIS'] = self.integrated_data.ndim
             for axis, size in enumerate(reversed(self.integrated_data.shape), start=1):
                 header[f'NAXIS{axis}'] = size
@@ -1234,7 +1238,7 @@ class IntegResultWindow(QMainWindow):
                 self,
                 data_override=self.integrated_data,
                 header_override=header,
-                wcs_override=self.wcs,
+                wcs_override=shown_wcs,
                 dialog_title=f"Cut Out ({self.windowTitle()})",
                 collapsed_axes=collapsed_axes,
                 wcs_to_data_axis=axis_mapping,
@@ -1517,13 +1521,13 @@ class IntegResultWindow(QMainWindow):
         header = getattr(self.fits_viewer, "header", None)
         if header is None and self.wcs is not None:
             try:
-                header = self.wcs.to_header()
+                header = self._display_wcs().to_header()
             except Exception:
                 header = {}
         controller = DisplayMap(
             self.integrated_data,
             header or {},
-            self.wcs,
+            self._display_wcs(),
             self.config,
             defer_colorbar=True,
         )
@@ -1642,10 +1646,10 @@ class IntegResultWindow(QMainWindow):
         self.canvas = FigureCanvas(self.fig)
         self._overlay_updates_enabled = True
 
-        self.ax = self.fig.add_subplot(111, projection=self.fits_viewer.wcs, slices=self.integ_slice)
+        self.ax = self.fig.add_subplot(111, projection=viewer_display_wcs(self.fits_viewer), slices=self.integ_slice)
         self.resize(config.get('figure_width'), config.get('figure_height'))
         self.format_pix = Format_pix_to_wcs(
-            self.wcs,
+            self._display_wcs(),
             self.integ_slice,
             self.ax,
             self.plane,
@@ -1886,6 +1890,7 @@ class IntegResultWindow(QMainWindow):
             self.z_max_int_input.setPlaceholderText("Z max value")
             self.z_max_int_input.setFixedWidth(80)
             self.z_max_int_input.returnPressed.connect(self.set_z_range)
+            mark_spectral_field(self.z_min_int_input, self.z_max_int_input)
             self.z_int_button = QPushButton('Set Z', self)
             self.z_int_button.clicked.connect(self.set_z_range)
         
@@ -2324,12 +2329,17 @@ class IntegResultWindow(QMainWindow):
         return []
 
     # Annotation ActionSession bridge ---------------------------------------
+    def _display_wcs(self):
+        """This result's WCS with spectral numbers in the display unit (plots and read-outs)."""
+        return display_wcs(self.wcs, getattr(self.fits_viewer, "spectral_metadata", None))
+
     def _setup_marker_action_bridge(self):
         data = np.asarray(self.integrated_data)
         header = None
-        if self.wcs is not None:
+        shown_wcs = self._display_wcs()
+        if shown_wcs is not None:
             try:
-                header = self.wcs.to_header()
+                header = shown_wcs.to_header()
                 header["NAXIS"] = int(data.ndim)
                 for axis, size in enumerate(reversed(data.shape), start=1):
                     header[f"NAXIS{axis}"] = int(size)
@@ -2344,7 +2354,7 @@ class IntegResultWindow(QMainWindow):
         self.app_state = create_app_state(
             data=data,
             header=header,
-            wcs=self.wcs,
+            wcs=shown_wcs,
             filepath=getattr(self, "filename", None),
         )
         registry = ActionRegistry()
@@ -4956,47 +4966,6 @@ class IntegResultWindow(QMainWindow):
              print(f"Error saving FITS: {e}")
 
         
-    def reorder_fits_header(self, header):
-        preferred_order = [
-            'SIMPLE', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2', 'NAXIS3', 'NAXIS4', 'EXTEND',
-            'BSCALE', 'BZERO',
-    
-            'BMAJ', 'BMIN', 'BPA', 'BTYPE', 'OBJECT', 'BUNIT', 'RADESYS',
-            'LONPOLE', 'LATPOLE', 'TELESCOP', 'INSTRUME', 'OBSERVER',
-            'DATE-OBS', 'DATE', 'TIMESYS', 'OBSRA', 'OBSDEC',
-            'OBSGEO-X', 'OBSGEO-Y', 'OBSGEO-Z', 'SPECSYS', 'RESTFRQ', 
-            'VELREF', 'ALTRVAL', 'ALTRPIX',
-    
-            'CTYPE1', 'CRVAL1', 'CDELT1', 'CRPIX1', 'CUNIT1', 'CROTA1',
-            'CTYPE2', 'CRVAL2', 'CDELT2', 'CRPIX2', 'CUNIT2', 'CROTA2',
-            'CTYPE3', 'CRVAL3', 'CDELT3', 'CRPIX3', 'CUNIT3', 'CROTA3',
-            'CTYPE4', 'CRVAL4', 'CDELT4', 'CRPIX4', 'CUNIT4', 'CROTA4',
-    
-            'PC1_1', 'PC2_1', 'PC3_1', 'PC4_1',
-            'PC1_2', 'PC2_2', 'PC3_2', 'PC4_2', 
-            'PC1_3', 'PC2_3', 'PC3_3', 'PC4_3',
-            'PC1_4', 'PC2_4', 'PC3_4', 'PC4_4',
-        ]
-
-        new_header = fits.Header()
-    
-        for key in preferred_order:
-            if key in header:
-                try:
-                    value = header[key]
-                    new_header[key] = value
-                except ValueError:
-                    print(f"Skipping invalid key-value pair: {key} -> {value}")
-    
-        for key, value in header.items():
-            if key not in new_header:
-                try:
-                    new_header[key] = value
-                except ValueError:
-                    print(f"Skipping invalid key-value pair: {key} -> {value}")
-    
-        return new_header
-
     def _compose_identity_title(self) -> str:
         """Build "<FITS N> · <descriptive> — <parent fits>" for this result."""
         descriptive = str(getattr(self, "_descriptive_window_title", "") or "").strip()

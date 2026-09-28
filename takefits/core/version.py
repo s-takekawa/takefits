@@ -1,5 +1,5 @@
 APP_NAME = "Takefits"
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 APP_BUILD_SUFFIX = ""
 
 # Keep the package version stable while making dev builds obvious in UI/CLI text.

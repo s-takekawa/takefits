@@ -206,6 +206,10 @@ def build_default_config():
             'number_decimals': 6,       # Number of decimals to display
             'coord_wrap': 180,        # Coordinate wrap
         
+            # How cubes with a frequency axis open: 'velocity' (radio, when a
+            # rest frequency is given) or 'frequency' (TF-415).
+            'spectral_axis_frequency': 'velocity',
+
             # Scroll speed setting
             'scrollspeed': 0.1,         # Speed of scrolling
             'invert_wheel_direction': False,  # Reverse mouse wheel channel direction

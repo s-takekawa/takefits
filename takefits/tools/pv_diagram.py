@@ -18,6 +18,16 @@ from takefits.tools.color_scale import ColorSettingsPanel, ColorMode
 from takefits.tools.pv_polyline import PolylinePathInteraction
 from takefits.core.contour_manager import ContourManager, ContourItem
 from takefits.core.coordinate import CoordinateConverter
+from takefits.core.spectral_records import document_spectral_unit, rescale_named_values
+from takefits.ui.spectral_fields import mark_spectral_field
+from takefits.core.spectral_units import (
+    SPECTRAL_UNIT_KEY,
+    axis_step,
+    spectral_sub_wcs,
+    spectral_unit_tag,
+    stored_spectral_factor,
+    viewer_display_wcs,
+)
 from takefits.core.wcs_frames import (
     build_native_world_vector,
     native_celestial_frame,
@@ -177,7 +187,9 @@ class PVdiagram(QMainWindow):
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.fits_viewer = fits_viewer
-        self.wcs = self.fits_viewer.wcs
+        # The PV window plots and reads velocities in the display unit; the
+        # use cases it calls take the viewer's AppState (live WCS) instead.
+        self.wcs = viewer_display_wcs(self.fits_viewer)
         if self.fits_viewer.data.ndim == 3:
             self.data = self.fits_viewer.data
         elif self.fits_viewer.data.ndim == 4:
@@ -376,8 +388,8 @@ class PVdiagram(QMainWindow):
 
                 # If that fails or it's not a celestial WCS, try reading CDELT keywords
                 if self.pixel_scale_deg is None and self.wcs.wcs.cdelt is not None:
-                    cdelt1 = abs(self.wcs.wcs.cdelt[0])
-                    cdelt2 = abs(self.wcs.wcs.cdelt[1])
+                    cdelt1 = abs(axis_step(self.wcs, 0))
+                    cdelt2 = abs(axis_step(self.wcs, 1))
 
                     # Convert unit object to string before comparing
                     unit_str = str(self.wcs.wcs.cunit[0]).lower()
@@ -503,6 +515,7 @@ class PVdiagram(QMainWindow):
         self.vel_label = QLabel('V:')
         self.vel_min_input = QLineEdit(self)
         self.vel_max_input = QLineEdit(self)
+        mark_spectral_field(self.vel_min_input, self.vel_max_input)
         self.vel_button = QPushButton('Set V')
 
         self.vel_min_input.setFixedWidth(80)
@@ -970,7 +983,10 @@ class PVdiagram(QMainWindow):
         markerColors = ["None", "blue", "red", "green", "cyan", "magenta", "black", "white", "gray", "orange", "purple", "yellow", "olive"]
         self.markerColorCombo.addItems(markerColors)
         self.markerColorCombo.setCurrentText(self.pvmarker_color)
-        self.markerColorCombo.currentTextChanged.connect(lambda new_color: setattr(self, "pvmarker_color", new_color))
+        # A bound method, not a lambda: this combo has no Qt parent, so a
+        # lambda capturing self would keep a closed PV window (and its FITS
+        # window) alive.
+        self.markerColorCombo.currentTextChanged.connect(self._on_marker_color_changed)
         #arrow_control_layout.addRow("Marker Color:", self.markerColorCombo)
 
         self.arrowSizeSpin = QDoubleSpinBox()
@@ -2550,6 +2566,9 @@ class PVdiagram(QMainWindow):
         else:
             self.fits_canvas.draw_idle()
 
+    def _on_marker_color_changed(self, new_color):
+        self.pvmarker_color = new_color
+
     def _on_slit_color_changed(self, new_color):
         """Apply slit color changes to existing slit artists immediately."""
         self.pvarrow_color = new_color
@@ -3343,7 +3362,30 @@ class PVdiagram(QMainWindow):
             "world_frame": self._current_path_world_frame(),
             "wcs_ctype": self._wcs_values_for_path_recipe("ctype"),
             "wcs_cunit": self._wcs_values_for_path_recipe("cunit"),
+            # unit of geometry.spectral_world (display unit; wcs_cunit is the SI label)
+            SPECTRAL_UNIT_KEY: self._path_recipe_spectral_unit(),
         }
+
+    def _path_recipe_spectral_unit(self):
+        wcs = getattr(self.fits_viewer, "wcs", None)
+        if wcs is None:
+            return ""
+        try:
+            return spectral_unit_tag(wcs, getattr(self.fits_viewer, "spectral_metadata", None))
+        except Exception:
+            return ""
+
+    def _path_recipe_in_current_spectral_unit(self, recipe):
+        """The recipe's spectral_world values in this cube's display unit (TF-415 slice A)."""
+        wcs = getattr(self.fits_viewer, "wcs", None)
+        if wcs is None or not isinstance(recipe, dict):
+            return recipe
+        factor = stored_spectral_factor(
+            document_spectral_unit(recipe), wcs, getattr(self.fits_viewer, "spectral_metadata", None)
+        )
+        if factor is None or factor == 1.0:
+            return recipe
+        return rescale_named_values(recipe, ("spectral_world",), factor)
 
     def _build_straight_path_recipe_from_state(self, workspace_state):
         if not isinstance(workspace_state, dict):
@@ -4133,7 +4175,7 @@ class PVdiagram(QMainWindow):
 
         try:
             with open(path, "r", encoding="utf-8") as handle:
-                recipe = json.load(handle)
+                recipe = self._path_recipe_in_current_spectral_unit(json.load(handle))
             state = self._workspace_state_from_path_recipe(recipe)
             if not self._confirm_path_recipe_load_warnings(self._path_recipe_load_warnings(state)):
                 return
@@ -6286,20 +6328,27 @@ class PVdiagram(QMainWindow):
                 self.update_range_inputs()
                 return
 
-            if vel_min_val >= vel_max_val:
-                print("Warning: Velocity Min value must be less than Max value.")
+            if vel_min_val == vel_max_val:
+                print("Warning: Velocity Min and Max values must differ.")
                 # Restore previous valid values from plot
                 self.update_range_inputs()
                 return
+
+            # Either order is accepted (the inputs show the plotted order,
+            # descending on velocity-decreasing cubes); the velocity axis
+            # keeps its direction.
+            shown = self.pv_ax.get_xlim() if self.swapAxesCheck.isChecked() else self.pv_ax.get_ylim()
+            vel_lo, vel_hi = sorted((vel_min_val, vel_max_val))
+            vel_limits = (vel_hi, vel_lo) if shown[0] > shown[1] else (vel_lo, vel_hi)
 
             # Apply based on axis swap state
             pos_limits = self._display_position_limits((pos_min_val, pos_max_val))
             if self.swapAxesCheck.isChecked():
                 self.pv_ax.set_ylim(*pos_limits) # Position on Y axis
-                self.pv_ax.set_xlim(vel_min_val, vel_max_val) # Velocity on X axis
+                self.pv_ax.set_xlim(*vel_limits) # Velocity on X axis
             else:
                 self.pv_ax.set_xlim(*pos_limits) # Position on X axis
-                self.pv_ax.set_ylim(vel_min_val, vel_max_val) # Velocity on Y axis
+                self.pv_ax.set_ylim(*vel_limits) # Velocity on Y axis
 
             self.is_range_manual = True # Mark that range was set manually
             self.pv_canvas.draw_idle()
@@ -6598,7 +6647,9 @@ class PVdiagram(QMainWindow):
         # leave the current axes/range controls untouched.  It is still a
         # successful refresh (and therefore safe to export), not a stale result.
         if np.all(np.isnan(pv)):
-            self.pv_im.set_data(pv)
+            # The displayed array is what Save PV FITS writes, so keep it in
+            # the swapped layout even though the axes stay untouched.
+            self.pv_im.set_data(np.transpose(pv) if self.swapAxesCheck.isChecked() else pv)
             self._sync_open_pv_color_panel_data()
             self._refresh_contours()
             self.pv_canvas.draw()
@@ -6618,14 +6669,14 @@ class PVdiagram(QMainWindow):
                  vel_label = v_xz.state.ax_coord[1].get_axislabel()
         except Exception:
             pass
-        if self.wcs and self.wcs.wcs.naxis >= 3:
-            wcs_spec = self.wcs.sub(['spectral'])
+        wcs_spec = self._spectral_sub_wcs() if self.wcs and self.wcs.wcs.naxis >= 3 else None
+        if wcs_spec is not None:
             v_coords = wcs_spec.wcs_pix2world(np.arange(n_vel), 0)[0]
             if n_vel > 1:
                 dv = v_coords[1] - v_coords[0]
             else:
                 spec_axis_index = next((i for i, ct in enumerate(self.wcs.wcs.ctype) if 'VEL' in ct.upper() or 'VRAD' in ct.upper() or 'VOPT' in ct.upper() or 'FREQ' in ct.upper()), -1)
-                dv = self.wcs.wcs.cdelt[spec_axis_index] if spec_axis_index != -1 else 1
+                dv = axis_step(self.wcs, spec_axis_index) if spec_axis_index != -1 else 1
             y_min, y_max = v_coords[0] - dv / 2.0, v_coords[-1] + dv / 2.0
         else:
             y_min, y_max = -0.5, n_vel - 0.5
@@ -6733,12 +6784,16 @@ class PVdiagram(QMainWindow):
         self.pv_canvas.flush_events()
         return True
 
+    def _spectral_sub_wcs(self):
+        """The 1-D spectral WCS, also for 'VEL' and 'VELOCITY' axes (the viewer's axis)."""
+        return spectral_sub_wcs(self.wcs, getattr(self.fits_viewer, "spectral_metadata", None))
+
     def get_channel_from_velocity(self, velocity_coord):
         """Convert velocity coordinate from PV diagram to channel index."""
         if self.wcs and self.wcs.wcs.naxis >= 3:
             try:
                 # Use the spectral part of the WCS for conversion
-                spec_wcs = self.wcs.sub(['spectral'])
+                spec_wcs = self._spectral_sub_wcs()
                 # The input is already in world coordinates (e.g., km/s), so we convert it to pixel
                 channel_pix = np.atleast_1d(spec_wcs.world_to_pixel_values(velocity_coord))
                 return int(round(channel_pix[0]))
@@ -6752,7 +6807,7 @@ class PVdiagram(QMainWindow):
         if self.wcs and self.wcs.wcs.naxis >= 3:
             try:
                 # Use the spectral part of the WCS for conversion
-                spec_wcs = self.wcs.sub(['spectral'])
+                spec_wcs = self._spectral_sub_wcs()
                 # Convert channel index (pixel) to velocity (world)
                 velocity_coord = spec_wcs.pixel_to_world_values(channel)
 
@@ -7303,7 +7358,7 @@ class PVdiagram(QMainWindow):
         except Exception:
             zpix = 0.0
         try:
-            spectral_wcs = self.wcs.sub(["spectral"])
+            spectral_wcs = self._spectral_sub_wcs()
             world = spectral_wcs.wcs_pix2world([zpix], 0)
             return float(np.atleast_1d(world)[0])
         except Exception:

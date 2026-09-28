@@ -8,6 +8,7 @@ import math
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.core.spectral_units import axis_step, display_wcs
 from takefits.logic.data_tools import ensure_operation_memory_budget, sanitize_slice
 from .utils import axis_world_to_pixel
 
@@ -126,7 +127,7 @@ def compute_channel_map(
         raise ValueError(f"Expected 3D data cube, got {data.ndim}D")
 
     n_channels = data.shape[axis]
-    wcs = state.wcs
+    wcs = display_wcs(state.wcs, getattr(state, "spectral_metadata", None))
 
     # Convert world coordinates to pixel if provided
     if start_world is not None or end_world is not None:
@@ -149,7 +150,7 @@ def compute_channel_map(
 
         # Convert interval from world to pixel if specified
         if interval_world is not None:
-            cdelt = abs(wcs.wcs.cdelt[wcs_axis])
+            cdelt = abs(axis_step(wcs, wcs_axis))
             interval = abs(interval_world) / cdelt
 
     # Ensure we have valid logical channel range
@@ -362,7 +363,7 @@ def channel_labels_to_world(
     if state.wcs is None:
         return [(f"{f:.1f}", f"{c:.1f}", f"{t:.1f}") for f, c, t in labels]
 
-    wcs = state.wcs
+    wcs = display_wcs(state.wcs, getattr(state, "spectral_metadata", None))
     world_labels = []
 
     for from_pix, center_pix, to_pix in labels:

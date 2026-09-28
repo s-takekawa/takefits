@@ -16,6 +16,23 @@ from takefits.core.annotation_serialization import (
     snapshot_region_specs,
 )
 from takefits.core.history_provenance import build_processing_history_lines_with_action
+from takefits.core.spectral_open import (
+    preferred_frequency_axis,
+    recorded_frequency_axis,
+    workspace_frequency_axis,
+)
+from takefits.core.spectral_records import document_spectral_unit, rescale_workspace_state
+from takefits.core.spectral_units import (
+    SPECTRAL_UNIT_KEY,
+    display_wcs,
+    refresh_display_wcs,
+    scale_spectral_value,
+    spectral_unit_tag,
+    spectral_wcs_axis,
+    stored_spectral_factor,
+    wcs_numbers,
+)
+from takefits.ui.spectral_fields import is_spectral_field
 from takefits.core.workspace_restore import (
     build_workspace_restore_diagnostics,
     build_workspace_restore_status_line,
@@ -28,6 +45,7 @@ from takefits.core.workspace_restore import (
 from PySide6.QtWidgets import (
     QApplication,
     QMessageBox,
+    QDialog,
     QFileDialog,
     QInputDialog,
     QWidget,
@@ -44,7 +62,7 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QToolTip,
 )
-from PySide6.QtCore import QThread, QTimer, QSignalBlocker, QEvent, Qt
+from PySide6.QtCore import QObject, QThread, QTimer, QSignalBlocker, QEvent, Qt
 from PySide6.QtGui import QCursor, QGuiApplication
 import base64
 import io
@@ -63,6 +81,46 @@ from takefits.core.wcs_frames import frame_is_available, normalize_display_frame
 
 
 _AUTO_UPDATE_CHECK_STARTED_PROPERTY = "takefits_auto_update_check_started"
+_DETACHED_UPDATE_CHECKS: set = set()
+
+
+class _DetachedUpdateCheck(QObject):
+    """An update check still running when the window that started it closed.
+
+    Qt aborts when a running QThread is destroyed, and the closed window is
+    deleted with its children, so the unparented thread is kept here until it
+    finishes. Its result goes to a window that is still open. This object
+    lives on the GUI thread, so its slots run there (a plain function
+    connected to the worker would run on the worker thread).
+    """
+
+    def __init__(self, thread, worker, manual):
+        super().__init__()
+        self._thread = thread
+        self._worker = worker
+        self._manual = manual
+        self._finished = False
+        _DETACHED_UPDATE_CHECKS.add(self)
+        worker.finished.connect(self._deliver)
+        thread.finished.connect(self._finalize)
+        if thread.isFinished():
+            self._finalize()
+
+    def _deliver(self, latest):
+        for window in WindowRegistry.instance().windows():
+            if not getattr(window, "_is_app_closing", False):
+                window._on_update_check_finished(latest, manual=self._manual)
+                return
+
+    def _finalize(self):
+        if self._finished:
+            return
+        self._finished = True
+        self._worker.deleteLater()
+        self._thread.deleteLater()
+        # Drop the last reference once this slot has returned: Qt must not
+        # delete an object while it is handling an event.
+        QTimer.singleShot(0, lambda: _DETACHED_UPDATE_CHECKS.discard(self))
 
 
 class MainWindow(FITSViewer):
@@ -103,7 +161,6 @@ class MainWindow(FITSViewer):
         super().__init__(data, header, wcs, filename, spectral_metadata)
         self.data = data
         self.header = header
-        self.wcs = wcs
         self._browse_first_startup = bool(self.is_large_data_mode())
         
         self.plane = plane
@@ -874,6 +931,89 @@ class MainWindow(FITSViewer):
         self.app_state.data = self.data if data is None else data
         self.app_state.header = self.header if header is None else header
         self.app_state.wcs = self.wcs if wcs is None else wcs
+        # Actions run on the state change the viewers' metadata dict (the rest frequency).
+        if isinstance(getattr(self, 'spectral_metadata', None), dict):
+            self.app_state.spectral_metadata = self.spectral_metadata
+
+    def _sync_display_wcs_of(self, viewer):
+        """Write the viewer's current WCS numbers into the display WCS its plots and read-outs hold.
+
+        WCSAxes keeps the WCS it was built with; a rest-frequency change, or an
+        undo that brings back another WCS with the same structure, moves only
+        numbers, so the plots follow without being rebuilt.
+        """
+        displaymap = getattr(viewer, "displaymap", None)
+        shown = refresh_display_wcs(
+            getattr(viewer, "wcs", None),
+            getattr(viewer, "spectral_metadata", None),
+            previous=getattr(displaymap, "wcs", None),
+        )
+        if shown is None:
+            return
+        if getattr(viewer, "converter", None) is not None:
+            viewer.converter.wcs = shown
+        if getattr(viewer, "format_pix", None) is not None:
+            viewer.format_pix.wcs = shown
+
+    def _display_wcs_numbers(self):
+        """The numbers of the display WCS the main plot holds, to tell whether a sync moved them."""
+        try:
+            return wcs_numbers(getattr(getattr(self, "displaymap", None), "wcs", None))
+        except Exception:
+            return None
+
+    def _refresh_spectral_view_ranges(self):
+        """Re-express the XZ/ZY range boxes in the moved spectral axis; the views keep their channels."""
+        for viewer in [self] + list(getattr(self, "subwindows", []) or []):
+            cache = getattr(viewer, "_full_world_limits", None) if viewer is not None else None
+            if isinstance(cache, dict):
+                cache.clear()
+        if int(getattr(getattr(self, "data", None), "ndim", 0) or 0) < 3:
+            return
+        for plane in ("xz", "zy"):
+            viewer = self._viewer_for_plane(plane)
+            ax = getattr(viewer, "ax", None) if viewer is not None else None
+            if ax is None:
+                continue
+            try:
+                self.update_ranges(plane, ax.get_xlim(), ax.get_ylim())
+            except Exception:
+                pass
+
+    def refresh_spectral_axis_views(self, numbers_before=None):
+        """Re-read the spectral axis in every viewer and the spectrum/baseline windows after it moved in place.
+
+        ``numbers_before`` is :meth:`_display_wcs_numbers` from before the
+        viewers' WCS changed, when a caller synced them already.
+        """
+        if numbers_before is None:
+            numbers_before = self._display_wcs_numbers()
+        for viewer in [self] + list(getattr(self, "subwindows", []) or []):
+            if viewer is not None:
+                self._sync_display_wcs_of(viewer)
+        if self._display_wcs_numbers() != numbers_before:
+            self._refresh_spectral_view_ranges()
+        control_panel = getattr(self, "control_panel", None)
+        for name in ("spec_window", "baseline_panel"):
+            window = getattr(control_panel, name, None) if control_panel is not None else None
+            refresh = getattr(window, "refresh_spectral_axis", None)
+            if callable(refresh):
+                try:
+                    refresh()
+                except Exception:
+                    pass
+        self.refresh_header_panel()
+
+    def refresh_header_panel(self):
+        """Draw an open Show Header window again after the header changed."""
+        panel = getattr(self, "header_panel", None)
+        if panel is None:
+            return
+        try:
+            if panel.isVisible() and callable(getattr(panel, "refresh", None)):
+                panel.refresh()
+        except RuntimeError:  # the window was closed and deleted
+            self.header_panel = None
 
     def record_action(self, name, params=None, replace_tag=None):
         """Record an action in ActionSession history without re-executing it."""
@@ -1074,8 +1214,9 @@ class MainWindow(FITSViewer):
                 continue
             snapshot[key] = value
 
-        # Persist native (unwrapped/unformatted) WCS values for robust reload.
-        wcs = getattr(self, "wcs", None)
+        # Persist native (unwrapped/unformatted) WCS values for robust reload,
+        # with the spectral value in the display unit.
+        wcs = self.display_wcs() if getattr(self, "wcs", None) is not None else None
         if wcs is not None and cursor_x is not None and cursor_y is not None:
             try:
                 naxis = max(int(getattr(wcs, "naxis", 0) or 0), 2)
@@ -2657,7 +2798,11 @@ class MainWindow(FITSViewer):
         kind = str(entry.get("kind") or "").strip()
         try:
             if kind == "line_edit" and isinstance(widget, QLineEdit):
-                widget.setText(str(state.get("text") or ""))
+                text = str(state.get("text") or "")
+                factor = float(getattr(self, "_ui_state_spectral_factor", 1.0) or 1.0)
+                if factor != 1.0 and is_spectral_field(widget):
+                    text = scale_spectral_value(text, factor)
+                widget.setText(text)
                 return True
             if kind == "combo_box" and isinstance(widget, QComboBox):
                 index = state.get("index")
@@ -2931,7 +3076,43 @@ class MainWindow(FITSViewer):
             signature["celestial_family"] = "equatorial"
         elif "GLON" in axis_types and "GLAT" in axis_types:
             signature["celestial_family"] = "galactic"
+        # The unit of the spectral world numbers saved with this signature
+        # (range files, workspaces, recipes); the axis "unit" above is the
+        # WCS's SI unit, which cannot tell km/s from m/s or GHz from Hz.
+        try:
+            tag = spectral_unit_tag(wcs, getattr(self, "spectral_metadata", None))
+        except Exception:
+            tag = ""
+        if tag:
+            signature[SPECTRAL_UNIT_KEY] = tag
         return signature
+
+    def _saved_spectral_factor(self, document) -> float:
+        """Factor from a saved document's spectral numbers to this cube's display unit (1 when unknown)."""
+        wcs = getattr(self, "wcs", None)
+        if wcs is None:
+            return 1.0
+        factor = stored_spectral_factor(document_spectral_unit(document), wcs, getattr(self, "spectral_metadata", None))
+        return 1.0 if factor is None else float(factor)
+
+    def _saved_spectral_mode_note(self, document, what: str = "workspace") -> str:
+        """A notice when a workspace or recipe was saved with the frequency axis in another mode than this window's."""
+        saved = recorded_frequency_axis(document)
+        mode = (getattr(self, "spectral_metadata", None) or {}).get("spectral_axis_mode") or {}
+        current = mode.get("frequency_axis") if isinstance(mode, dict) else None
+        if not saved or not current or saved == current:
+            return ""
+        if what == "workspace":
+            remedy = "open the workspace with File > Open FITS in New Window"
+        else:
+            remedy = (
+                "reopen the cube in that mode (Preferences > General > Frequency axes open as, "
+                "or --spectral-axis) and load the recipe again"
+            )
+        return (
+            f"This {what} was saved with the frequency axis shown as {saved}; this window shows it as "
+            f"{current}, so its spectral ranges may not apply. To use the saved mode, {remedy}."
+        )
 
     def _dataset_descriptor(self) -> dict:
         filepath = str(getattr(self, "filename_path", "") or "")
@@ -2940,12 +3121,24 @@ class MainWindow(FITSViewer):
             shape = [int(v) for v in getattr(self.data, "shape", [])]
         except Exception:
             shape = []
+        app_state = getattr(self, "app_state", None)
+        spectral_metadata = dict(
+            getattr(app_state, "spectral_metadata", {}) or {}
+        )
+        selected_hdu_index = spectral_metadata.get("selected_hdu_index")
+        try:
+            selected_hdu_index = int(selected_hdu_index)
+        except (TypeError, ValueError):
+            selected_hdu_index = None
         return {
             "filepath": os.path.abspath(filepath) if filepath else "",
             "filename": os.path.basename(filepath) if filepath else str(getattr(self, "filename", "") or ""),
             "data_shape": shape,
+            "hdu_index": selected_hdu_index,
             "wcs_naxis": int(getattr(self.wcs, "naxis", 0) or 0),
             "wcs_signature": self._build_wcs_signature(getattr(self, "wcs", None)),
+            # how the spectral axis opened (TF-415 slice A); a workspace reopens this way
+            "spectral_axis": dict(spectral_metadata.get("spectral_axis_mode") or {}),
         }
 
     def _viewer_for_plane(self, plane: str):
@@ -7150,6 +7343,54 @@ class MainWindow(FITSViewer):
         finally:
             self._refresh_undo_redo_actions()
 
+    def export_moment_pipeline_dialog(self):
+        """Export one live Moment result as a validated CLI pipeline."""
+        from takefits.ui.moment_pipeline_export import (
+            MomentPipelineExportDialog,
+            format_pipeline_diagnostics,
+            save_moment_pipeline_manifest,
+            show_pipeline_saved,
+        )
+
+        windows = self._live_integration_windows()
+        if not windows:
+            QMessageBox.information(
+                self,
+                "Export Moment Pipeline",
+                "Create a Moment result window before exporting a pipeline.",
+            )
+            return None
+
+        def save(request):
+            return save_moment_pipeline_manifest(
+                self,
+                request.result_window,
+                manifest_path=request.manifest_path,
+                fits_path=request.fits_path,
+                image_path=request.image_path,
+            )
+
+        # The dialog saves before closing, so a rejected export keeps it open.
+        dialog = MomentPipelineExportDialog(
+            self,
+            windows,
+            source_path=str(getattr(self, "filename_path", "") or ""),
+            save_handler=save,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.save_result is None:
+            return None
+        request = dialog.request()
+        result = dialog.save_result
+        diagnostic_text = format_pipeline_diagnostics(result.diagnostics)
+
+        outputs = [path for path in (request.fits_path, request.image_path) if path]
+        detail = "\n".join(f"- {path}" for path in outputs)
+        message = f"Saved pipeline manifest:\n{result.path}\n\nPipeline outputs:\n{detail}"
+        if diagnostic_text:
+            message += f"\n\nDiagnostics:\n{diagnostic_text}"
+        show_pipeline_saved(self, result.path, message)
+        return result
+
     def save_workspace_dialog(self):
         if not hasattr(self, "action_session") or self.action_session is None:
             return
@@ -7280,12 +7521,15 @@ class MainWindow(FITSViewer):
             move_delta = (0, 0)
         return move_delta
 
-    def open_path_in_new_window(self, path: str, *, main_only: bool = False):
+    def open_path_in_new_window(self, path: str, *, main_only: bool = False, frequency_axis: str | None = None):
         """Load a FITS (or workspace) file into a new, independent MainWindow.
 
         ``main_only`` (used when launching several FITS at once) stows the tool
         and range panels so the comparison view stays uncluttered -- just the
         main viewers, side by side.
+
+        ``frequency_axis`` (the launch option) overrides the Preferences for
+        how a frequency axis opens; a workspace opens as it was saved.
         """
         from takefits.main import (
             is_workspace_file,
@@ -7309,8 +7553,15 @@ class MainWindow(FITSViewer):
         # Banner first so the WCS notices from load_fits are grouped under the
         # file they belong to (matters when opening several FITS).
         print_fits_loading_banner(fits_path)
+        if workspace_path:
+            if frequency_axis:
+                print("\033[93mThe workspace opens in the spectral-axis mode it was saved with; "
+                      "--spectral-axis is ignored for it.\033[0m")
+            frequency_axis = workspace_frequency_axis(workspace_path)
+        elif not frequency_axis:
+            frequency_axis = preferred_frequency_axis(getattr(getattr(self, "config_manager", None), "config", None))
         try:
-            data, header, wcs, spectral_metadata = load_fits(fits_path)
+            data, header, wcs, spectral_metadata = load_fits(fits_path, frequency_axis=frequency_axis)
         except Exception as exc:
             QMessageBox.critical(
                 self, "Open in New Window", f"Failed to open FITS file:\n{exc}"
@@ -7451,6 +7702,14 @@ class MainWindow(FITSViewer):
             return
         self._flush_pending_annotation_commits()
         try:
+            spectral_mode_note = self._saved_spectral_mode_note(
+                json.loads(Path(path).read_text(encoding="utf-8")), "recipe"
+            )
+        except Exception:
+            spectral_mode_note = ""
+        if spectral_mode_note:
+            print(f"\033[93m{spectral_mode_note}\033[0m")
+        try:
             self.action_session.load_history(path, replay=True, replace=True)
             apply_grid_state = any(
                 str(getattr(record, "action", "") or "") == "set_coordinate_grid"
@@ -7468,6 +7727,7 @@ class MainWindow(FITSViewer):
                     f"Loaded recipe with {len(self.action_session.history)} action(s).\n"
                     f"Restored windows: Integration={restored.get('integration', 0)}, "
                     f"Channel Map={restored.get('channel_map', 0)}"
+                    + (f"\n\n{spectral_mode_note}" if spectral_mode_note else "")
                 ),
             )
         except Exception as exc:
@@ -7538,6 +7798,17 @@ class MainWindow(FITSViewer):
         has_wcs_signature = bool(diagnostics.get("has_wcs_signature", False))
         self._log_workspace_restore_diagnostics(diagnostics)
         workspace_state = payload.get("workspace_state") if isinstance(payload.get("workspace_state"), dict) else {}
+        # Spectral world numbers of the workspace in this cube's display unit
+        # (the history converts itself in load_history; TF-415 slice A).
+        spectral_factor = self._saved_spectral_factor(payload)
+        spectral_mode_note = self._saved_spectral_mode_note(payload, "workspace")
+        if spectral_mode_note:
+            print(f"\033[93m{spectral_mode_note}\033[0m")
+        if spectral_factor != 1.0:
+            spectral_axis = spectral_wcs_axis(getattr(self, "wcs", None), getattr(self, "spectral_metadata", None))
+            workspace_state = rescale_workspace_state(
+                workspace_state, spectral_factor, 2 if spectral_axis is None else spectral_axis
+            )
         colorbar_state = workspace_state.get("colorbar_state")
         saved_display_frame = workspace_state.get("wcs_display_frame")
         saved_decimal = workspace_state.get("wcs_decimal")
@@ -7591,7 +7862,11 @@ class MainWindow(FITSViewer):
                 workspace_state.get("geometry_state"),
                 allow_window_axis_limits=same_dataset,
             )
-            restored_ui_widgets = self._restore_workspace_ui_state(workspace_state.get("ui_state"))
+            self._ui_state_spectral_factor = spectral_factor
+            try:
+                restored_ui_widgets = self._restore_workspace_ui_state(workspace_state.get("ui_state"))
+            finally:
+                self._ui_state_spectral_factor = 1.0
             self._restore_window_sync_state(workspace_state.get("window_sync"))
             # Workspace display state is authoritative over any visual actions
             # found in the replayed recipe history. The sibling key preserves
@@ -7657,6 +7932,7 @@ class MainWindow(FITSViewer):
                         f"Baseline={'yes' if restored_baseline else 'no'}, "
                         f"Clump={'yes' if restored_clump else 'no'}, "
                         f"UIWidgets={restored_ui_widgets}"
+                        + (f"\n\n{spectral_mode_note}" if spectral_mode_note else "")
                     ),
                 )
             self.set_workspace_save_path(path)
@@ -8068,10 +8344,19 @@ class MainWindow(FITSViewer):
             return
         self._suspend_action_recording = True
         try:
+            display_numbers_before = self._display_wcs_numbers()
             self.app_state = state
             self.data = state.data
             self.header = state.header
             self.wcs = state.wcs
+            # The replayed metadata (a copy of the undo seed) goes into the dict the
+            # viewers and open panels share, which the state then uses again.
+            state_metadata = getattr(state, "spectral_metadata", None)
+            shared_metadata = getattr(self, "spectral_metadata", None)
+            if isinstance(state_metadata, dict) and isinstance(shared_metadata, dict):
+                if state_metadata is not shared_metadata:
+                    shared_metadata.update(state_metadata)
+                state.spectral_metadata = shared_metadata
 
             viewers = [self] + list(getattr(self, "subwindows", []))
             for viewer in viewers:
@@ -8080,13 +8365,11 @@ class MainWindow(FITSViewer):
                 viewer.data = state.data
                 viewer.header = state.header
                 viewer.wcs = state.wcs
-                if hasattr(viewer, "converter") and viewer.converter is not None:
-                    viewer.converter.wcs = state.wcs
-                if hasattr(viewer, "format_pix") and viewer.format_pix is not None:
-                    viewer.format_pix.wcs = state.wcs
+                self._sync_display_wcs_of(viewer)
                 if hasattr(viewer, "update_cube"):
                     viewer.update_cube()
                 self._sync_hpbw_overlay_with_current_header(viewer)
+            self.refresh_spectral_axis_views(numbers_before=display_numbers_before)
 
             def _safe_int(value, default=0):
                 try:
@@ -8095,7 +8378,10 @@ class MainWindow(FITSViewer):
                     return int(default)
 
             preferred = dict(preferred_cursor) if isinstance(preferred_cursor, dict) else {}
-            world_mapped = self._cursor_world_to_pixel_snapshot(preferred, getattr(state, "wcs", None))
+            world_mapped = self._cursor_world_to_pixel_snapshot(
+                preferred,
+                display_wcs(getattr(state, "wcs", None), getattr(state, "spectral_metadata", None) or self.spectral_metadata),
+            )
             if isinstance(world_mapped, dict):
                 for key, value in world_mapped.items():
                     current = preferred.get(key)
@@ -8612,6 +8898,56 @@ class MainWindow(FITSViewer):
             if "last_result" in session_attrs:
                 session_attrs["last_result"] = None
 
+    def _delete_closed_window_objects(self, related_windows=()):
+        """Delete the Qt side of this closed window and of its family.
+
+        Lambdas and partials connected to the window's own actions, buttons
+        and toolbars capture the window, and only the C++ connection holds
+        them: a cycle that Python's gc cannot see, so closing alone never
+        frees the window. Deleting the C++ objects drops those connections,
+        and the Python objects are then collected. The XZ/ZY subwindows and
+        the panels are separate top-level widgets with the same kind of cycle.
+        """
+        windows = [self]
+        windows.extend(getattr(self, "subwindows", []) or [])
+        windows.extend(related_windows or ())
+        seen = set()
+        for window in windows:
+            if window is None or id(window) in seen:
+                continue
+            seen.add(id(window))
+            try:
+                window.deleteLater()
+            except (AttributeError, RuntimeError):
+                # Not a QObject, or already deleted (WA_DeleteOnClose).
+                pass
+
+    def _detach_running_update_check(self):
+        """Keep a running update check alive past this window's deletion."""
+        thread = getattr(self, "_update_check_thread", None)
+        worker = getattr(self, "_update_check_worker", None)
+        try:
+            running = thread is not None and thread.isRunning()
+        except RuntimeError:
+            running = False
+        if not running or worker is None:
+            return
+
+        for signal, slot in (
+            (worker.finished, self._on_update_check_finished),
+            (thread.finished, self._cleanup_update_check_thread),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        thread.setParent(None)
+        self._update_check_thread = None
+        self._update_check_worker = None
+        _DetachedUpdateCheck(
+            thread, worker, bool(getattr(self, "_update_check_manual", False))
+        )
+
     def _defer_close_for_running_regrid(self, event) -> bool:
         """Keep the document alive while its non-cancellable regrid job runs."""
         thread = getattr(self, "_regrid_thread", None)
@@ -8737,8 +9073,8 @@ class MainWindow(FITSViewer):
             except Exception:
                 pass
         self.dispose_heavy_data(related_data_holders)
-        # The Qt/Python wrapper can still be pinned by signal-to-lambda
-        # connections, but cube/memmap ownership is explicitly detached above.
+        self._detach_running_update_check()
+        self._delete_closed_window_objects(related_data_holders)
         if app is not None and is_last_window:
             print("\n\nProgram exited.")
             app.quit()
@@ -8841,7 +9177,7 @@ class MainWindow(FITSViewer):
                 if getattr(window, "plane", "").lower() != "xy":
                     continue
                 if hasattr(window, "region_manager"):
-                    window.region_manager.import_regions_from_dict(payload, clear_existing=True)
+                    window.region_manager.import_regions_from_dict(payload, clear_existing=True, from_file=True)
             except Exception:
                 continue
 
@@ -8940,7 +9276,8 @@ class MainWindow(FITSViewer):
                     message += f" Skipped {skipped} unsupported {noun}."
                 QMessageBox.information(self, "Regions", message)
             else:
-                self.region_manager.import_regions_from_dict(payload, clear_existing=True)
+                # a file without a unit record is in the old units
+                self.region_manager.import_regions_from_dict(payload, clear_existing=True, from_file=True)
                 self._enable_region_mode_after_import()
                 self._load_regions_into_open_xy_windows_from_dict(payload)
                 QMessageBox.information(self, "Regions", "Regions loaded.")
@@ -9128,12 +9465,13 @@ class MainWindow(FITSViewer):
         self._update_check_thread.finished.connect(self._cleanup_update_check_thread)
         self._update_check_thread.start()
 
-    def _on_update_check_finished(self, latest):
+    def _on_update_check_finished(self, latest, manual=None):
         from takefits.core.version import APP_VERSION
         from takefits.logic import update_check
         from takefits.ui.update_dialog import UpdateAvailableDialog
 
-        manual = self._update_check_manual
+        if manual is None:
+            manual = self._update_check_manual
         state_path = self._update_check_state_path()
         state = update_check.mark_checked(state_path)
 

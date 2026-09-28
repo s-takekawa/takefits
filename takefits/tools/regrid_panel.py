@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from takefits.core.spectral_units import axis_step, classify_axis_type, viewer_display_wcs
+from takefits.ui.spectral_fields import mark_spectral_field
 from takefits.tools.base_panel import confirm_pending_close
 
 
@@ -33,7 +35,8 @@ class RegridPanel(QWidget):
     def __init__(self, fits_viewer):
         super().__init__()
         self.fits_viewer = fits_viewer
-        self.wcs = fits_viewer.wcs
+        # Rows show the grid in the display unit (km/s for converted velocity axes).
+        self.wcs = viewer_display_wcs(fits_viewer)
         self.header = getattr(fits_viewer, "header", None)
 
         config_manager = getattr(fits_viewer, "config_manager", None)
@@ -136,7 +139,6 @@ class RegridPanel(QWidget):
 
         ctype_list = getattr(self.wcs.wcs, "ctype", [])
         crval_list = getattr(self.wcs.wcs, "crval", [])
-        cdelt_list = getattr(self.wcs.wcs, "cdelt", [])
         naxis = getattr(self.wcs.wcs, "naxis", len(ctype_list))
 
         axis_letters = ["X", "Y", "Z", "U", "V", "W"]
@@ -144,7 +146,7 @@ class RegridPanel(QWidget):
         for index in range(naxis):
             ctype = ctype_list[index] if index < len(ctype_list) else f"AXIS{index + 1}"
             crval = crval_list[index] if index < len(crval_list) else 0.0
-            cdelt = cdelt_list[index] if index < len(cdelt_list) else 0.0
+            cdelt = axis_step(self.wcs, index)  # CDELT or CD matrix
             abs_cdelt = abs(cdelt)
             sign = -1.0 if cdelt < 0 else 1.0
             if cdelt == 0:
@@ -176,6 +178,11 @@ class RegridPanel(QWidget):
             anchor_edit = QLineEdit()
             anchor_edit.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
             anchor_edit.setText(self._format_world_value(crval, ctype))
+            mark_spectral_field(
+                world_edit,
+                anchor_edit,
+                on=classify_axis_type(ctype) in ("velocity", "frequency", "wavelength"),
+            )
             manual_layout.addWidget(anchor_edit, row, 3)
 
             control = {
@@ -580,7 +587,14 @@ class RegridPanel(QWidget):
 
     # ------------------------------------------------------------------
     # Formatting helpers
+    @staticmethod
+    def _is_frequency_or_wavelength(axis_type: str) -> bool:
+        return classify_axis_type(axis_type) in ("frequency", "wavelength")
+
     def _format_world_value(self, value: float, axis_type: str) -> str:
+        if self._is_frequency_or_wavelength(axis_type):
+            # GHz / um numbers: fixed decimals would round a 488.28125 kHz channel to 488 kHz
+            return f"{value:.12g}"
         if self.decimal:
             return f"{value:.{self.number_decimals}f}"
 
@@ -601,6 +615,8 @@ class RegridPanel(QWidget):
     def _format_spacing_value(self, value: float, axis_type: str) -> str:
         if value < 0:
             value = abs(value)
+        if self._is_frequency_or_wavelength(axis_type):
+            return f"{value:.12g}"
         if self.decimal:
             return f"{value:.{self.number_decimals}f}"
 

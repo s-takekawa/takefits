@@ -160,17 +160,25 @@ def apply_arithmetic(
     """
     Apply arithmetic to state.data in-place.
 
-    If `data_b_path` is provided, data is loaded from the FITS primary HDU.
+    If `data_b_path` is provided, it is loaded through ``load_fits``, as the
+    GUI's Arithmetic panel loads it.
     """
     if state.data is None:
         raise ValueError("No data loaded")
 
     data_b = None
     if data_b_path:
-        from astropy.io import fits
+        # Through the loader, as the GUI's Arithmetic panel reads it, so a
+        # cube flipped on load (FREQ -> VRAD) lines up with state.data.
+        from takefits.core.io.fits import load_fits
 
-        with fits.open(data_b_path) as hdul:
-            data_b = hdul[0].data
+        # B opens in the mode A was opened with, so both keep the same channel order.
+        mode = (getattr(state, "spectral_metadata", None) or {}).get("spectral_axis_mode") or {}
+        data_b, _header_b, _wcs_b, _meta_b = load_fits(
+            data_b_path,
+            compute_wcs=False,
+            frequency_axis=mode.get("frequency_axis", "velocity"),
+        )
 
     state.data = compute_arithmetic(
         data_a=state.data,

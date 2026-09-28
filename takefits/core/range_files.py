@@ -63,6 +63,9 @@ def _normalize_source(source: Any) -> Dict[str, Any]:
     signature = source.get("wcs_signature")
     if isinstance(signature, dict):
         normalized["wcs_signature"] = dict(signature)
+    spectral_axis = source.get("spectral_axis")
+    if isinstance(spectral_axis, dict) and spectral_axis:
+        normalized["spectral_axis"] = dict(spectral_axis)
     return normalized
 
 

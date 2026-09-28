@@ -1,3 +1,7 @@
+import math
+import re
+import uuid
+
 import numpy as np
 from typing import Optional
 
@@ -24,6 +28,23 @@ from takefits.tools.base_panel import (
     has_action_record_tag,
     record_action_preview,
     replay_action_history_to_current_cursor,
+)
+from takefits.core.spectral_units import (
+    apply_spectral_axis,
+    canonical_velocity_unit,
+    classify_axis_type,
+    convert_axis_cards,
+    copy_wcs_numbers,
+    display_unit,
+    header_axis_step,
+    line_rest_frequency_hz,
+    refresh_alternate_reference,
+    rest_frequency_hz,
+    rest_frequency_intents,
+    set_header_axis_step,
+    spectral_wcs_axis,
+    systemic_redshift,
+    write_radio_velocity_axis,
 )
 
 class UnitConversionPanel(QWidget):
@@ -52,6 +73,11 @@ class UnitConversionPanel(QWidget):
         self.spectral_metadata = getattr(self.fits_viewer, 'spectral_metadata', {})
         self._spectral_axis_index = self.spectral_metadata.get('axis_index')
         self._conversion_action_record_tag = "panel:unit-conversion"
+        # One record per panel, so a reset never removes another panel's committed change.
+        self._rest_frequency_record_tag = f"panel:unit-conversion:restfreq:{uuid.uuid4().hex[:8]}"
+        self._rest_frequency_snapshot = None
+        self._rest_frequency_message = ""
+        self._edited_header_keys = set()
 
         self._disk_header = self._load_disk_header()
         disk_axis_info = self._extract_disk_spectral_axis_info(self._disk_header)
@@ -210,6 +236,7 @@ class UnitConversionPanel(QWidget):
         """Initialize UI widgets to allow access from multiple methods."""
         self.header_group = QGroupBox("Header Information (Freq/Beam/3rd Axis)")
         self.rf_input = QLineEdit()
+        self.z_input = QLineEdit()  # systemic redshift (TF-415 slice B)
         
         # Group for Beam Properties
         self.beam_group = QGroupBox("Beam Properties")
@@ -271,6 +298,7 @@ class UnitConversionPanel(QWidget):
         header_layout.setContentsMargins(10, 10, 10, 10)
         header_layout.setVerticalSpacing(5) # Reduce vertical spacing
         header_layout.addRow(QLabel("RestFreq (GHz):"), self.rf_input)
+        header_layout.addRow(QLabel("z (systemic):"), self.z_input)
         header_layout.addRow(QLabel("BMAJ (arcsec):"), self.bmaj_input)
         header_layout.addRow(QLabel("BMIN (arcsec):"), self.bmin_input)
         header_layout.addRow(QLabel("BPA (deg):"), self.bpa_input)
@@ -310,6 +338,7 @@ class UnitConversionPanel(QWidget):
         self.set_button.clicked.connect(self.update_header_values)
         self.reset_header_button.clicked.connect(self.reset_header_values)
         self.rf_input.returnPressed.connect(self.update_header_values)
+        self.z_input.returnPressed.connect(self.update_header_values)
         self.bmaj_input.returnPressed.connect(self.update_header_values)
         self.bmin_input.returnPressed.connect(self.update_header_values)
         self.bpa_input.returnPressed.connect(self.update_header_values)
@@ -368,7 +397,7 @@ class UnitConversionPanel(QWidget):
         
         def _check_freq_axis(header):
             """Robust check for a valid frequency axis."""
-            if 'RESTFRQ' in header:
+            if rest_frequency_hz(None, header) is not None:  # RESTFRQ, RESTFREQ or RESTWAV
                 return True
             naxis = header.get('NAXIS', 0)
             for i in range(1, naxis + 1):
@@ -383,7 +412,7 @@ class UnitConversionPanel(QWidget):
 
         params = {
             'has_bmaj_bmin': 'BMAJ' in header and 'BMIN' in header,
-            'has_cdelt': 'CDELT1' in header and 'CDELT2' in header,
+            'has_cdelt': header_axis_step(header, 1) is not None and header_axis_step(header, 2) is not None,
             'has_freq_axis': _check_freq_axis(header)
         }
         
@@ -406,16 +435,18 @@ class UnitConversionPanel(QWidget):
             info['bmin'] = info.get('bmin', "N/A")
             info['bpa'] = info.get('bpa', "N/A")
             
+        info['z'] = f"{systemic_redshift(self.spectral_metadata):.12g}"
         try:
-            freq_hz = None
-            if 'RESTFRQ' in header:
-                freq_hz = header['RESTFRQ']
-            else:
+            # the line's own rest frequency: RESTFRQ is that / (1 + z)
+            freq_hz = line_rest_frequency_hz(None, header, self.spectral_metadata)
+            if freq_hz is None:
                 naxis = header.get('NAXIS', 0)
                 for i in range(1, naxis + 1):
                     ctype = header.get(f'CTYPE{i}', '')
                     if 'FREQ' in ctype:
-                        freq_hz = header.get(f'CRVAL{i}')
+                        # suggest the axis's first frequency, in Hz like RESTFRQ
+                        cunit = str(header.get(f'CUNIT{i}', '') or '').strip() or 'Hz'
+                        freq_hz = (float(header.get(f'CRVAL{i}')) * u.Unit(cunit)).to(u.Hz).value
                         break
                     if 'VELO' in ctype or 'VRAD' in ctype:
                         info['restfreq'] = "N/A"
@@ -449,8 +480,8 @@ class UnitConversionPanel(QWidget):
         if not self.header_params['has_cdelt']:
             return 0.0
         try:
-            cdelt1_deg = self.fits_viewer.header['CDELT1']
-            cdelt2_deg = self.fits_viewer.header['CDELT2']
+            cdelt1_deg = header_axis_step(self.fits_viewer.header, 1)  # CDELT or CD matrix
+            cdelt2_deg = header_axis_step(self.fits_viewer.header, 2)
             cdelt1_rad = np.deg2rad(cdelt1_deg)
             cdelt2_rad = np.deg2rad(cdelt2_deg)
             return np.abs(cdelt1_rad * cdelt2_rad)
@@ -465,10 +496,86 @@ class UnitConversionPanel(QWidget):
         """Populate header input fields from current info strings."""
         self.header_info_strings = self._get_header_info_strings()
         self.rf_input.setText(self.header_info_strings.get('restfreq', 'N/A'))
+        self.z_input.setText(self.header_info_strings.get('z', '0'))
         self.bmaj_input.setText(self.header_info_strings.get('bmaj', 'N/A'))
         self.bmin_input.setText(self.header_info_strings.get('bmin', 'N/A'))
         self.bpa_input.setText(self.header_info_strings.get('bpa', 'N/A'))
         self._sync_spectral_axis_ui()
+        self._sync_rest_frequency_tooltip()
+
+    def _rest_frequency_intent(self):
+        """(intent, None) for a typed rest frequency, or (None, why not).
+
+        Re-reference the velocities (keep the observed frequencies) where that
+        applies: frequency-native cubes and radio/optical velocity cubes with a
+        rest frequency.  Otherwise only the rest frequency changes.  The
+        metadata-only change of a velocity cube that has a rest frequency is
+        left to the ``set_spectral_axis`` action (intent 'metadata').
+        """
+        viewer = self.fits_viewer
+        reasons = rest_frequency_intents(getattr(viewer, 'wcs', None), viewer.header, self.spectral_metadata)
+        for intent in ('rereference', 'metadata'):
+            if reasons.get(intent) is None:
+                return intent, None
+        return None, reasons.get('metadata') or reasons.get('rereference')
+
+    def _sync_rest_frequency_tooltip(self):
+        """Say on the RestFreq field what a change will do to this cube."""
+        try:
+            intent, refusal = self._rest_frequency_intent()
+        except Exception:
+            intent, refusal = None, None
+        if intent == 'rereference':
+            text = ("Changing the rest frequency re-derives the velocity axis for the new line "
+                    "(CRVAL and the channel width); the observed frequencies stay.")
+        elif intent == 'metadata':
+            text = "Changing the rest frequency changes only RESTFRQ; the spectral axis stays as it is."
+        else:
+            text = refusal or ""
+        self.rf_input.setToolTip(text)
+        z_text = (
+            "Systemic redshift: velocities are measured from RestFreq / (1 + z), the frequency at\n"
+            "which the line from redshift z is observed (radio velocities for a frequency cube; a\n"
+            "velocity cube keeps its convention). RestFreq stays the line's own rest frequency.\n"
+            "Saved files carry RESTFRQ = RestFreq / (1 + z) and ZSOURCE = z."
+        )
+        if intent != 'rereference':
+            z_text += "\n" + (text or "")
+        z_text += "\n" + self._spectral_frame_note()
+        foreign = (self.spectral_metadata or {}).get('zsource_header') if isinstance(self.spectral_metadata, dict) else None
+        if foreign is not None:
+            z_text += f"\nThe header has ZSOURCE = {foreign}, not applied."
+        self.z_input.setToolTip(z_text.strip())
+
+    def _spectral_frame_note(self) -> str:
+        """The cube's spectral frame, and what it means for the z typed in.
+
+        z is applied in the frame of the cube's frequencies, so a z measured in
+        another frame shifts the zero point.  The frame comes from SPECSYS,
+        from wcslib (AIPS 'FREQ-LSR' / 'VELO-HEL' CTYPEs), or from the AIPS
+        VELREF (1 LSR, 2 HEL, 3 OBS, +256 radio).
+        """
+        viewer = self.fits_viewer
+        header = viewer.header
+        frame, source = str(header.get('SPECSYS', '') or '').strip().upper(), 'SPECSYS'
+        if not frame:
+            wcs = getattr(viewer, 'wcs', None)
+            frame, source = str(getattr(getattr(wcs, 'wcs', None), 'specsys', '') or '').strip().upper(), 'CTYPE'
+        if not frame:
+            try:
+                frame = {1: 'LSRK', 2: 'BARYCENT', 3: 'TOPOCENT'}.get(int(header.get('VELREF')) % 256, '')
+            except (TypeError, ValueError):
+                frame = ''
+            source = 'VELREF'
+        if not frame:
+            return "This cube does not name its frame (no SPECSYS); z is applied to the frequencies as they are."
+        text = f"z is applied in this cube's frame, {frame} ({source}): enter a z measured in that frame."
+        if frame in ('LSRK', 'LSRD'):
+            text += "\nA z measured in the barycentric (heliocentric) frame shifts the zero point by up to about 20 km/s."
+        elif frame in ('TOPOCENT', 'GEOCENTR'):
+            text += ("\nA z measured in the barycentric (heliocentric) frame shifts the zero point by up to "
+                     "about 30 km/s, depending on the date.")
+        return text
 
     def _set_field_set_style(self, field: QLineEdit, is_set: bool):
         """Update the style and read-only state of a field to show if it's set."""
@@ -636,15 +743,21 @@ class UnitConversionPanel(QWidget):
         error_messages = []
         ignore_values = ['n/a', 'nan', 'none', 'non', '']
         detail_history_messages = []
+        self._rest_frequency_message = ""
 
         def process_field(field, key, conversion_factor, is_degree=False):
             # Skip if the field is already read-only (already set)
-            if field.isReadOnly():
+            if field.isReadOnly() and key != 'RESTFRQ':
                 return
 
             text = field.text().strip()
+            if key == 'RESTFRQ':
+                # RestFreq and z form one change; an empty field keeps its value.
+                self._process_spectral_axis_fields(updated_keys, error_messages, detail_history_messages)
+                return
+
             original_text = self.header_info_strings.get(key.lower() if not is_degree else 'bpa', 'N/A')
-            
+
             if text.lower() in ignore_values:
                 if original_text.lower() not in ignore_values:
                      # User deleted a valid value, treat as reset for this key
@@ -653,6 +766,7 @@ class UnitConversionPanel(QWidget):
                     elif key in self.fits_viewer.header:
                         del self.fits_viewer.header[key]
                     updated_keys.append(key)
+                    self._edited_header_keys.add(key)
                 return # No change or reset to original, don't lock
 
             if text == original_text:
@@ -660,127 +774,11 @@ class UnitConversionPanel(QWidget):
 
             try:
                 value = float(text)
-                # Special handling for RESTFRQ to log original and adjust velocity axis headers
-                if key == 'RESTFRQ':
-                    old_has = 'RESTFRQ' in self.fits_viewer.header
-                    old_val_hz = self.fits_viewer.header.get('RESTFRQ', None)
-                    new_val_hz = value * conversion_factor # This is a float
-
-                    # --- BUG FIX (from previous turn) ---
-                    # Attempt to convert old_val_hz to a float for comparison
-                    old_val_hz_float = None
-                    if old_val_hz is not None:
-                        try:
-                            old_val_hz_float = float(old_val_hz)
-                        except (TypeError, ValueError):
-                            pass # old_val_hz_float remains None
-
-                    # Check if the value is *actually* changing
-                    is_changed = (old_val_hz_float is None) or (not np.isclose(old_val_hz_float, new_val_hz))
-                    # --- BUG FIX (from previous turn) END ---
-
-                    self.fits_viewer.header['RESTFRQ'] = new_val_hz
-                    if isinstance(self.spectral_metadata, dict):
-                        try:
-                            old_val_hz_numeric = float(old_val_hz)
-                        except (TypeError, ValueError):
-                            old_val_hz_numeric = None
-                        self.spectral_metadata['restfreq_hz'] = new_val_hz
-                        if self.spectral_metadata.get('restfreq_original_hz') is None:
-                            original_rest = old_val_hz_numeric if old_has and old_val_hz_numeric is not None else new_val_hz
-                            self.spectral_metadata['restfreq_original_hz'] = original_rest
-                    
-                    # HISTORY: record precise change
-                    if old_has:
-                        try:
-                            old_val_hz_fmt = f"{float(old_val_hz):.6f}"
-                        except (TypeError, ValueError):
-                            old_val_hz_fmt = str(old_val_hz)
-                        
-                        # *** APPLY BUG FIX CHECK HERE ***
-                        if is_changed:
-                            detail_history_messages.append((
-                                'restfreq-change',
-                                f"RESTFRQ changed: {old_val_hz_fmt} Hz -> {new_val_hz:.6f} Hz"
-                            ))
-                    else:
-                        # If it didn't exist before, it's definitely a change
-                        detail_history_messages.append((
-                            'restfreq-change',
-                            f"RESTFRQ set to {new_val_hz:.6f} Hz (previously undefined)"
-                        ))
-                        is_changed = True # Ensure 'is_changed' is true if key was new
-
-                    # If spectral axis is velocity-like, keep type and ensure units
-                    naxis = self.fits_viewer.header.get('NAXIS', 0)
-                    for i in range(1, naxis + 1):
-                        ctype_key = f'CTYPE{i}'
-                        ctype_i = self.fits_viewer.header.get(ctype_key, '')
-                        ctype_upper = ctype_i.upper()
-                    
-                        current_spectral_axis = self._spectral_axis_index
-                        if current_spectral_axis is None:
-                            break
-                        if i != current_spectral_axis:
-                            continue
-                        
-                        if any(tag in ctype_upper for tag in ('VELO', 'VRAD', 'VOPT')):
-                            normalized_ctype = ctype_i if ctype_i else 'VRAD'
-                            self.fits_viewer.header[ctype_key] = normalized_ctype
-                            cunit_key = f'CUNIT{i}'
-                            cunit_val = str(self.fits_viewer.header.get(cunit_key, '')).strip()
-                            if not cunit_val:
-                                self.fits_viewer.header[cunit_key] = 'km/s'
-                                cunit_val = 'km/s'
-
-                            # Only run CRVAL update logic if the frequency *actually* changed
-                            if old_has and old_val_hz and is_changed and old_val_hz_float is not None:
-                                try:
-                                    velocity_value = float(self.fits_viewer.header.get(f'CRVAL{i}', 0.0))
-                                except (TypeError, ValueError):
-                                    velocity_value = None
-
-                                if velocity_value is not None:
-                                    c_speed = const.c.to('m/s').value
-                                    vel_unit = cunit_val.lower()
-                                    vel_mps = velocity_value * 1000.0 if 'km/s' in vel_unit else velocity_value
-                                    if np.isfinite(vel_mps):
-                                        freq_obs = None
-                                        if 'VOPT' in ctype_upper:
-                                            denom = 1.0 + vel_mps / c_speed
-                                            if np.isfinite(denom) and denom > 0:
-                                                freq_obs = old_val_hz_float / denom
-                                        else:
-                                            freq_obs = old_val_hz_float * (1.0 - vel_mps / c_speed)
-
-                                        if freq_obs and np.isfinite(freq_obs) and freq_obs > 0:
-                                            if 'VOPT' in ctype_upper:
-                                                new_vel_mps = c_speed * ((new_val_hz / freq_obs) - 1.0)
-                                            else:
-                                                # Use new_val_hz (which is guaranteed > 0 if freq_obs > 0)
-                                                new_vel_mps = c_speed * (new_val_hz - freq_obs) / new_val_hz
-
-                                            if np.isfinite(new_vel_mps):
-                                                new_vel = new_vel_mps / 1000.0 if 'km/s' in vel_unit else new_vel_mps
-                                                self.fits_viewer.header[f'CRVAL{i}'] = new_vel
-                                                crval_key = f'CRVAL{i}'
-                                                if crval_key not in updated_keys:
-                                                    updated_keys.append(crval_key)
-                            break
-                    
-                    # Only add RESTFRQ to updated_keys and lock the field IF the value actually changed.
-                    if is_changed:
-                        if key not in updated_keys:
-                            updated_keys.append(key)
-                        self._set_field_set_style(field, True) # Lock and style the field
-
-                else:
-                    self.fits_viewer.header[key] = value * conversion_factor
-                    
-                    # Moved these lines inside the 'else' block
-                    if key not in updated_keys:
-                        updated_keys.append(key)
-                    self._set_field_set_style(field, True) # Lock and style the field
+                self.fits_viewer.header[key] = value * conversion_factor
+                if key not in updated_keys:
+                    updated_keys.append(key)
+                self._edited_header_keys.add(key)
+                self._set_field_set_style(field, True) # Lock and style the field
 
             except ValueError:
                 error_messages.append(f"{key} is not a valid number.")
@@ -805,10 +803,15 @@ class UnitConversionPanel(QWidget):
             self.header_modified = True
             self.save_button.setEnabled(True)
             
+            header = self.fits_viewer.header
             for key in updated_keys:
                 for window in self.subwindows:
-                    if window:
-                        window.header[key] = self.fits_viewer.header[key]
+                    if not window or window.header is header:
+                        continue
+                    if key in header:
+                        window.header[key] = (header[key], header.comments[key])
+                    elif key in window.header:
+                        del window.header[key]  # removed here too (ZSOURCE when z returns to 0)
             
             history_msg = f"Header updated: {', '.join(updated_keys)} modified by user."
             self._update_history(history_msg, category='header-update')
@@ -820,9 +823,274 @@ class UnitConversionPanel(QWidget):
             # Immediately propagate changes to viewers
             self.update_all_displays()
             self._update_spectral_metadata_from_header()
-            
-            QMessageBox.information(self, 'Success', f"FITS header has been updated for: {', '.join(updated_keys)}.")
+            self._refresh_header_window()
 
+            message = f"FITS header has been updated for: {', '.join(updated_keys)}."
+            if self._rest_frequency_message:
+                message += "\n\n" + self._rest_frequency_message
+            QMessageBox.information(self, 'Success', message)
+
+    # ------------------------------------------------------------------
+    # Rest-frequency changes (TF-415 foundation step 2)
+    # ------------------------------------------------------------------
+
+    def _typed_spectral_value(self, field, info_key, error_messages, parse, what):
+        """The number typed in ``field`` when it differs from the value shown, else None."""
+        if field.isReadOnly():
+            return None
+        text = field.text().strip()
+        if text.lower() in ('n/a', 'nan', 'none', 'non', '') or text == self.header_info_strings.get(info_key):
+            return None  # empty, or still the value shown (RestFreq is shown rounded to 1 kHz)
+        try:
+            return parse(text)
+        except ValueError:
+            error_messages.append(what)
+            return None
+
+    def _process_spectral_axis_fields(self, updated_keys, error_messages, detail_history_messages):
+        """Apply a typed rest frequency and/or systemic z as one change (see core.spectral_units)."""
+        def _rest(text):
+            value = float(text) * 1e9
+            if not (math.isfinite(value) and value > 0):
+                raise ValueError
+            return value
+
+        def _z(text):
+            value = float(text)
+            if not (math.isfinite(value) and value > -1.0):
+                raise ValueError
+            return value
+
+        errors_before = len(error_messages)
+        new_line = self._typed_spectral_value(
+            self.rf_input, 'restfreq', error_messages, _rest, "RESTFRQ must be a positive frequency in GHz."
+        )
+        new_z = self._typed_spectral_value(
+            self.z_input, 'z', error_messages, _z, "z must be a number greater than -1."
+        )
+        if len(error_messages) > errors_before:
+            return
+        viewer = self.fits_viewer
+        current_line = line_rest_frequency_hz(getattr(viewer, 'wcs', None), viewer.header, self.spectral_metadata)
+        current_z = systemic_redshift(self.spectral_metadata)
+        if new_line is not None and current_line is not None and math.isclose(current_line, new_line, rel_tol=1e-12):
+            new_line = None  # unchanged
+        if new_z is not None and new_z == current_z:
+            new_z = None
+        if new_line is None and new_z is None:
+            return
+        line_hz = current_line if new_line is None else new_line
+        if line_hz is None:
+            error_messages.append("z: set the rest frequency of the line (RestFreq) as well.")
+            return
+        intent, refusal = self._rest_frequency_intent()
+        if intent is None:
+            error_messages.append(f"RESTFRQ: {refusal}")
+            return
+        z = current_z if new_z is None else new_z
+        try:
+            summary = self._apply_spectral_axis_change(line_hz, z, intent)
+        except ValueError as exc:
+            error_messages.append(f"RESTFRQ: {exc}")
+            return
+        except Exception as exc:
+            error_messages.append(f"Error setting RESTFRQ: {exc}")
+            return
+        for key in summary['header_keys']:
+            if key not in updated_keys:
+                updated_keys.append(key)
+        detail_history_messages.append(('restfreq-change', self._rest_frequency_history_text(summary)))
+        self._rest_frequency_message = self._rest_frequency_summary_text(summary)
+        if new_line is not None:
+            self._set_field_set_style(self.rf_input, True)  # Lock and style the field
+        if new_z is not None:
+            self._set_field_set_style(self.z_input, True)
+
+    def _main_window(self):
+        return getattr(self.fits_viewer, 'main_window', None) or self.fits_viewer
+
+    def _apply_spectral_axis_change(self, line_hz: float, z: float, intent: str) -> dict:
+        """Change the rest frequency / systemic z of the shared header, WCS and metadata, and record it."""
+        viewer = self.fits_viewer
+        main_window = self._main_window()
+        sync = getattr(main_window, 'sync_app_state_data', None)
+        if callable(sync):
+            sync()
+        session = getattr(main_window, 'action_session', None)
+        ensure_seed = getattr(session, 'ensure_initial_state_seed', None)
+        if callable(ensure_seed):
+            ensure_seed()  # undo must start from before the change (deferred seeds of large data)
+
+        snapshot = self._capture_rest_frequency_snapshot()
+        previous_z = systemic_redshift(self.spectral_metadata)
+        summary = apply_spectral_axis(
+            viewer.wcs, viewer.header, self.spectral_metadata, restfreq_hz=line_hz, z=z, intent=intent
+        )
+        if self._rest_frequency_snapshot is None:
+            self._rest_frequency_snapshot = snapshot  # Reset goes back to before the first change
+        summary['step_before'] = snapshot.get('step')
+        summary['step_after'] = self._header_spectral_step()
+        params = {"restfreq_hz": float(line_hz), "intent": str(intent)}
+        if z or previous_z:
+            params["z"] = float(z)  # recorded whenever a systemic redshift is involved
+        record_action_preview(viewer, "set_spectral_axis", params, replace_tag=self._rest_frequency_record_tag)
+        self._refresh_after_rest_frequency_change()
+        return summary
+
+    def _spectral_axis_number(self) -> Optional[int]:
+        axis = spectral_wcs_axis(getattr(self.fits_viewer, 'wcs', None), self.spectral_metadata)
+        return None if axis is None else axis + 1
+
+    def _header_spectral_step(self):
+        axis_number = self._spectral_axis_number()
+        return None if axis_number is None else header_axis_step(self.fits_viewer.header, axis_number)
+
+    def _capture_rest_frequency_snapshot(self) -> dict:
+        header = self.fits_viewer.header
+        keys = ['RESTFRQ', 'RESTFREQ', 'RESTWAV', 'ZSOURCE', 'ALTRVAL', 'ALTRPIX']
+        axis_number = self._spectral_axis_number()
+        if axis_number is not None:
+            keys += [f'CRVAL{axis_number}', f'CDELT{axis_number}']
+            cd_row = re.compile(rf'CD{axis_number}_\d+')
+            keys += [str(key) for key in header.keys() if cd_row.fullmatch(str(key))]
+        wcs = getattr(self.fits_viewer, 'wcs', None)
+        meta = self.spectral_metadata if isinstance(self.spectral_metadata, dict) else {}
+        return {
+            'header': {
+                key: (key in header, header.get(key), header.comments[key] if key in header else '')
+                for key in keys
+            },
+            'wcs': wcs.deepcopy() if wcs is not None else None,
+            'metadata': {key: meta.get(key) for key in ('restfreq_hz', 'line_restfreq_hz', 'systemic_z')},
+            'step': self._header_spectral_step(),
+        }
+
+    def _restore_rest_frequency_snapshot(self, snapshot: dict) -> None:
+        header = self.fits_viewer.header
+        for key, (present, value, comment) in snapshot['header'].items():
+            if present:
+                header[key] = (value, comment)
+            elif key in header:
+                del header[key]
+        copy_wcs_numbers(getattr(self.fits_viewer, 'wcs', None), snapshot.get('wcs'))
+        if isinstance(self.spectral_metadata, dict):
+            self.spectral_metadata.update(snapshot.get('metadata') or {})
+
+    def _rest_frequency_record_position(self):
+        """(index of this panel's record in the action history, cursor), or (None, None)."""
+        session = getattr(self._main_window(), 'action_session', None)
+        if session is None:
+            return None, None
+        history = list(getattr(session, 'history', []) or [])
+        for index in range(len(history) - 1, -1, -1):
+            if getattr(history[index], 'tag', None) == self._rest_frequency_record_tag:
+                return index, int(getattr(session, 'cursor', len(history)))
+        return None, None
+
+    _REST_FREQUENCY_TAG_PREFIX = "panel:unit-conversion:restfreq:"
+
+    def _other_rest_frequency_tags(self) -> list:
+        """Tags of RestFreq / z changes recorded before the cursor by other Unit Conversion panels."""
+        session = getattr(self._main_window(), 'action_session', None)
+        if session is None:
+            return []
+        history = list(getattr(session, 'history', []) or [])
+        cursor = int(getattr(session, 'cursor', len(history)))
+        tags = []
+        for record in history[:cursor]:
+            tag = str(getattr(record, 'tag', None) or '')
+            if tag.startswith(self._REST_FREQUENCY_TAG_PREFIX) and tag != self._rest_frequency_record_tag:
+                if tag not in tags:
+                    tags.append(tag)
+        return tags
+
+    def _reset_rest_frequency_change(self) -> None:
+        """Take back the RestFreq / z changes made in Unit Conversion, exactly.
+
+        This panel's own change comes back from the snapshot taken before its
+        first change, or by replaying the history without it when later
+        actions exist.  Changes another Unit Conversion panel made (one that
+        was closed and opened again) are taken out of the history, which is
+        then replayed, so Reset Header works from any panel.
+        """
+        snapshot, self._rest_frequency_snapshot = self._rest_frequency_snapshot, None
+        other_tags = self._other_rest_frequency_tags()
+        if snapshot is None and not other_tags:
+            return
+        index, cursor = self._rest_frequency_record_position()
+        preferred_cursor = capture_preferred_cursor_snapshot(self.fits_viewer)
+        if other_tags:
+            for tag in other_tags + ([self._rest_frequency_record_tag] if index is not None else []):
+                while clear_action_preview_record(self.fits_viewer, tag):
+                    pass  # a panel may have left more than one record
+            if replay_action_history_to_current_cursor(self.fits_viewer, preferred_cursor=preferred_cursor):
+                self._refresh_after_rest_frequency_change()
+                return
+        elif index is not None:
+            clear_action_preview_record(self.fits_viewer, self._rest_frequency_record_tag)
+            if index >= cursor:
+                return  # already undone from the main window
+            if index < cursor - 1 and replay_action_history_to_current_cursor(
+                self.fits_viewer, preferred_cursor=preferred_cursor
+            ):
+                return  # later actions may depend on the axis: replay them without the change
+        if snapshot is not None:
+            self._restore_rest_frequency_snapshot(snapshot)
+            self._refresh_after_rest_frequency_change()
+
+    def _refresh_header_window(self) -> None:
+        """Draw an open Show Header window again (the panel edits the header in place)."""
+        refresh = getattr(self._main_window(), 'refresh_header_panel', None)
+        if callable(refresh):
+            refresh()
+
+    def _refresh_after_rest_frequency_change(self) -> None:
+        main_window = self._main_window()
+        refresh = getattr(main_window, 'refresh_spectral_axis_views', None)
+        if callable(refresh):
+            refresh()
+
+    @staticmethod
+    def _format_ghz(value_hz) -> str:
+        return "undefined" if value_hz is None else f"{float(value_hz) / 1e9:.9g} GHz"
+
+    def _rest_frequency_history_text(self, summary: dict) -> str:
+        previous = summary.get('previous_hz')
+        change = (
+            f"RESTFRQ changed: {previous:.6f} Hz -> {summary['rest_hz']:.6f} Hz"
+            if previous is not None
+            else f"RESTFRQ set to {summary['rest_hz']:.6f} Hz (previously undefined)"
+        )
+        if summary.get('z') or summary.get('previous_z'):
+            change += (
+                f" (line rest {summary.get('line_rest_hz', 0.0):.6f} Hz, "
+                f"z {summary.get('previous_z', 0.0):.12g} -> {summary.get('z', 0.0):.12g})"
+            )
+        if summary.get('intent') == 'rereference':
+            return change + "; velocities re-referenced, observed frequencies kept"
+        return change + "; velocity axis kept"
+
+    def _rest_frequency_summary_text(self, summary: dict) -> str:
+        if summary.get('z') or summary.get('previous_z'):
+            change = (
+                f"RestFreq {self._format_ghz(summary.get('previous_line_rest_hz'))} -> "
+                f"{self._format_ghz(summary.get('line_rest_hz'))}, z {summary.get('previous_z', 0.0):.12g} -> "
+                f"{summary.get('z', 0.0):.12g}: velocities are measured from "
+                f"{self._format_ghz(summary['rest_hz'])} (RestFreq / (1 + z))."
+            )
+        else:
+            change = f"RestFreq {self._format_ghz(summary.get('previous_hz'))} -> {self._format_ghz(summary['rest_hz'])}."
+        if summary.get('intent') != 'rereference':
+            axis_number = self._spectral_axis_number()
+            ctype = self.fits_viewer.header.get(f'CTYPE{axis_number}', '') if axis_number else ''
+            kind = 'velocity' if classify_axis_type(ctype) == 'velocity' else 'spectral'
+            return change + f" Only RESTFRQ changed; the {kind} axis is unchanged."
+        text = change + " Velocities were re-referenced; the observed frequencies are unchanged."
+        before, after = summary.get('step_before'), summary.get('step_after')
+        if before is not None and after is not None:
+            unit = display_unit(self.spectral_metadata)
+            text += f" Channel width {abs(before):.6g} -> {abs(after):.6g} {unit}".rstrip() + "."
+        return text + " Velocity ranges typed in other open panels keep their numbers."
 
     def _reinitialize_parameters(self):
         """Recalculate all internal parameters after a header change."""
@@ -903,13 +1171,20 @@ class UnitConversionPanel(QWidget):
         if self.header_modified and show_message:
             QMessageBox.information(self, 'Header Reset', 'Header values have been reset to their original state.')
 
-        self.fits_viewer.header = self.original_header.copy()
-        for window in self.subwindows:
-            if window:
-                window.header = self.original_header.copy()
+        # Only what this panel changed goes back, in place: the header object is
+        # shared with AppState and the subwindows, and BUNIT belongs to the
+        # conversion (reset separately).
+        self._reset_rest_frequency_change()
+        header = self.fits_viewer.header
+        for key in sorted(self._edited_header_keys):
+            if key in self.original_header:
+                header[key] = self.original_header[key]
+            elif key in header:
+                del header[key]
+        self._edited_header_keys.clear()
         
         # Unlock all fields and reset their styles
-        for field in [self.rf_input, self.bmaj_input, self.bmin_input, self.bpa_input]:
+        for field in [self.rf_input, self.z_input, self.bmaj_input, self.bmin_input, self.bpa_input]:
             self._set_field_set_style(field, False)
 
         # Repopulate fields with original values and re-check capabilities
@@ -932,6 +1207,7 @@ class UnitConversionPanel(QWidget):
         self._sync_bunit_to_viewers()
         self.update_all_displays()
         self._update_spectral_metadata_from_header()
+        self._refresh_header_window()  # after the HISTORY lines of the change are gone
 
     def reset_conversion_operations(self):
         """Resets only the unit conversion UI to its original state."""
@@ -1067,12 +1343,50 @@ class UnitConversionPanel(QWidget):
     # FITS Save and HISTORY
     # ------------------------------------------------------------------
   
+    _DISK_AXIS_PREFIXES = ('CTYPE', 'CUNIT', 'CRVAL', 'CRPIX', 'CDELT')
+
+    def _restore_disk_spectral_axis(self, header_copy, axis, disk_header) -> None:
+        """Put the disk file's spectral axis (FITS axis ``axis``) back into ``header_copy``."""
+        for key_prefix in self._DISK_AXIS_PREFIXES:
+            key = f"{key_prefix}{axis}"
+            if key in disk_header:
+                header_copy[key] = disk_header[key]
+            elif key in header_copy:
+                # If key existed in viewer but not disk, remove it
+                if key_prefix not in ('CRPIX'): # Keep CRPIX if needed?
+                    del header_copy[key]
+        # A CD-matrix step lives in the axis's CD row.
+        cd_row = re.compile(rf'CD{axis}_\d+')
+        for key in [k for k in header_copy.keys() if cd_row.fullmatch(str(k))]:
+            if key not in disk_header:
+                del header_copy[key]
+        for key in [k for k in disk_header.keys() if cd_row.fullmatch(str(k))]:
+            header_copy[key] = disk_header[key]
+        # The alternate reference (ALTRVAL at ALTRPIX) belongs to the disk axis.
+        for key in ('ALTRVAL', 'ALTRPIX'):
+            if key in disk_header:
+                header_copy[key] = disk_header[key]
+
+    @staticmethod
+    def _same_rest_frequency(rest_hz, header) -> bool:
+        disk_hz = rest_frequency_hz(None, header)
+        return (
+            rest_hz is not None
+            and disk_hz is not None
+            and math.isclose(float(rest_hz), disk_hz, rel_tol=1e-12, abs_tol=1e-3)
+        )
+
+    @staticmethod
+    def _axis_is_frequency(header, axis) -> bool:
+        return classify_axis_type(header.get(f'CTYPE{axis}', '')) == 'frequency'
+
     def _prepare_header_for_save(self, *, is_data_being_flipped_back: bool = False):
         """Return a header copy adjusted for FITS output."""
         header_copy = self.fits_viewer.header.copy()
+        is_cube = getattr(self.fits_viewer.data, 'ndim', 0) > 2
 
         convert_to_frequency = (
-            getattr(self.fits_viewer.data, 'ndim', 0) > 2
+            is_cube
             and getattr(self, 'spectral_axis_mode', 'velocity') == 'frequency'
         )
         
@@ -1093,7 +1407,6 @@ class UnitConversionPanel(QWidget):
                     restfreq = None
 
                 crval_key = f'CRVAL{axis}'
-                cdelt_key = f'CDELT{axis}'
                 cunit_key = f'CUNIT{axis}'
                 ctype_key = f'CTYPE{axis}'
 
@@ -1108,16 +1421,12 @@ class UnitConversionPanel(QWidget):
                     
                     original_disk_header = self._load_disk_header()
                     if original_disk_header:
-                         # Restore the *spectral axis* keys from disk.
-                         for key_prefix in ('CTYPE', 'CUNIT', 'CRVAL', 'CRPIX', 'CDELT'):
-                             key = f"{key_prefix}{axis}"
-                             if key in original_disk_header:
-                                 header_copy[key] = original_disk_header[key]
-                             elif key in header_copy:
-                                 # If key existed in viewer but not disk, remove it
-                                 if key_prefix not in ('CRPIX'): # Keep CRPIX if needed?
-                                     del header_copy[key]
-                    
+                        # Restore the *spectral axis* keys from disk.
+                        self._restore_disk_spectral_axis(header_copy, axis, original_disk_header)
+                        if restfreq is not None and not self._same_rest_frequency(restfreq, original_disk_header):
+                            # the frequencies stay; the velocity at ALTRPIX follows the new rest frequency
+                            refresh_alternate_reference(header_copy, axis, restfreq)
+
                     # Ensure CTYPE/CUNIT are valid if disk_header failed
                     current_ctype = header_copy.get(ctype_key, '')
                     if not current_ctype or 'VELO' in current_ctype.upper():
@@ -1133,6 +1442,14 @@ class UnitConversionPanel(QWidget):
                     
                     return header_copy
                 
+                # (Velo on disk, Freq in memory: opened with --spectral-axis freq)
+                # The in-memory axis already is the frequency axis; write it in Hz.
+                if self._axis_is_frequency(header_copy, axis):
+                    convert_axis_cards(header_copy, axis, 'Hz')
+                    header_copy[cunit_key] = 'Hz'
+                    refresh_alternate_reference(header_copy, axis, restfreq)
+                    return header_copy
+
                 # (Scenario 3: Velo -> Freq)
                 # If we reach here, it means:
                 # convert_to_frequency=True
@@ -1162,7 +1479,9 @@ class UnitConversionPanel(QWidget):
 
                 if restfreq and np.isfinite(restfreq):
                     vel_crval = header_copy.get(crval_key, 0.0)
-                    vel_cdelt = header_copy.get(cdelt_key, 0.0)
+                    vel_cdelt = header_axis_step(header_copy, axis)  # CDELT or CD matrix
+                    if vel_cdelt is None:
+                        vel_cdelt = 0.0
                     vel_cunit = str(header_copy.get(cunit_key, '') or '').strip().lower()
                     if not vel_cunit:
                         vel_cunit = str(self.spectral_metadata.get('current_axis_unit', '') or '').strip().lower()
@@ -1213,13 +1532,28 @@ class UnitConversionPanel(QWidget):
                         header_copy[crval_key] = freq_crval
                     if freq_cdelt is not None:
                         freq_cdelt = (freq_cdelt * u.Hz).to(target_unit).value
-                        header_copy[cdelt_key] = freq_cdelt
+                        set_header_axis_step(header_copy, axis, freq_cdelt)
 
                     if desired_unit:
                         header_copy[cunit_key] = desired_unit
 
                     header_copy[ctype_key] = desired_ctype or 'FREQ'
+                    refresh_alternate_reference(header_copy, axis, restfreq)
         
+        elif axis is not None and is_cube and self._axis_is_frequency(header_copy, axis):
+            # A frequency axis in memory (kept in frequency, or opened from radio
+            # velocity) saved as velocity: the disk's velocity axis when the file
+            # had one and the rest frequency is unchanged, else radio velocities
+            # derived from the frequencies. Without a rest frequency it stays.
+            rest_hz = rest_frequency_hz(None, header_copy)
+            if not self._disk_axis_was_frequency:
+                disk_header = self._load_disk_header()
+                if disk_header and self._same_rest_frequency(rest_hz, disk_header):
+                    self._restore_disk_spectral_axis(header_copy, axis, disk_header)
+                    return header_copy
+            unit = None if self._disk_axis_was_frequency else canonical_velocity_unit(self._disk_spectral_cunit or '')
+            write_radio_velocity_axis(header_copy, axis, rest_hz, unit or 'km/s')
+
         elif axis is not None: # Target is Velocity (convert_to_frequency is False)
             
             # Scenarios (Velo -> Velo) and (Freq -> Velo) are handled here.

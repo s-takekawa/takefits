@@ -6,6 +6,14 @@ from .region import Region
 from astropy.wcs.utils import proj_plane_pixel_scales, wcs_to_celestial_frame
 from astropy.coordinates import Angle, SkyCoord
 import astropy.units as u
+from .spectral_records import document_spectral_unit, rescale_region_entry
+from .spectral_units import (
+    SPECTRAL_UNIT_KEY,
+    spectral_unit_tag,
+    spectral_wcs_axis,
+    stored_spectral_factor,
+    viewer_display_wcs,
+)
 from .wcs_frames import celestial_axis_indices, normalize_display_frame, parse_world_value
 
 
@@ -135,8 +143,10 @@ class RegionManager(QObject):
     _global_region_counter = 1
     selected_region_changed = pyqtSignal(object)
     def __init__(self, viewer):
-        # Initializes the RegionManager.
-        super().__init__()
+        # Initializes the RegionManager. A Qt viewer owns it, so deleting a
+        # closed viewer also drops the slots connected here (lambdas that
+        # capture the viewer would otherwise keep it alive).
+        super().__init__(viewer if isinstance(viewer, QObject) else None)
         self.viewer = viewer
         self.regions = []          # List to store all created region objects.
         self.selected_region = None # The region that is currently selected.
@@ -1624,7 +1634,7 @@ class RegionManager(QObject):
         if normalized in aliases:
             return aliases[normalized]
         if normalized in {"world", "wcs"}:
-            wcs = getattr(self.viewer, "wcs", None) if self.viewer is not None else None
+            wcs = viewer_display_wcs(self.viewer) if self.viewer is not None else None
             frame = normalize_display_frame(self._world_frame_from_wcs(wcs))
             if frame in _DS9_WORLD_COORD_SYSTEMS:
                 return frame
@@ -1797,7 +1807,7 @@ class RegionManager(QObject):
             return None
 
         viewer = self.viewer
-        wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        wcs = viewer_display_wcs(viewer) if viewer is not None else None
         metadata = dict(metadata or {})
         plane = str(metadata.get("plane") or getattr(viewer, "plane", "xy") or "xy").lower()
         axes = self._axes_for_plane(plane)
@@ -2060,7 +2070,7 @@ class RegionManager(QObject):
         entries = []
         target_plane = plane.lower() if plane else None
         viewer = self.viewer
-        wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        wcs = viewer_display_wcs(viewer) if viewer is not None else None
         world_frame = self._world_frame_from_wcs(wcs)
         shared_context = self._shared_world_context(max(getattr(wcs, "naxis", 2), 2)) if wcs is not None else {}
         for region in self.regions:
@@ -2130,13 +2140,48 @@ class RegionManager(QObject):
                     "world": world_state,
                 }
             )
-        return {
+        payload = {
             "format": "takefits.region",
             "version": 1,
             "plane": target_plane or "all",
             "regions": entries,
             "world_frame": world_frame,
         }
+        live_wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        if live_wcs is not None:
+            try:
+                unit = spectral_unit_tag(live_wcs, getattr(viewer, "spectral_metadata", None))
+            except Exception:
+                unit = ""
+            if unit:
+                payload[SPECTRAL_UNIT_KEY] = unit  # unit of the spectral world numbers
+        return payload
+
+    def _payload_in_current_spectral_unit(self, payload: dict, *, from_file: bool) -> dict:
+        """Region world numbers in the host cube's display unit (TF-415 slice A).
+
+        Converted from the unit the payload records; an unrecorded payload only
+        when read from a file (old units), as in-session payloads already use
+        the display unit.
+        """
+        viewer = self.viewer
+        live_wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        regions = payload.get("regions") if isinstance(payload, dict) else None
+        if live_wcs is None or not isinstance(regions, list):
+            return payload
+        stored_unit = document_spectral_unit(payload)
+        if stored_unit is None and not from_file:
+            return payload
+        metadata = getattr(viewer, "spectral_metadata", None)
+        factor = stored_spectral_factor(stored_unit, live_wcs, metadata)
+        if factor is None or factor == 1.0:
+            return payload
+        axis = spectral_wcs_axis(live_wcs, metadata)
+        result = dict(payload)
+        result["regions"] = [
+            rescale_region_entry(entry, factor, 2 if axis is None else axis) for entry in regions
+        ]
+        return result
 
     def _region_from_state(self, kind: str, state: dict) -> Region | None:
         if kind == "circle":
@@ -2157,8 +2202,9 @@ class RegionManager(QObject):
             region.set_label_text(label)
         return region
 
-    def import_regions_from_dict(self, payload: dict, clear_existing: bool = True) -> None:
+    def import_regions_from_dict(self, payload: dict, clear_existing: bool = True, from_file: bool = False) -> None:
         """Load regions from serialized dict. Falls back to world geometry when available."""
+        payload = self._payload_in_current_spectral_unit(payload, from_file=from_file)
         if payload.get("format") != "takefits.region":
             raise ValueError("Unsupported region file format")
         version = int(payload.get("version", 0))
@@ -2170,7 +2216,7 @@ class RegionManager(QObject):
             self.delete_all_regions()
         added_any = False
         viewer = self.viewer
-        wcs = getattr(viewer, "wcs", None) if viewer is not None else None
+        wcs = viewer_display_wcs(viewer) if viewer is not None else None
         for entry in regions_payload:
             kind = entry.get("kind")
             plane = (entry.get("plane") or payload.get("plane") or "xy").lower()

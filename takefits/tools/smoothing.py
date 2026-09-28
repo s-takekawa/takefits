@@ -9,6 +9,7 @@ from takefits.logic.data_tools import create_preview_snapshot, is_lazy_scaled
 from takefits.tools.base_panel import clear_action_preview_record, confirm_pending_close, has_action_record_tag, record_action_preview
 import time
 import os
+from takefits.core.spectral_units import header_axis_step
 
 class SmoothSettingsPanel(QDialog):
     def __init__(self, fits_viewer, subwindows):
@@ -417,8 +418,8 @@ class SmoothSettingsPanel(QDialog):
 
         # Log kernel info
         FWHM_to_sigma = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2)))
-        pixel_scale_x = abs(self.header['CDELT1']) * 3600
-        pixel_scale_y = abs(self.header['CDELT2']) * 3600
+        pixel_scale_x = abs(header_axis_step(self.header, 1)) * 3600  # CDELT or CD matrix
+        pixel_scale_y = abs(header_axis_step(self.header, 2)) * 3600
 
         sigma_kernel_maj_sq = (target_bmaj * FWHM_to_sigma) ** 2 - (current_bmaj * FWHM_to_sigma) ** 2
         sigma_kernel_min_sq = (target_bmin * FWHM_to_sigma) ** 2 - (current_bmin * FWHM_to_sigma) ** 2

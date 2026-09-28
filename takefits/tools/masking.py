@@ -687,14 +687,10 @@ class MaskSettingsPanel(BaseToolPanel):
                 window.canvas.draw()
 
     def _get_sanitized_header(self):
-        new_header = self.fits_viewer.header.copy()
-        try:
-            original_header_on_disk = fits.getheader(self.fits_viewer.filename)
-            if "CUNIT3" not in original_header_on_disk and "CUNIT3" in new_header:
-                del new_header["CUNIT3"]
-        except Exception as exc:
-            print(f"Could not check original header on disk. Error: {exc}")
-        return new_header
+        # The loader's header names the unit of its spectral numbers (it adds
+        # CUNIT3 when the file had none), so the masked cube keeps it.  This
+        # used to be dropped only when the file sat in the working directory.
+        return self.fits_viewer.header.copy()
 
     def save_masked_fits(self):
         if self.current_mask is None:

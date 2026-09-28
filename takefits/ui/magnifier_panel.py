@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from takefits.core.spectral_units import header_axis_step
 from takefits.logic.data_tools import sanitize_slice
 
 
@@ -529,16 +530,13 @@ class MagnifierPanel(QWidget):
         if bmaj <= 0 or bmin <= 0:
             return None
         try:
-            cdelt1 = abs(float(header["CDELT1"]))
-            cdelt2 = abs(float(header["CDELT2"]))
+            # CDELT, or the CD matrix (whose omitted off-diagonal terms are 0)
+            step1, step2 = header_axis_step(header, 1), header_axis_step(header, 2)
         except Exception:
-            try:
-                cdelt1 = math.hypot(float(header["CD1_1"]), float(header["CD2_1"]))
-                cdelt2 = math.hypot(float(header["CD1_2"]), float(header["CD2_2"]))
-            except Exception:
-                return None
-        if cdelt1 <= 0 or cdelt2 <= 0:
             return None
+        if not step1 or not step2:
+            return None
+        cdelt1, cdelt2 = abs(step1), abs(step2)
         return bmaj / cdelt1, bmin / cdelt2, bpa + 90.0
 
     @staticmethod

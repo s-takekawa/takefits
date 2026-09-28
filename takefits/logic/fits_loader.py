@@ -19,15 +19,16 @@ class FITSWorker(QObject):
     progress = pyqtSignal(str)
     error = pyqtSignal(str, str)
 
-    def __init__(self, filename: str):
+    def __init__(self, filename: str, frequency_axis: str = "velocity"):
         super().__init__()
         self.filename = str(filename)
+        self.frequency_axis = str(frequency_axis or "velocity")
 
     def run(self) -> None:
         # The "Loading: <file>" banner is printed by the caller (main.py) before
         # the worker starts, so it uses the same format as additional files.
         try:
-            data, header, wcs, spectral_metadata = load_fits(self.filename)
+            data, header, wcs, spectral_metadata = load_fits(self.filename, frequency_axis=self.frequency_axis)
         except FITSLoadError as err:
             path = err.filename if err.filename is not None else self.filename
             if err.kind == "not_found":

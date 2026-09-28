@@ -1,6 +1,7 @@
 from astropy.coordinates import Angle
 from astropy import units as u
 import numpy as np
+from takefits.core.spectral_units import axis_step
 from takefits.core.wcs_frames import (
     axis_is_latitude,
     axis_is_longitude,
@@ -165,7 +166,7 @@ class CoordinateConverter:
         except Exception:
             return None
         try:
-            return float(self.wcs.wcs.cdelt[idx])
+            return float(axis_step(self.wcs, idx))
         except Exception:
             return None
 
@@ -262,7 +263,7 @@ class CoordinateConverter:
         coord_wrap = self.config.get('coord_wrap', 180)
         value = _wrap_longitude_value(float(coord), axis_type, coord_wrap)
         if self.decimal:
-            if any(token in axis_upper for token in ('VRAD', 'VELO', 'VOPT')) or 'FREQ' in axis_upper:
+            if any(token in axis_upper for token in ('VRAD', 'VELO', 'VOPT', 'WAVE', 'AWAV')) or 'FREQ' in axis_upper:
                 return _format_numeric_value(value, numeric_decimals)
             return f'{value:.{numeric_decimals}f}'
         else:
@@ -421,7 +422,7 @@ class Format_pix_to_wcs:
         if axis_index is None or axis_index < 0:
             return base_int
         try:
-            step = self.wcs.wcs.cdelt[int(axis_index)]
+            step = axis_step(self.wcs, int(axis_index))
         except Exception:
             return base_int
         return _auto_decimals_from_pixel_step(step, base)
@@ -437,7 +438,7 @@ class Format_pix_to_wcs:
         if axis_index is None or axis_index < 0:
             return base_int
         try:
-            step = self.wcs.wcs.cdelt[int(axis_index)]
+            step = axis_step(self.wcs, int(axis_index))
         except Exception:
             return base_int
         return _auto_sexagesimal_precision_from_pixel_step(
@@ -748,7 +749,7 @@ class Format_pix_to_wcs:
                     precision=(axis_decimals if self.decimal else axis_sexagesimal_precision),
                     pad=True,
                 )
-            elif any(token in axis_type for token in ('VRAD', 'VELO', 'VOPT')) or 'FREQ' in axis_type:
+            elif any(token in axis_type for token in ('VRAD', 'VELO', 'VOPT', 'WAVE', 'AWAV')) or 'FREQ' in axis_type:
                 formatted = _format_numeric_value(value, axis_decimals)
             else:
                 formatted = f"{value:.{axis_decimals}f}"

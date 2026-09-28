@@ -34,6 +34,7 @@ from typing import List, Optional
 from astropy import units as u
 from PySide6.QtCore import QObject, QTimer, Signal
 
+from takefits.core.spectral_units import viewer_display_wcs
 from takefits.ui.window_registry import WindowRegistry
 from takefits.core.wcs_frames import celestial_axis_indices, native_celestial_frame
 
@@ -157,7 +158,7 @@ def _effective_spectral_unit(viewer, spec=None):
     which Astropy already canonicalizes.
     """
     if spec is None:
-        spec = _spectral_subwcs(getattr(viewer, "wcs", None))
+        spec = _spectral_subwcs(viewer_display_wcs(viewer))
     ctype_upper = _spectral_axis_ctype(viewer, spec).upper()
     if "FREQ" in ctype_upper:
         unit = _spectral_unit_from_wcs(spec)
@@ -190,7 +191,7 @@ def _effective_spectral_unit(viewer, spec=None):
 
 def _spectral_pixel_to_numeric(viewer, pixel):
     """Convert a spectral pixel to a rest-frequency-free numeric world value."""
-    spec = _spectral_subwcs(getattr(viewer, "wcs", None))
+    spec = _spectral_subwcs(viewer_display_wcs(viewer))
     if spec is None:
         return None
     try:
@@ -212,7 +213,7 @@ def _spectral_numeric_to_pixel(viewer, spectral_value):
         value = float(value)
     except Exception:
         return None
-    spec = _spectral_subwcs(getattr(viewer, "wcs", None))
+    spec = _spectral_subwcs(viewer_display_wcs(viewer))
     if spec is None or not math.isfinite(value):
         return None
 

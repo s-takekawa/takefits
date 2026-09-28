@@ -29,6 +29,8 @@ from takefits.core.colorbar_layout import compute_colorbar_geometry, orientation
 from takefits.core.click_label_layout import compute_click_label_geometry
 from takefits.core.fonts import resolve_mpl_font_family
 from takefits.core.viewer_state import ViewerState
+from takefits.core.spectral_units import apply_viewer_convention, display_wcs
+from takefits.ui.spectral_fields import mark_spectral_field
 from takefits.core.contour_manager import ContourManager, ContourItem
 from takefits.core.plotting.display_map import DisplayMap
 from takefits.core.coordinate import Format_pix_to_wcs
@@ -36,7 +38,6 @@ from matplotlib.figure import Figure
 from matplotlib import colormaps
 from takefits.logic.add_hpbw import AddHPBW
 from takefits.tools.color_scale import ColorSettingsPanel
-from astropy import units as u
 from takefits.core.region_manager import RegionManager
 from takefits.core.marker_manager import MarkerManager
 from takefits.core.wcs_frames import (
@@ -229,6 +230,10 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                 return subwindow
         return None
 
+    def display_wcs(self):
+        """This viewer's WCS with spectral numbers in the display unit (plots and read-outs)."""
+        return display_wcs(self.wcs, getattr(self, "spectral_metadata", None))
+
     def __init__(self, data, header, wcs=None, filename="", spectral_metadata=None):
         super().__init__()
         self.data = data
@@ -272,61 +277,8 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
                     header[axis] = replacement
                 self.wcs = WCS(header)
         
-        #velocity unit conversion [Note: Subject to change in the future.]
-        spectral_meta = self.spectral_metadata
-        self.velocity_unit_converted = bool(spectral_meta.get('velocity_unit_adjusted', False))
-        axis_index = spectral_meta.get('axis_index')
-        if axis_index is None and self.wcs.wcs.naxis >= 3:
-            axis_index = 3
-        if axis_index and spectral_meta.get('axis_index') is None:
-            spectral_meta['axis_index'] = axis_index
-        if axis_index and axis_index <= self.wcs.wcs.naxis:
-            wcs_axis_idx = axis_index - 1
-            try:
-                unit_wcs = self.wcs.wcs.cunit[wcs_axis_idx].to_string().replace(' ', '').lower()
-            except Exception:
-                unit_wcs = ''
-            unit_header = str(self.header.get(f'CUNIT{axis_index}', '')).replace(' ', '').lower()
-            already_adjusted = spectral_meta.get('velocity_unit_adjusted', False)
-
-            if not already_adjusted:
-                if unit_header == 'km/s' and unit_wcs != 'km/s':
-                    try:
-                        wcs_unit = u.Unit(unit_wcs) if unit_wcs else None
-                    except Exception:
-                        wcs_unit = None
-                    spectral_meta['current_axis_unit'] = 'km/s'
-                    spectral_meta['current_axis_type'] = 'velocity'
-                    spectral_meta['current_axis_ctype'] = self.header.get(f'CTYPE{axis_index}', spectral_meta.get('current_axis_ctype'))
-                elif (unit_header in ('m/s', '') and abs(self.wcs.wcs.cdelt[wcs_axis_idx]) > 100.0):
-                    self.wcs.wcs.cdelt[wcs_axis_idx] = (self.wcs.wcs.cdelt[wcs_axis_idx] * u.m / u.s).to(u.km / u.s).value
-                    self.wcs.wcs.crval[wcs_axis_idx] = (self.wcs.wcs.crval[wcs_axis_idx] * u.m / u.s).to(u.km / u.s).value
-                    self.header[f'CUNIT{axis_index}'] = 'km/s'
-                    self.header[f'CDELT{axis_index}'] = self.wcs.wcs.cdelt[wcs_axis_idx]
-                    self.header[f'CRVAL{axis_index}']  = self.wcs.wcs.crval[wcs_axis_idx]
-                    spectral_meta['velocity_unit_adjusted'] = True
-                    spectral_meta['velocity_unit_original'] = 'm/s'
-                    spectral_meta['velocity_unit_target'] = 'km/s'
-                    spectral_meta['current_axis_unit'] = 'km/s'
-                    spectral_meta['current_axis_type'] = 'velocity'
-                    spectral_meta['current_axis_ctype'] = self.header.get(f'CTYPE{axis_index}', spectral_meta.get('current_axis_ctype'))
-                    self.velocity_unit_converted = True
-            else:
-                if spectral_meta.get('current_axis_unit') is None:
-                    current_unit = self.header.get(f'CUNIT{axis_index}', '')
-                    spectral_meta['current_axis_unit'] = current_unit.strip() if isinstance(current_unit, str) else None
-                if spectral_meta.get('current_axis_type') in (None, 'unknown'):
-                    spectral_meta['current_axis_type'] = 'velocity'
-                spectral_meta['current_axis_ctype'] = self.header.get(f'CTYPE{axis_index}', spectral_meta.get('current_axis_ctype'))
-        
-        elif self.wcs.wcs.naxis == 2:
-            for i in range(2):
-                wcs_unit = self.wcs.wcs.cunit[i].to_string().replace(' ', '').lower()
-                if wcs_unit == 'm/s':
-                    self.wcs.wcs.cdelt[i] = (self.wcs.wcs.cdelt[i] * u.m / u.s).to(u.km / u.s).value
-                    self.wcs.wcs.crval[i] = (self.wcs.wcs.crval[i] * u.m / u.s).to(u.km / u.s).value
-        
-        
+        # the viewer's display-unit pass (see core/spectral_units.py)
+        self.velocity_unit_converted = apply_viewer_convention(self.wcs, self.header, self.spectral_metadata)
 
         self.original_data = data if is_lazy_scaled(data) else np.array(data, copy=False)
         self.integ_result_windows = []
@@ -432,7 +384,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self.scroll_accumulation = 0
         self.xlabel = self.ylabel = self.zlabel = None
 
-        self.converter = CoordinateConverter(self.wcs, config)
+        self.converter = CoordinateConverter(self.display_wcs(), config)
         self.original_xval = None
         self.original_yval = None
         self.original_zval = None
@@ -1653,7 +1605,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
         self.displaymap = DisplayMap(
             self.data,
             self.header,
-            self.wcs,
+            self.display_wcs(),
             self.config_manager.config,
             viewer_state=self.state,
             large_data_mode=self.is_large_data_mode(),
@@ -1675,7 +1627,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
 
 
         self.format_pix = Format_pix_to_wcs(
-            self.wcs,
+            self.display_wcs(),
             self.displaymap.slices,
             self.ax,
             self.plane,
@@ -1732,6 +1684,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.current_value_label.setFixedWidth(30)
         
             self.chval_box = QLineEdit()
+            mark_spectral_field(self.chval_box, on=self.plane == 'xy')  # the channel's spectral value
             if self.plane == 'xy':
                 naxis = self.header['NAXIS3']
             elif self.plane == 'xz':
@@ -1842,6 +1795,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             self.z_max_input.setPlaceholderText("Z max value")
             _allow_compact_line_edit(self.z_max_input)
             self.z_max_input.returnPressed.connect(self.set_z_range)
+            mark_spectral_field(self.z_min_input, self.z_max_input)
             self.z_button = QPushButton('Set Z', self)
             self.z_button.clicked.connect(self.set_z_range)
             fit_button_to_text(self.z_button)
@@ -3013,7 +2967,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             y = self._get_shared_world_y()
             # If world coordinates are not yet set (e.g. at startup), calculate from shared pixels
             if x is None or y is None:
-                x, y = self.format_pix.pix_to_wcs(self.wcs, self._get_shared_xpix(), self._get_shared_ypix(), self.plane)
+                x, y = self.format_pix.pix_to_wcs(self.display_wcs(), self._get_shared_xpix(), self._get_shared_ypix(), self.plane)
 
             try:
                 z = float(chval)
@@ -3038,7 +2992,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             z = self._get_shared_world_z()
             # Fallback if world coords are None
             if x is None or z is None:
-                x, z = self.format_pix.pix_to_wcs(self.wcs, self._get_shared_xpix(), self._get_shared_zpix(), self.plane)
+                x, z = self.format_pix.pix_to_wcs(self.display_wcs(), self._get_shared_xpix(), self._get_shared_zpix(), self.plane)
 
             try:
                 y = str(chval).strip()
@@ -3063,7 +3017,7 @@ class FITSViewer(QMainWindow, ViewerCoordinatorMixin, ViewerBlitMixin):
             y = self._get_shared_world_y()
             # Fallback if world coords are None
             if z is None or y is None:
-                z, y = self.format_pix.pix_to_wcs(self.wcs, self._get_shared_zpix(), self._get_shared_ypix(), self.plane)
+                z, y = self.format_pix.pix_to_wcs(self.display_wcs(), self._get_shared_zpix(), self._get_shared_ypix(), self.plane)
 
             try:
                 x = str(chval).strip()

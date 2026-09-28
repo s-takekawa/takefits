@@ -17,6 +17,7 @@ try:
 except Exception:
     gaussian_filter = None
 
+from takefits.core.spectral_units import display_wcs
 from takefits.core.contour_manager import (
     ContourItemState,
     ContourParameters,
@@ -102,7 +103,7 @@ def channel_world_value(state, channel: int) -> Optional[Tuple[float, str]]:
         else:
             return None
     try:
-        sub = wcs.sub([int(axis_index)])
+        sub = display_wcs(wcs, meta).sub([int(axis_index)])
         value = float(np.atleast_1d(sub.pixel_to_world_values(float(channel)))[0])
         unit = str(meta.get("current_axis_unit") or sub.wcs.cunit[0] or "").strip()
         if unit.replace(" ", "").lower() == "m/s":

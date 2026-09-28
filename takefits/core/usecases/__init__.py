@@ -98,6 +98,7 @@ from .channel_map import ChannelMapResult, compute_channel_map, channel_labels_t
 from .cutout import CutoutResult, compute_cutout, export_cutout_fits
 from .arithmetic import ArithmeticOp, compute_arithmetic, apply_arithmetic
 from .unit_conversion import IntensityUnit, convert_intensity_unit, apply_unit_conversion
+from .spectral_axis import set_spectral_axis
 from .scaling import compute_scaled, apply_scaling
 from .clump import (
     ClumpResult,
@@ -146,7 +147,8 @@ from .annotations import (
 def load_fits_data(
     filepath: str,
     hdu: Optional[int] = None,
-    compute_wcs: bool = True
+    compute_wcs: bool = True,
+    frequency_axis: str = "velocity",
 ) -> AppState:
     """
     Load a FITS file and return an AppState.
@@ -157,6 +159,9 @@ def load_fits_data(
         filepath: Path to the FITS file
         hdu: Explicit HDU index, or None to auto-select the first image HDU
         compute_wcs: Whether to compute WCS (default True)
+        frequency_axis: 'velocity' (default) converts a frequency axis with a
+            rest frequency to radio velocity; 'frequency' keeps it and converts
+            a radio-velocity (VRAD) axis to frequency
 
     Returns:
         AppState with loaded data, header, wcs, and spectral metadata
@@ -167,6 +172,7 @@ def load_fits_data(
         filepath,
         compute_wcs=compute_wcs,
         hdu=hdu,
+        frequency_axis=frequency_axis,
     )
 
     return create_app_state(

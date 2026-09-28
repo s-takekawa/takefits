@@ -24,6 +24,17 @@ class Action:
             schema["x-cli-supported"] = False
         return schema
 
+# Former action names that saved histories may still carry; never listed.
+ACTION_ALIASES: Dict[str, str] = {
+    "set_rest_frequency": "set_spectral_axis",  # renamed in TF-415 slice D (2026-09-28), before a release
+}
+
+
+def canonical_action_name(name: Any) -> Any:
+    """The current name of an action (a former name is mapped, anything else is returned as it is)."""
+    return ACTION_ALIASES.get(name, name) if isinstance(name, str) else name
+
+
 class ActionRegistry:
     def __init__(self):
         self._actions: Dict[str, Action] = {}
@@ -62,7 +73,7 @@ class ActionRegistry:
         self._actions[name] = action
 
     def get_action(self, name: str) -> Optional[Action]:
-        return self._actions.get(name)
+        return self._actions.get(canonical_action_name(name))
 
     def list_actions(self) -> List[Dict[str, Any]]:
         return [action.to_schema() for action in self._actions.values()]
@@ -180,6 +191,15 @@ def _apply_regrid(state: AppState, params: Dict[str, Any]) -> AppState:
     state.data = result.data
     state.header = result.header
     state.wcs = result.wcs
+    if state.wcs is not None:
+        # compute_regrid builds WCS(header), which holds SI (m/s) numbers.
+        # Apply the loader's display-unit pass so later steps see the axis
+        # that loading the regridded file would give.
+        from takefits.core.spectral_units import apply_load_convention, identify_spectral_axis
+
+        metadata = state.spectral_metadata if isinstance(state.spectral_metadata, dict) else {}
+        axis_index = metadata.get("axis_index") or identify_spectral_axis(state.header)
+        apply_load_convention(state.wcs, state.header, metadata, axis_index)
     return state
 
 
@@ -213,9 +233,15 @@ def _export_pv_from_result(
         if path_length_px is None:
             raise ValueError("PV export requires slice endpoints or a prior compute_pv action.")
         x0 = y0 = x1 = y1 = 0.0
+    # compute_pv returns (velocity, position), while export_pv_fits takes the
+    # array in the layout it writes (the GUI passes its displayed image), so a
+    # swapped export transposes here, as export_pv_image does.
+    pv_data = np.asanyarray(result)
+    if is_swapped:
+        pv_data = pv_data.T
     return _usecases().export_pv_fits(
         state,
-        result,
+        pv_data,
         output_path,
         x0=float(x0),
         y0=float(y0),
@@ -337,7 +363,17 @@ def register_default_actions(registry: ActionRegistry):
                     "type": "integer",
                     "description": "Explicit HDU index; omitted to auto-select the first image HDU.",
                 },
-                "compute_wcs": {"type": "boolean", "description": "Whether to compute WCS (default True)."}
+                "compute_wcs": {"type": "boolean", "description": "Whether to compute WCS (default True)."},
+                "frequency_axis": {
+                    "type": "string",
+                    "enum": ["velocity", "frequency"],
+                    "description": (
+                        "Velocity or frequency for a radio cube: 'velocity' (default) converts a "
+                        "frequency axis to radio velocity when a rest frequency is given; "
+                        "'frequency' keeps a frequency axis and converts a radio-velocity (VRAD) "
+                        "axis to frequency."
+                    ),
+                },
             },
             "required": ["filepath"]
         }
@@ -1146,6 +1182,37 @@ def register_default_actions(registry: ActionRegistry):
         }
     )
 
+    # Rest frequency and systemic redshift (TF-415 foundation step 2, slices B and D)
+    registry.register(
+        name="set_spectral_axis",
+        description=(
+            "Set the rest frequency of the line and/or the systemic redshift z; velocities are "
+            "measured from restfreq_hz / (1 + z). 'rereference' keeps the observed frequencies and "
+            "re-derives the velocity axis; 'metadata' keeps the velocity axis and changes RESTFRQ only."
+        ),
+        handler=_usecase_handler("set_spectral_axis"),
+        params_schema={
+            "type": "object",
+            "properties": {
+                "restfreq_hz": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Rest frequency of the line itself in Hz (not redshifted). Omit to keep it.",
+                },
+                "z": {
+                    "type": "number",
+                    "description": "Systemic redshift (> -1). Omit to keep it; 0 removes it.",
+                },
+                "intent": {
+                    "type": "string",
+                    "enum": ["rereference", "metadata"],
+                    "description": "What stays: the observed frequencies (rereference) or the velocity axis (metadata).",
+                },
+            },
+            "required": ["intent"],
+        },
+    )
+
     # --- Phase 9d: Visualization Export ---
 
     registry.register(
@@ -1165,6 +1232,17 @@ def register_default_actions(registry: ActionRegistry):
                 },
                 "axis": {"type": "integer"},
                 "cmap": {"type": "string"},
+                "cmap_rgba": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "number", "minimum": 0, "maximum": 1},
+                        "minItems": 4,
+                        "maxItems": 4,
+                    },
+                    "description": "Sampled RGBA colormap captured from a GUI result."
+                },
                 "pixel_range": {
                     "type": "array",
                     "items": {"type": "number"},
@@ -1173,6 +1251,10 @@ def register_default_actions(registry: ActionRegistry):
                 "world_range": {
                     "type": "array",
                     "minItems": 2, "maxItems": 2
+                },
+                "clip_threshold": {
+                    "type": "number",
+                    "description": "Clip values below this threshold before computing the map."
                 },
                 "title": {"type": "string"},
                 "origin": {"type": "string", "enum": ["lower", "upper"]},
@@ -1188,6 +1270,19 @@ def register_default_actions(registry: ActionRegistry):
                 },
                 "vmin": {"type": "number", "description": "Lower intensity limit (null autoscales)."},
                 "vmax": {"type": "number", "description": "Upper intensity limit (null autoscales)."},
+                "log_scale": {"type": "boolean", "description": "Use logarithmic color normalization."},
+                "xlim": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2,
+                    "description": "Displayed X pixel limits."
+                },
+                "ylim": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2, "maxItems": 2,
+                    "description": "Displayed Y pixel limits."
+                },
                 "figsize": {
                     "type": "array",
                     "items": {"type": "number"},
@@ -1241,6 +1336,10 @@ def register_default_actions(registry: ActionRegistry):
                     "type": "array",
                     "items": {"type": "number"},
                     "minItems": 2, "maxItems": 2
+                },
+                "clip_threshold": {
+                    "type": "number",
+                    "description": "Clip values below this threshold before computing the map."
                 },
                 "history_entries": {
                     "type": "array",

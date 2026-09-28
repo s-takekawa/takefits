@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover - SciPy compatibility fallback
         PeakPropertyWarning = Warning
 
 from takefits.core.app_state import AppState, RegionSpec
+from takefits.core.spectral_units import display_unit, display_wcs
 from takefits.logic.data_tools import ensure_operation_memory_budget, sanitize_slice
 from .utils import get_axis_ctype, parse_world_coordinate
 
@@ -293,7 +294,7 @@ def _spectral_axis_values_with_status(
 ) -> Tuple[np.ndarray, bool]:
     """Return spectral values and whether WCS conversion actually succeeded."""
     values = np.arange(int(n_channels), dtype=float)
-    wcs = getattr(state, "wcs", None)
+    wcs = display_wcs(getattr(state, "wcs", None), getattr(state, "spectral_metadata", None))
     if wcs is None:
         return values, False
     try:
@@ -339,17 +340,9 @@ def spectral_axis_unit(
 def spectral_unit_string(state: AppState) -> str:
     """Converted spectral-axis unit from `spectral_metadata`, or ''.
 
-    Accepts either a bare unit (``"km/s"``) or a decorated label
-    (``"Velocity [km/s]"``), matching what `export_pv_fits` parses.
+    See `takefits.core.spectral_units.display_unit`.
     """
-    metadata = getattr(state, "spectral_metadata", None) or {}
-    raw = str(metadata.get("current_axis_unit", "") or "").strip()
-    if not raw:
-        return ""
-    import re
-
-    match = re.search(r"\[(.*?)\]", raw)
-    return (match.group(1) if match else raw).strip()
+    return display_unit(getattr(state, "spectral_metadata", None))
 
 
 @dataclass
@@ -982,8 +975,15 @@ def fit_spectrum_gaussian(
         y_values = get_spectrum(state, x=x, y=y)
         x_values = spectral_axis_values(state, np.asarray(y_values).size)
 
+    x_values = np.asarray(x_values, dtype=float)
+    if fit_kwargs.get("min_sigma") is None:
+        # Half a channel, as the GUI fit in channels uses: a fixed 0.5 in world
+        # units is wider than a whole GHz or um axis.
+        steps = np.abs(np.diff(x_values[np.isfinite(x_values)]))
+        step = float(np.median(steps)) if steps.size else 0.0
+        fit_kwargs["min_sigma"] = 0.5 * step if np.isfinite(step) and step > 0 else 0.5
     return fit_gaussian_spectrum(
-        np.asarray(x_values, dtype=float),
+        x_values,
         np.asarray(y_values, dtype=float),
         n_components=n_components,
         **fit_kwargs,

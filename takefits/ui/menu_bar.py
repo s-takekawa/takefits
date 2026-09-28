@@ -4,6 +4,7 @@ import sys
 from PySide6.QtWidgets import QMenu, QMessageBox
 from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtCore import Qt
+from takefits.app_paths import pipeline_runner_available
 from takefits.ui.config_panel import ConfigPanel
 from takefits.logic.show_header import ShowHeader
 from takefits.core.version import APP_DISPLAY_VERSION, APP_NAME
@@ -31,6 +32,9 @@ class MenuBar:
         self.load_workspace_action = QAction("Load Workspace...", self.parent)
         self.save_recipe_action = QAction("Save Recipe...", self.parent)
         self.load_recipe_action = QAction("Load Recipe...", self.parent)
+        self.export_moment_pipeline_action = QAction(
+            "Export Moment Pipeline...", self.parent
+        )
         self.save_workspace_action.setShortcut(QKeySequence.StandardKey.Save)
         self.load_workspace_action.setShortcut(QKeySequence.StandardKey.Open)
         self.save_recipe_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
@@ -41,6 +45,7 @@ class MenuBar:
             self.load_workspace_action,
             self.save_recipe_action,
             self.load_recipe_action,
+            self.export_moment_pipeline_action,
         ):
             # WindowShortcut (not Application) so the keystroke routes to the
             # focused window's action. With several MainWindows open, an
@@ -54,6 +59,9 @@ class MenuBar:
         self.load_workspace_action.triggered.connect(self.load_workspace)
         self.save_recipe_action.triggered.connect(self.save_recipe)
         self.load_recipe_action.triggered.connect(self.load_recipe)
+        self.export_moment_pipeline_action.triggered.connect(
+            self.export_moment_pipeline
+        )
         file_menu.addAction(self.open_new_window_action)
         file_menu.addSeparator()
         file_menu.addAction(self.save_workspace_action)
@@ -61,6 +69,10 @@ class MenuBar:
         file_menu.addSeparator()
         file_menu.addAction(self.save_recipe_action)
         file_menu.addAction(self.load_recipe_action)
+        # Exported manifests run through the repository CLI (cli/run.py), which
+        # installed releases do not ship, so offer the export only where it runs.
+        if pipeline_runner_available():
+            file_menu.addAction(self.export_moment_pipeline_action)
         file_menu.addSeparator()
         self.show_header_action = QAction("Show Header", self.parent)
         self.show_header_action.triggered.connect(self.open_header_panel)
@@ -469,6 +481,10 @@ class MenuBar:
     def load_recipe(self):
         if hasattr(self.parent, "load_recipe_dialog"):
             self.parent.load_recipe_dialog()
+
+    def export_moment_pipeline(self):
+        if hasattr(self.parent, "export_moment_pipeline_dialog"):
+            self.parent.export_moment_pipeline_dialog()
 
     def open_in_new_window(self):
         if hasattr(self.parent, "open_fits_in_new_window_dialog"):
@@ -933,6 +949,9 @@ class MenuBar:
         existing = getattr(self.parent, "header_panel", None)
         try:
             if existing is not None and existing.isVisible():
+                refresh = getattr(existing, "refresh", None)
+                if callable(refresh):
+                    refresh()  # the header may have changed since the window was drawn
                 existing.raise_()
                 existing.activateWindow()
                 return

@@ -43,6 +43,15 @@ To restore a saved workspace, launch Takefits with the workspace file path.
 takefits /path/to/yourfile.workspace.json
 ```
 
+Frequency axes open as radio velocity when the file has a rest frequency
+(`RESTFRQ`). To see frequencies instead (also for cubes stored in radio
+velocity, `VRAD`), change **Preferences -> General -> Frequency / velocity
+axes open as**, or choose for one launch:
+
+```bash
+takefits /path/to/cube.fits --spectral-axis freq   # or --spec freq; "vel" shows velocities
+```
+
 ## Features
 
 Takefits provides a comprehensive set of tools for radio astronomy data analysis.

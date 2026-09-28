@@ -22,6 +22,12 @@ from PySide6.QtWidgets import (
 )
 
 from takefits.core.coordinate import CoordinateConverter
+from takefits.core.spectral_units import (
+    canonical_velocity_unit,
+    display_unit,
+    display_wcs,
+    spectral_wcs_axis,
+)
 from takefits.core.region import CircleRegion, CubeRegion, EllipseRegion, RectangleRegion, Region
 from takefits.ui.save_fits_dialog import SaveFITS
 from takefits.core.usecases import compute_cutout
@@ -30,7 +36,6 @@ from takefits.core.history_provenance import build_processing_history_lines_with
 
 
 __all__ = [
-    "CutoutProcessor",
     "CutoutSettingsDialog",
 ]
 
@@ -38,113 +43,6 @@ __all__ = [
 def _axis_display_name(ctype: str) -> str:
     base = ctype.split('-')[0].strip()
     return base or ctype
-
-
-class CutoutProcessor:
-    """Utility for extracting data/WCS cutouts from the current FITS viewer."""
-
-    def __init__(
-        self,
-        data: np.ndarray,
-        header,
-        wcs: WCS,
-        *,
-        wcs_to_data_axis: Optional[Sequence[Optional[int]]] = None,
-    ) -> None:
-        self._data = data
-        self._header = header
-        self._wcs = wcs
-        self._wcs_to_data_axis = self._initialize_wcs_axis_mapping(wcs_to_data_axis)
-        self._data_to_wcs_axis = {
-            data_axis: wcs_axis
-            for wcs_axis, data_axis in enumerate(self._wcs_to_data_axis)
-            if data_axis is not None
-        }
-
-    def _initialize_wcs_axis_mapping(
-        self, mapping: Optional[Sequence[Optional[int]]]
-    ) -> List[Optional[int]]:
-        if mapping is not None:
-            if len(mapping) != self._wcs.naxis:
-                raise ValueError("Provided axis mapping length does not match WCS axes.")
-            return [int(m) if m is not None else None for m in mapping]
-
-        data_ndim = getattr(self._data, 'ndim', 0)
-        default: List[Optional[int]] = []
-        for axis in range(self._wcs.naxis):
-            data_axis = data_ndim - axis - 1
-            if 0 <= data_axis < data_ndim:
-                default.append(data_axis)
-            else:
-                default.append(None)
-        return default
-
-    @staticmethod
-    def _clamp_indices(start: int, stop: int, axis_len: int) -> Tuple[int, int]:
-        start = max(start, 0)
-        stop = min(stop, axis_len)
-        return start, stop
-
-    def extract(self, pixel_bounds: Sequence[Tuple[int, int]]):
-        if self._wcs.naxis != len(pixel_bounds):
-            raise ValueError("Number of cut-out bounds does not match WCS axes.")
-
-        data_slices: List[slice] = [slice(None)] * self._data.ndim
-        actual_bounds_wcs: List[Optional[Tuple[int, int]]] = [None] * len(pixel_bounds)
-
-        for wcs_axis_index, data_axis_index in enumerate(self._wcs_to_data_axis):
-            req_start, req_stop = pixel_bounds[wcs_axis_index]
-            start_i = int(math.floor(req_start))
-            stop_i = int(math.ceil(req_stop))
-
-            if data_axis_index is None:
-                if stop_i <= start_i:
-                    stop_i = start_i + 1
-                actual_bounds_wcs[wcs_axis_index] = (start_i, stop_i)
-                continue
-
-            axis_len = self._data.shape[data_axis_index]
-            clip_start, clip_stop = self._clamp_indices(start_i, stop_i, axis_len)
-            if clip_stop <= clip_start:
-                raise ValueError("Selected region is outside data bounds.")
-
-            data_slices[data_axis_index] = slice(clip_start, clip_stop)
-            actual_bounds_wcs[wcs_axis_index] = (clip_start, clip_stop)
-
-        if any(bound is None for bound in actual_bounds_wcs):
-            raise ValueError("Failed to compute actual bounds for all axes.")
-
-        sample_dtype = self._data.dtype
-        out_dtype = sample_dtype if sample_dtype.kind in ('f', 'c') else np.float32
-        cutout_data = self._data[tuple(data_slices)].astype(out_dtype, copy=True)
-
-        new_header = self._header.copy()
-
-        for axis in range(self._wcs.naxis):
-            data_axis = self._wcs_to_data_axis[axis]
-            bound = actual_bounds_wcs[axis]
-            clip_start = bound[0]
-            span = max(bound[1] - bound[0], 1)
-            crpix_key = f"CRPIX{axis + 1}"
-            if crpix_key in new_header:
-                new_header[crpix_key] = float(new_header[crpix_key]) - clip_start
-            naxis_key = f"NAXIS{axis + 1}"
-            if naxis_key in new_header:
-                if data_axis is not None and 0 <= data_axis < cutout_data.ndim:
-                    new_header[naxis_key] = cutout_data.shape[data_axis]
-                else:
-                    new_header[naxis_key] = span
-
-        with np.errstate(all='ignore'):
-            try:
-                new_header['DATAMIN'] = float(np.nanmin(cutout_data))
-                new_header['DATAMAX'] = float(np.nanmax(cutout_data))
-            except ValueError:
-                new_header['DATAMIN'] = np.nan
-                new_header['DATAMAX'] = np.nan
-
-        new_wcs = WCS(new_header)
-        return cutout_data, new_header, new_wcs, actual_bounds_wcs
 
 
 class CutoutSettingsDialog(QDialog):
@@ -175,6 +73,8 @@ class CutoutSettingsDialog(QDialog):
         self.header = header_source.copy() if header_source is not None else None
 
         wcs_source = wcs_override if wcs_override is not None else getattr(fits_viewer, 'wcs', None)
+        # The dialog shows and parses world bounds in the display unit.
+        wcs_source = display_wcs(wcs_source, getattr(fits_viewer, 'spectral_metadata', None))
         self.wcs = wcs_source.deepcopy() if hasattr(wcs_source, 'deepcopy') else wcs_source
 
         if self.data is None or self.header is None or self.wcs is None:
@@ -1311,50 +1211,12 @@ class CutoutSettingsDialog(QDialog):
             collapsed_header.append(card, useblanks=False)
 
         for new_axis, src_axis in enumerate(axis_order, start=1):
+            # the display unit of each axis (km/s or m/s for velocity)
             self._apply_axis_unit(collapsed_header, new_axis, src_axis)
 
-        self._convert_velocity_axes_to_kms(collapsed_header, axis_order)
         self._append_velocity_history(collapsed_header)
 
         return collapsed_header
-
-    def _history_ranges_from_header(self, header, data_shape: Sequence[int]):
-        try:
-            wcs = WCS(header)
-        except Exception:
-            return []
-
-        converter = CoordinateConverter(wcs, self.config)
-        axis_types = converter.get_axis_types()
-
-        size_per_axis: List[int] = []
-        for axis in range(wcs.naxis):
-            data_axis = len(data_shape) - axis - 1
-            if 0 <= data_axis < len(data_shape):
-                size = int(data_shape[data_axis])
-            else:
-                size = 1
-            size_per_axis.append(max(size, 1))
-
-        if not size_per_axis:
-            return []
-
-        corners = np.array(list(product(*[(0, size - 1) for size in size_per_axis])), dtype=float)
-        if corners.size == 0:
-            return []
-
-        world_coords = wcs.wcs_pix2world(corners, 0)
-        history_ranges = []
-        for axis, axis_type in enumerate(axis_types):
-            values = world_coords[:, axis]
-            with np.errstate(all='ignore'):
-                lo = float(np.nanmin(values))
-                hi = float(np.nanmax(values))
-            formatted_min = converter.format_world_coordinate(lo, axis_type)
-            formatted_max = converter.format_world_coordinate(hi, axis_type)
-            history_ranges.append((formatted_min, formatted_max, _axis_display_name(axis_type)))
-
-        return history_ranges
 
     def _apply_axis_unit(self, header: fits.Header, new_axis: int, src_axis: int) -> None:
         unit_key = f'CUNIT{new_axis}'
@@ -1369,6 +1231,9 @@ class CutoutSettingsDialog(QDialog):
         header[unit_key] = (resolved, comment)
 
     def _resolve_unit_string(self, src_axis: int, fallback) -> Optional[str]:
+        shown = self._display_spectral_unit(src_axis)
+        if shown:
+            return shown
         if self._should_force_kms(src_axis):
             return 'km/s'
 
@@ -1408,6 +1273,28 @@ class CutoutSettingsDialog(QDialog):
                 return normalized
 
         return ''
+
+    def _display_metadata(self):
+        viewer = self.fits_viewer
+        metadata = getattr(viewer, 'spectral_metadata', None)
+        if not metadata:
+            metadata = getattr(getattr(viewer, 'fits_viewer', None), 'spectral_metadata', None)
+        return metadata if isinstance(metadata, dict) else None
+
+    def _display_spectral_unit(self, src_axis: int) -> Optional[str]:
+        """The display unit of the spectral axis (the dialog WCS holds its numbers in it).
+
+        km/s or m/s for velocity axes; GHz, MHz, um, Angstrom ... for
+        frequency and wavelength axes (TF-415 slice A), whose dialog WCS still
+        carries wcslib's SI label.
+        """
+        metadata = self._display_metadata()
+        if self.wcs is None or spectral_wcs_axis(self.wcs, metadata) != src_axis:
+            return None
+        shown = display_unit(metadata)
+        if not shown:
+            return None
+        return canonical_velocity_unit(shown) or shown
 
     def _normalize_unit(self, unit_str: str) -> str:
         sanitized = unit_str.replace('\u2212', '-').replace('\u2013', '-').replace('\u2014', '-')
@@ -1487,51 +1374,6 @@ class CutoutSettingsDialog(QDialog):
             return True
 
         return False
-
-    def _convert_velocity_axes_to_kms(self, header: fits.Header, axis_order: Sequence[int]) -> None:
-        for new_axis, src_axis in enumerate(axis_order, start=1):
-            axis_type = ''
-            if 0 <= src_axis < len(self.axis_types):
-                axis_type = self.axis_types[src_axis]
-            axis_type_upper = axis_type.upper() if axis_type else ''
-            if not any(token in axis_type_upper for token in ('VRAD', 'VELO', 'VOPT')):
-                continue
-
-            unit_key = f'CUNIT{new_axis}'
-            cdelt_key = f'CDELT{new_axis}'
-            crval_key = f'CRVAL{new_axis}'
-
-            current_unit = header.get(unit_key, '')
-            normalized_current = self._normalize_unit(current_unit) if current_unit else ''
-
-            if normalized_current == 'km/s':
-                header[unit_key] = 'km/s'
-                continue
-
-            conversion_factor = None
-            if normalized_current:
-                try:
-                    conversion_factor = (1 * u.Unit(normalized_current)).to(u.km / u.s).value
-                except Exception:
-                    conversion_factor = None
-
-            if conversion_factor is None:
-                # Assume the axis is already in km/s; just set the unit
-                header[unit_key] = 'km/s'
-                continue
-
-            if cdelt_key in header:
-                try:
-                    header[cdelt_key] = float(header[cdelt_key]) * conversion_factor
-                except Exception:
-                    pass
-            if crval_key in header:
-                try:
-                    header[crval_key] = float(header[crval_key]) * conversion_factor
-                except Exception:
-                    pass
-
-            header[unit_key] = 'km/s'
 
     def _infer_label_unit(self, wcs_axis: int) -> Optional[str]:
         if self.fits_viewer is None:

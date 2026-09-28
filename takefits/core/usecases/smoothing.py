@@ -12,6 +12,7 @@ from takefits.logic.data_tools import (
     is_lazy_scaled,
     materialize_elementwise_inputs,
 )
+from takefits.core.spectral_units import header_axis_step
 
 
 SmoothingKernel = Literal["gaussian", "boxcar", "hanning"]
@@ -542,8 +543,8 @@ def compute_smoothed_to_resolution(
         target_bmaj, target_bmin = target_bmin, target_bmaj
 
     # Get pixel scale
-    pixel_scale_x = abs(header['CDELT1']) * 3600  # arcsec/pixel
-    pixel_scale_y = abs(header['CDELT2']) * 3600
+    pixel_scale_x = abs(header_axis_step(header, 1)) * 3600  # arcsec/pixel (CDELT or CD matrix)
+    pixel_scale_y = abs(header_axis_step(header, 2)) * 3600
 
     # Calculate convolving kernel parameters
     FWHM_to_sigma = 1.0 / (2.0 * np.sqrt(2.0 * np.log(2)))

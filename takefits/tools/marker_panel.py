@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from astropy import units as u
 from astropy.wcs.utils import proj_plane_pixel_scales
 
+from takefits.core.spectral_units import axis_step, viewer_display_wcs
 from takefits.core.marker import (
     Marker,
     MarkerState,
@@ -1674,7 +1675,7 @@ class MarkerPanel(QDialog):
         plane = self._plane_display_label(marker.plane)
         viewer = self._viewer_for_marker(marker)
         converter = getattr(viewer, "converter", None) if viewer else None
-        wcs = getattr(converter, "wcs", None) if converter is not None else getattr(viewer, "wcs", None)
+        wcs = getattr(converter, "wcs", None) if converter is not None else viewer_display_wcs(viewer)
         axis_indices = self._plane_axis_indices(marker.plane, wcs)
         world_values = self._world_strings_from_marker(
             marker,
@@ -2277,7 +2278,7 @@ class MarkerPanel(QDialog):
         if wcs is None or axis_index is None:
             return base
         try:
-            step = abs(float(wcs.wcs.cdelt[int(axis_index)]))
+            step = abs(float(axis_step(wcs, int(axis_index))))
         except Exception:
             return base
         if not math.isfinite(step) or step <= 0:
@@ -3324,6 +3325,7 @@ class MarkerPanel(QDialog):
             plane = self.marker_manager.import_from_dict(
                 payload,
                 clear_existing=clear_existing,
+                from_file=True,  # a file without a unit record is in the old units
             )
             self.marker_manager.redraw_plane(plane)
             self._current_plane = plane
@@ -3409,7 +3411,7 @@ class MarkerPanel(QDialog):
         # Attach world endpoints for lines so they can be reprojected with correct angle.
         viewer = self.marker_manager.viewer_for_plane(plane)
         format_pix = getattr(viewer, "format_pix", None) if viewer else None
-        wcs = getattr(viewer, "wcs", None) if viewer else None
+        wcs = viewer_display_wcs(viewer) if viewer else None
         base_plane_resolver = getattr(self.marker_manager, "_base_plane_for", None)
         base_plane = base_plane_resolver(plane) if callable(base_plane_resolver) else plane
         if format_pix is not None and wcs is not None:
@@ -3459,7 +3461,7 @@ class MarkerPanel(QDialog):
         viewer = self._viewer_for_plane(plane)
         if viewer is None:
             return None
-        wcs = getattr(viewer, "wcs", None)
+        wcs = viewer_display_wcs(viewer)
         if wcs is None:
             return None
         axis_indices = self._plane_axis_indices(plane, wcs)

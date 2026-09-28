@@ -7,6 +7,12 @@ import numpy as np
 
 from takefits.core.app_state import AppState
 from takefits.core.io.save_fits import update_datamin_datamax_if_present
+from takefits.core.spectral_units import display_wcs
+
+
+def _display_wcs(state: AppState):
+    """The state's WCS with spectral numbers in the display unit (world values in and out)."""
+    return display_wcs(state.wcs, getattr(state, "spectral_metadata", None))
 
 
 def world_to_pixel(
@@ -30,7 +36,7 @@ def world_to_pixel(
         raise ValueError("WCS is not available")
 
     world_array = np.array([world_coords])
-    pixel_array = state.wcs.wcs_world2pix(world_array, 0)
+    pixel_array = _display_wcs(state).wcs_world2pix(world_array, 0)
 
     return tuple(pixel_array[0])
 
@@ -56,7 +62,7 @@ def pixel_to_world(
         raise ValueError("WCS is not available")
 
     pixel_array = np.array([pixel_coords])
-    world_array = state.wcs.wcs_pix2world(pixel_array, 0)
+    world_array = _display_wcs(state).wcs_pix2world(pixel_array, 0)
 
     return tuple(world_array[0])
 
@@ -144,13 +150,14 @@ def axis_world_to_pixel(
     else:
         world_val_float = float(world_value)
 
+    wcs = _display_wcs(state)
     if reference_pixel is not None:
-        ref_world = list(state.wcs.wcs_pix2world([list(reference_pixel)], 0)[0])
+        ref_world = list(wcs.wcs_pix2world([list(reference_pixel)], 0)[0])
     else:
-        ref_world = list(state.wcs.wcs.crval)
+        ref_world = list(wcs.wcs.crval)
 
     ref_world[axis] = world_val_float
-    pixel_coords = state.wcs.wcs_world2pix([ref_world], 0)[0]
+    pixel_coords = wcs.wcs_world2pix([ref_world], 0)[0]
 
     return float(pixel_coords[axis])
 
@@ -177,7 +184,7 @@ def axis_pixel_to_world(
         ref_pixel = [crpix - 1 for crpix in state.wcs.wcs.crpix]
 
     ref_pixel[axis] = pixel_value
-    world_coords = state.wcs.wcs_pix2world([ref_pixel], 0)[0]
+    world_coords = _display_wcs(state).wcs_pix2world([ref_pixel], 0)[0]
 
     return float(world_coords[axis])
 
@@ -207,9 +214,10 @@ def world_bounds_to_pixel_bounds(
 
     corners = list(product(*[(lo, hi) for lo, hi in parsed_bounds]))
 
+    wcs = _display_wcs(state)
     pixel_values = []
     for corner in corners:
-        pix = state.wcs.wcs_world2pix([list(corner)], 0)[0]
+        pix = wcs.wcs_world2pix([list(corner)], 0)[0]
         pixel_values.append(pix)
 
     pix_array = np.array(pixel_values)

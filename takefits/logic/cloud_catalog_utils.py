@@ -1,4 +1,5 @@
 import numpy as np
+from takefits.core.spectral_units import axis_step
 
 def calculate_props_from_indices_values(indices, values, wcs=None, ndim=3, label_id=0):
     """
@@ -144,9 +145,8 @@ def calculate_props_from_indices_values(indices, values, wcs=None, ndim=3, label
         except Exception:
             # Fallback
             if hasattr(wcs.wcs, 'cdelt'):
-                cdelt = wcs.wcs.cdelt
-                dx_deg = abs(cdelt[0])
-                dy_deg = abs(cdelt[1])
+                dx_deg = abs(axis_step(wcs, 0))
+                dy_deg = abs(axis_step(wcs, 1))
                 area_deg2 = npix * dx_deg * dy_deg
                 r_eff_deg = np.sqrt(area_deg2 / np.pi)
                 sigma_x_deg = x_sig_pix * dx_deg
@@ -164,7 +164,7 @@ def calculate_props_from_indices_values(indices, values, wcs=None, ndim=3, label
             if ndim == 3 and wcs_naxis >= 3:
                  try:
                      spec_axis = 2 # 3rd axis
-                     cdelt = wcs.wcs.cdelt[spec_axis]
+                     cdelt = axis_step(wcs, spec_axis)
                      crval = wcs.wcs.crval[spec_axis]
                      crpix = wcs.wcs.crpix[spec_axis] # 1-based
                      

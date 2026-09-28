@@ -1,11 +1,12 @@
 """Headless visualization usecases."""
 from __future__ import annotations
 
-from typing import Optional, Tuple, Union, List
+from typing import Optional, Sequence, Tuple, Union, List
 
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.core.spectral_units import display_wcs
 from takefits.core.usecases.moment import compute_moment
 from takefits.core.usecases.channel_map import compute_channel_map, channel_labels_to_world
 from takefits.core.usecases.export import export_figure
@@ -240,12 +241,26 @@ def _apply_channel_map_colorbar_layout(fig, cax, tile_axes, config, overrides=No
     cax.set_gid('colorbar')
 
 
-def _label_pv_spectral_axis(dm, header, config) -> None:
+def _pv_plot_wcs(wcs_2d, header):
+    """The PV WCS to plot: with the SI switch, a copy whose velocity numbers are in the header unit."""
+    if wcs_2d is None or header is None:
+        return wcs_2d
+    for index in (1, 2):
+        ctype = str(header.get(f'CTYPE{index}', '') or '').upper()
+        if ctype in ('OFFSET', 'PHI', ''):
+            continue
+        unit = str(header.get(f'CUNIT{index}', '') or '').strip()
+        return display_wcs(wcs_2d, {'current_axis_unit': unit, 'axis_index': index})
+    return wcs_2d
+
+
+def _label_pv_spectral_axis(dm, header, config, *, numbers_in_header_unit: bool = False) -> None:
     """Show the PV spectral axis in the header's unit, with that unit labelled.
 
     Astropy normalizes a spectral WCS to SI internally, so a km/s header renders
     m/s tick values and `DisplayMap` labels the axis "Velocity" with no unit.
-    Both are unhelpful in a publication figure.
+    Both are unhelpful in a publication figure.  When the plotted WCS already
+    holds header-unit numbers (``numbers_in_header_unit``), no format unit is set.
     """
     ax = getattr(dm, 'ax', None)
     if ax is None or header is None:
@@ -260,12 +275,17 @@ def _label_pv_spectral_axis(dm, header, config) -> None:
             coord = ax.coords[index]
         except Exception:
             continue
-        if unit:
+        if unit and not numbers_in_header_unit:
             try:
                 coord.set_format_unit(unit)
             except Exception:
                 pass
-        base = 'Frequency' if 'FREQ' in ctype else 'Velocity'
+        if 'FREQ' in ctype:
+            base = 'Frequency'
+        elif ctype.startswith(('WAVE', 'AWAV')):
+            base = 'Wavelength'
+        else:
+            base = 'Velocity'
         try:
             coord.set_axislabel(
                 f'{base} [{unit}]' if unit else base,
@@ -305,6 +325,10 @@ def register_custom_colormaps():
         mpl_colormaps.register(cool.reversed_colormap().get_colormap())
 
 
+# Plane shown by a moment map integrated along a numpy axis.
+_MOMENT_PLANES = {0: 'xy', 1: 'xz', 2: 'zy'}
+
+
 def export_moment_image(
     state: AppState,
     output_path: str,
@@ -326,6 +350,11 @@ def export_moment_image(
     draw_regions: bool = True,
     draw_beam: bool = True,
     draw_contours: bool = True,
+    clip_threshold: Optional[float] = None,
+    cmap_rgba: Optional[Sequence[Sequence[float]]] = None,
+    log_scale: bool = False,
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
 ) -> str:
     """
     Compute a moment map and export it as an image using CLI/GUI styling.
@@ -358,6 +387,14 @@ def export_moment_image(
         draw_beam: Draw the HPBW beam ellipse when the header carries one
             (TF-303), matching the GUI's XY viewer.
         draw_contours: Draw ``state.contours`` overlays (TF-303).
+        clip_threshold: Values below this finite threshold are excluded before
+            computing the moment map.
+        cmap_rgba: Optional sampled RGBA colormap. This takes precedence over
+            ``cmap`` and preserves GUI gamma/custom colormaps in a manifest.
+        log_scale: Apply logarithmic normalization. The effective limits must
+            both be positive.
+        xlim: Optional displayed X pixel limits.
+        ylim: Optional displayed Y pixel limits.
 
     Returns:
         Path to saved file.
@@ -367,12 +404,23 @@ def export_moment_image(
         state=state,
         moment_type=moment_type,
         axis=axis,
+        clip_threshold=clip_threshold,
         pixel_range=pixel_range,
-        world_range=world_range
+        world_range=world_range,
     )
     
-    # 2. Prepare 2D Header/WCS
-    if state.header:
+    # 2. Prepare 2D Header/WCS.  An XZ/ZY map (axis 1/2) keeps the spectral
+    # axis, which a 2-D header cannot hold next to one celestial axis, so it is
+    # drawn on the cube's WCS with the integrated axis as a single pixel, as the
+    # GUI's moment windows do.
+    plane = _MOMENT_PLANES.get(int(axis), 'xy')
+    wcs_naxis = int(getattr(getattr(state, 'wcs', None), 'naxis', 0) or 0)
+    if plane != 'xy' and wcs_naxis != 3:
+        plane = 'xy'  # 4-D cubes keep the previous 2-D celestial rendering
+    if plane != 'xy':
+        header_2d = state.header
+        wcs_2d = display_wcs(state.wcs, getattr(state, "spectral_metadata", None))
+    elif state.header:
         header_2d = create_2d_header_from_3d(state.header, axis_to_drop=axis)
         try:
             wcs_2d = WCS(header_2d)
@@ -385,6 +433,7 @@ def export_moment_image(
     # 3. Configure DisplayMap
     # Load stored config, then apply the state's render overrides (TF-302) so
     # tick/label/font/colorbar styling is action- and CLI-driveable.
+    register_custom_colormaps()
     config_manager = ConfigManager()
     config = resolve_render_config(state, config_manager.config)
 
@@ -452,7 +501,17 @@ def export_moment_image(
     # DisplayMap handles WCSAxes, colorbars, ticks, etc.
     from takefits.core.plotting.display_map import DisplayMap
 
-    dm = DisplayMap(moment_data, header_2d, wcs_2d, config)
+    moment_array = np.asarray(moment_data)
+    if plane == 'xz':
+        plot_data = moment_array[:, np.newaxis, :]  # (z, 1, x)
+        shown_data = moment_array
+    elif plane == 'zy':
+        plot_data = moment_array[:, :, np.newaxis]  # (z, y, 1)
+        shown_data = moment_array.T  # DisplayMap shows (y, z)
+    else:
+        plot_data = moment_data
+        shown_data = moment_data
+    dm = DisplayMap(plot_data, header_2d, wcs_2d, config)
 
     # Intensity limits: DisplayMap.display() applies default_cmin/cmax to the
     # image, so overriding them here also keeps the colorbar consistent.
@@ -461,8 +520,42 @@ def export_moment_image(
     if vmax is not None:
         dm.default_cmax = float(vmax)
 
-    # We display on 'xy' plane because we have reduced it to 2D
-    dm.display(fig, plane='xy')
+    dm.display(fig, plane=plane)
+
+    # A GUI gamma/custom colormap is captured as realized RGBA samples, not as
+    # mutable color-panel settings. Apply it to the already-created image and
+    # refresh the colorbar so a later local config change cannot affect it.
+    if cmap_rgba is not None:
+        import matplotlib as mpl
+
+        samples = np.asarray(cmap_rgba, dtype=float)
+        if (
+            samples.ndim != 2
+            or samples.shape[0] < 2
+            or samples.shape[1] != 4
+            or not np.isfinite(samples).all()
+            or np.any(samples < 0.0)
+            or np.any(samples > 1.0)
+        ):
+            raise ValueError("cmap_rgba must contain at least two finite RGBA rows in [0, 1]")
+        sampled_cmap = mpl.colors.ListedColormap(samples, name="takefits_snapshot")
+        sampled_cmap.set_bad(config.get('bad_color', 'black'))
+        dm.im.set_cmap(sampled_cmap)
+
+    if log_scale:
+        import matplotlib as mpl
+
+        current_vmin, current_vmax = dm.im.get_clim()
+        log_vmin = float(vmin) if vmin is not None else float(current_vmin)
+        log_vmax = float(vmax) if vmax is not None else float(current_vmax)
+        if not np.isfinite(log_vmin) or not np.isfinite(log_vmax):
+            raise ValueError("log_scale requires finite vmin and vmax")
+        if log_vmin <= 0.0 or log_vmax <= 0.0 or log_vmin >= log_vmax:
+            raise ValueError("log_scale requires 0 < vmin < vmax")
+        dm.im.set_norm(mpl.colors.LogNorm(vmin=log_vmin, vmax=log_vmax))
+
+    if getattr(dm, 'colorbar', None) is not None and (cmap_rgba is not None or log_scale):
+        dm.colorbar.update_normal(dm.im)
 
     # Reposition after display so the axes bounds are final.
     if auto_colorbar:
@@ -470,35 +563,41 @@ def export_moment_image(
             dm, fig, config, getattr(state, 'render_config', None)
         )
 
+    if xlim is not None:
+        dm.ax.set_xlim(float(xlim[0]), float(xlim[1]))
+    if ylim is not None:
+        dm.ax.set_ylim(float(ylim[0]), float(ylim[1]))
+
     # Contour overlays (TF-303): the image's own contours, and/or external
     # FITS overlaid by world coordinate. Drawn under the beam and annotations.
     if draw_contours and getattr(state, 'contours', None):
         draw_contour_specs_on_axes(
             dm.ax,
             state.contours,
-            data=moment_data,
-            target_wcs=wcs_2d,
-            plane='xy',
+            data=shown_data,
+            target_wcs=wcs_2d if plane == 'xy' else None,
+            plane=plane,
         )
 
     # HPBW beam, as the GUI draws on its XY viewer. No-op when the header
-    # carries no usable beam, so non-interferometric data is unaffected.
-    if draw_beam:
+    # carries no usable beam, so non-interferometric data is unaffected.  A
+    # position-velocity map has no beam to draw.
+    if draw_beam and plane == 'xy':
         draw_beam_on_axes(dm.ax, header_2d if header_2d is not None else state.header, config)
 
     # Annotations live in AppState and are drawn with the same artists the GUI
     # uses, so a CLI export matches what the viewer shows (TF-302). Regions go
     # first so markers stay on top, matching the GUI's zorder.
     if draw_regions and getattr(state, 'regions', None):
-        draw_regions_on_axes(dm.ax, state.regions, plane='xy')
+        draw_regions_on_axes(dm.ax, state.regions, plane=plane)
 
     if draw_markers and getattr(state, 'markers', None):
         draw_markers_on_axes(
             dm.ax,
             state.markers,
-            plane='xy',
-            wcs=wcs_2d,
-            shape=getattr(moment_data, 'shape', None),
+            plane=plane,
+            wcs=wcs_2d if plane == 'xy' else None,  # angular lengths only on the sky plane
+            shape=getattr(shown_data, 'shape', None),
         )
 
     if title:
@@ -583,17 +682,10 @@ def export_channel_map_image(
              crval1 = state.header.get('CRVAL1', 0)
              crval2 = state.header.get('CRVAL2', 0)
              
-             # Check if CUNIT3 is 'm/s' and input is likely km/s?
-             # User standard: "interval 25 km/s code [-150, 150] km/s"
-             # If WCS is m/s, we must scale input 1000x.
-             cunit3 = state.header.get('CUNIT3', '').lower()
-             scale_factor = 1.0
-             if 'm/s' in cunit3 and 'km/s' not in cunit3 and abs(start_world) < 10000:
-                  # Heuristic: if WCS is m/s but input is small, assume input is km/s
-                  scale_factor = 1000.0
-
-             w_start = start_world * scale_factor
-             w_end = end_world * scale_factor
+             # World inputs are in the display unit (m/s for fine m/s cubes),
+             # the unit display_wcs below holds; no km/s guess.
+             w_start = start_world
+             w_end = end_world
              
              # Convert to pixel
              # wcs_world2pix takes (ra, dec, vel) usually
@@ -603,9 +695,10 @@ def export_channel_map_image(
              # Safe Conversion: Use spectral_coord conversion if possible, or full wcs
              coords_start = [[crval1, crval2, w_start]]
              coords_end = [[crval1, crval2, w_end]]
+             shown_wcs = display_wcs(state.wcs, getattr(state, "spectral_metadata", None))
              
-             pix_start = state.wcs.wcs_world2pix(coords_start, 0)[0][2]
-             pix_end = state.wcs.wcs_world2pix(coords_end, 0)[0][2]
+             pix_start = shown_wcs.wcs_world2pix(coords_start, 0)[0][2]
+             pix_end = shown_wcs.wcs_world2pix(coords_end, 0)[0][2]
              
              start_channel = min(pix_start, pix_end)
              end_channel = max(pix_start, pix_end)
@@ -614,9 +707,9 @@ def export_channel_map_image(
                  # Calculate interval in pixels
                  # Estimate pixel scale at the center velocity?
                  # Or just diff between start and start+interval
-                 w_next = (start_world + interval_world) * scale_factor
+                 w_next = start_world + interval_world
                  coords_next = [[crval1, crval2, w_next]]
-                 pix_next = state.wcs.wcs_world2pix(coords_next, 0)[0][2]
+                 pix_next = shown_wcs.wcs_world2pix(coords_next, 0)[0][2]
                  interval = abs(pix_next - pix_start)
                  
              # Round to nearest integer for safe slicing/averaging?
@@ -710,7 +803,7 @@ def export_channel_map_image(
             vmax = global_max
 
     # Prepare WCS projection
-    wcs = state.wcs
+    wcs = display_wcs(state.wcs, getattr(state, "spectral_metadata", None))
     slices = None
     if wcs:
         # Determine slices based on axis
@@ -1345,19 +1438,20 @@ def export_pv_image(
 
     from takefits.core.plotting.display_map import DisplayMap
 
-    dm = DisplayMap(data_2d, header_2d, wcs_2d, config)
+    plot_wcs = _pv_plot_wcs(wcs_2d, header_2d)
+    dm = DisplayMap(data_2d, header_2d, plot_wcs, config)
     if vmin is not None:
         dm.default_cmin = float(vmin)
     if vmax is not None:
         dm.default_cmax = float(vmax)
 
     dm.display(fig, plane='xy')
-    _label_pv_spectral_axis(dm, header_2d, config)
+    _label_pv_spectral_axis(dm, header_2d, config, numbers_in_header_unit=plot_wcs is not wcs_2d)
 
     # Contour specs on the `pv` plane overlay the diagram itself (TF-303).
     if draw_contours and getattr(state, 'contours', None):
         draw_contour_specs_on_axes(
-            dm.ax, state.contours, data=data_2d, target_wcs=wcs_2d, plane='pv'
+            dm.ax, state.contours, data=data_2d, target_wcs=plot_wcs, plane='pv'
         )
 
     if auto_colorbar:

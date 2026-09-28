@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional
 
+from takefits.core.actions import canonical_action_name
+
 
 _ACTION_LABELS: Dict[str, str] = {
     "apply_mask_threshold": "Apply Mask Threshold",
@@ -16,6 +18,7 @@ _ACTION_LABELS: Dict[str, str] = {
     "apply_scaling": "Apply Scaling",
     "apply_baseline_subtraction": "Apply Baseline Subtraction",
     "convert_intensity_unit": "Convert Intensity Unit",
+    "set_spectral_axis": "Set Spectral Axis",
     "compute_arithmetic": "Compute Arithmetic",
     "compute_regrid": "Compute Regrid",
     "compute_moment": "Compute Moment",
@@ -56,10 +59,13 @@ _ACTION_PARAM_KEYS: Dict[str, List[str]] = {
     "apply_scaling": ["scale_factor"],
     "apply_baseline_subtraction": ["order", "world_ranges"],
     "convert_intensity_unit": ["from_unit", "to_unit", "method"],
+    "set_spectral_axis": ["restfreq_hz", "z", "intent"],
     "compute_arithmetic": ["operation", "expression", "data_b_path"],
     "compute_regrid": ["mode", "target_system", "template_path", "interpolation"],
     "compute_moment": ["moment_type", "axis", "clip_threshold", "pixel_range", "world_range"],
-    "export_moment_fits": ["moment_type", "axis", "pixel_range", "world_range"],
+    "export_moment_fits": [
+        "moment_type", "axis", "clip_threshold", "pixel_range", "world_range",
+    ],
     "compute_pv": [
         "x0", "y0", "x1", "y1", "start_world", "end_world", "width",
         "sample_spacing_pix", "weight_mode", "position_origin", "position_unit", "path_type",
@@ -166,6 +172,45 @@ def _axis_label_from_target(target: Any, axis_index: int, fallback: Optional[str
             pass
 
     return fallback_label
+
+
+def _number(value) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _velocity_convention_of(target: Any) -> str:
+    """'radio' / 'optical' velocities, or the kind of a non-velocity spectral axis, for HISTORY."""
+    label = _spectral_axis_label_from_target(target).upper()
+    if "VRAD" in label:
+        return "radio velocities"
+    if "VOPT" in label:
+        return "optical velocities"
+    if "FREQ" in label:
+        return "frequency axis"
+    return "spectral axis"
+
+
+def _spectral_axis_lines(params: Dict[str, Any], target: Any) -> List[str]:
+    """HISTORY for set_spectral_axis: the line's rest frequency, z and what the axis kept."""
+    rest = _number(params.get("restfreq_hz"))
+    z = _number(params.get("z"))
+    lines = []
+    if rest is not None:
+        lines.append(f"Line rest frequency: {rest:.12g} Hz")
+    if z is not None:
+        if rest is not None and z > -1:
+            lines.append(f"Systemic z = {z:.12g}; RESTFRQ = rest / (1 + z) = {rest / (1.0 + z):.12g} Hz")
+        else:
+            lines.append(f"Systemic z = {z:.12g}")
+    convention = _velocity_convention_of(target)
+    if params.get("intent") == "rereference":
+        lines.append(f"Re-referenced ({convention}); observed frequencies kept")
+    elif params.get("intent") == "metadata":
+        lines.append(f"{convention[0].upper()}{convention[1:]} kept; only the rest frequency changed")
+    return lines
 
 
 def _spectral_axis_label_from_target(target: Any) -> str:
@@ -478,6 +523,11 @@ def _build_verbose_history(action_name: str, params: Dict[str, Any], timestamp: 
         lines.append(f"Conversion: {f_unit} -> {t_unit}")
         lines.append(f"Method: {method}")
 
+    elif action_name == "set_spectral_axis":
+        lines.append(f"Spectral axis set using takefits on {time_str}")
+        lines.append(f"Source file: {filename}")
+        lines.extend(_spectral_axis_lines(params, target))
+
     elif action_name == "apply_baseline_subtraction":
         lines.append(f"Baseline subtracted using takefits on {time_str}")
         lines.append(f"Source file: {filename}")
@@ -669,7 +719,7 @@ def build_processing_history_lines_from_records(
 
     for raw_record in records:
         record = _coerce_record(raw_record)
-        action_name = str(getattr(record, "action", "") or "").strip()
+        action_name = str(canonical_action_name(str(getattr(record, "action", "") or "").strip()))
         if not action_name:
             continue
         label = _ACTION_LABELS.get(action_name)

@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 
 from takefits.core.app_state import AppState
+from takefits.core.spectral_units import display_wcs
 from takefits.logic.data_tools import (
     _get_available_memory_bytes,
     ensure_operation_memory_budget,
@@ -44,6 +45,11 @@ class ClumpResult:
     catalog: list  # List of dicts with properties per clump
     algorithm: str
     parameters: Dict[str, Any]
+
+
+def _catalog_wcs(state: AppState):
+    """The WCS the clump finders and catalogs read velocities from (display unit)."""
+    return display_wcs(state.wcs, getattr(state, "spectral_metadata", None))
 
 
 def _detect_total_ram_bytes() -> int | None:
@@ -269,7 +275,7 @@ def run_clumpfind(
     min_val = rms * min_threshold_sigma
     step = rms * step_sigma
 
-    finder = ClumpFind(data, wcs=state.wcs)
+    finder = ClumpFind(data, wcs=_catalog_wcs(state))
     mask = finder.run(min_val=min_val, step=step, min_pix=min_pixels, reporter=reporter)
     reporter.update(96, "Building catalog...")
     catalog = finder.get_catalog()
@@ -330,7 +336,7 @@ def run_fellwalker(
     min_val = rms * min_threshold_sigma
     min_dip = rms * min_dip_sigma
 
-    walker = FellWalker(data, wcs=state.wcs)
+    walker = FellWalker(data, wcs=_catalog_wcs(state))
     mask = walker.run(min_val=min_val, min_dip=min_dip, min_pix=min_pixels, reporter=reporter)
     reporter.update(96, "Building catalog...")
     catalog = walker.get_catalog()
@@ -402,7 +408,7 @@ def run_dendrogram(
     min_delta = rms * min_delta_sigma
 
     # Pass header to handler!
-    handler = DendroHandler(data, wcs=state.wcs, header=state.header)
+    handler = DendroHandler(data, wcs=_catalog_wcs(state), header=state.header)
     handler.run_dendrogram(min_value=min_value, min_delta=min_delta, min_npix=min_npix, reporter=reporter)
 
     if use_scimes and scimes_criteria:
@@ -495,7 +501,7 @@ def generate_catalog(state: AppState, mask: np.ndarray) -> List[Dict[str, Any]]:
     if mask.shape != data.shape:
         raise ValueError(f"Mask shape {mask.shape} does not match data shape {data.shape}")
 
-    return build_catalog(data, mask, wcs=state.wcs)
+    return build_catalog(data, mask, wcs=_catalog_wcs(state))
 
 
 def export_clump_mask(

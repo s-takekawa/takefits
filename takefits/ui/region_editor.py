@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
+from takefits.core.spectral_units import axis_step, viewer_display_wcs
 from takefits.core.region import CircleRegion, RectangleRegion, EllipseRegion, CubeRegion
 from takefits.core.region_viewer import (
     resolve_plane_pixel_limits,
@@ -450,7 +451,7 @@ class RegionEditorDialog(QDialog):
         converter = getattr(self.viewer, 'converter', None)
         wcs = getattr(converter, 'wcs', None)
         if wcs is None:
-            wcs = getattr(self.viewer, 'wcs', None)
+            wcs = viewer_display_wcs(self.viewer)
         self._axis_scales = {
             'x': {'deg_per_pix': None, 'kms_per_pix': None, 'unit': None, 'axis_type': None},
             'y': {'deg_per_pix': None, 'kms_per_pix': None, 'unit': None, 'axis_type': None},
@@ -1335,7 +1336,7 @@ class RegionEditorDialog(QDialog):
         content.append("\n##### Results (World Coordinates) #####")
 
 
-        converter, wcs = getattr(self.viewer, 'converter', None), getattr(self.viewer, 'wcs', None)
+        converter, wcs = getattr(self.viewer, 'converter', None), viewer_display_wcs(self.viewer)
 
         try:
             if not (converter and wcs):
@@ -1390,7 +1391,7 @@ class RegionEditorDialog(QDialog):
 
                 # Sigma_z
                 if is_3d and z_idx != -1 and 'sigma_z_pix' in moments:
-                    z_scale = abs(wcs.wcs.cdelt[z_idx])
+                    z_scale = abs(axis_step(wcs, z_idx))
                     val = moments['sigma_z_pix'] * z_scale
                     text = f"{fm(val)} {header_unit}" if header_unit else f"{fm(val)}"
                     add_line(content,

@@ -7,9 +7,18 @@ from pathlib import Path
 from astropy.io import fits
 from astropy.io.fits import VerifyError
 from astropy.wcs import WCS
-from astropy import units as u
 
-from takefits.logic.freq_to_velocity import FreqToVelocity
+from takefits.core.spectral_units import (
+    apply_load_convention,
+    classify_axis_type,
+    header_axis_step,
+    identify_spectral_axis,
+    normalize_velocity_cunits,
+    refresh_alternate_reference,
+    set_header_axis_step,
+    systemic_redshift_from_header,
+)
+from takefits.logic.freq_to_velocity import FreqToVelocity, RadioVelocityToFrequency
 from takefits.logic.data_tools import (
     LAZY_SCALING_THRESHOLD_BYTES,
     MEMMAP_THRESHOLD_BYTES,
@@ -27,6 +36,28 @@ from takefits.logic.data_tools import (
 # sanitized per slice so opening a large FITS does not page the whole file in.
 _FULL_DATA_SANITIZE_MAX_BYTES = MEMMAP_THRESHOLD_BYTES
 _SANITIZE_CHUNK_TARGET_BYTES = 16 * 1024 * 1024
+
+_KNOWN_CTYPE_FIXES = {
+    "GLON---TAN": "GLON-TAN",
+    "GLAT--TAN": "GLAT-TAN",
+}
+
+
+def _normalize_known_ctype_typos(header) -> None:
+    """Repair known, unambiguous celestial CTYPE separator typos in memory."""
+    try:
+        naxis = int(header.get("NAXIS", 0))
+    except (AttributeError, TypeError, ValueError):
+        return
+
+    for axis in range(1, naxis + 1):
+        key = f"CTYPE{axis}"
+        original = str(header.get(key, "")).strip().upper()
+        replacement = _KNOWN_CTYPE_FIXES.get(original)
+        if replacement is None:
+            continue
+        print(f"\033[93mWarning: Corrected {key}: {original} ==> {replacement}.\033[0m")
+        header[key] = replacement
 
 
 def _selected_image_hdu_index(hdul, requested_hdu: int | None = None) -> int | None:
@@ -240,32 +271,50 @@ def _collapse_singleton_axes(data, header):
     return data
 
 
-def _classify_axis_type(ctype: str):
-    """Return a simple classification ('frequency', 'velocity', or 'unknown') for a CTYPE value."""
-    if not ctype:
-        return 'unknown'
-    ctype_upper = str(ctype).upper()
-    if 'FREQ' in ctype_upper:
-        return 'frequency'
-    if any(tag in ctype_upper for tag in ('VRAD', 'VELO', 'VOPT')):
-        return 'velocity'
-    return 'unknown'
+# The loader's names for the shared helpers.
+_classify_axis_type = classify_axis_type
+_identify_spectral_axis = identify_spectral_axis
 
 
-def _identify_spectral_axis(header):
-    """Identify the first spectral-like axis (frequency or velocity)."""
-    if header is None:
-        return None
-    try:
-        naxis = int(header.get('NAXIS', 0))
-    except (TypeError, ValueError):
-        return None
+class _KeptFrequencyAxis:
+    """Stands in for FreqToVelocity when the frequency axis is kept."""
 
-    for axis in range(1, naxis + 1):
-        ctype = header.get(f'CTYPE{axis}', '')
-        if _classify_axis_type(ctype) != 'unknown':
-            return axis
-    return None
+    converted = False
+    to_frequency = False
+
+
+def _frequency_converter(header, frequency_axis: str, spectral_axis_index):
+    """The converter for the spectral axis: to velocity (the default), kept, or to frequency.
+
+    ``frequency_axis='frequency'`` keeps a frequency axis and turns a radio
+    velocity axis into frequency; other velocity axes open in velocity, with
+    a notice saying why.
+    """
+    kind = _classify_axis_type(header.get(f'CTYPE{spectral_axis_index}', '')) if spectral_axis_index else 'unknown'
+    if frequency_axis == "frequency":
+        if kind == 'frequency':
+            print("\033[96mThe frequency axis stays in frequency (spectral axis: freq).\033[0m")
+        elif kind == 'velocity':
+            converter = RadioVelocityToFrequency(header, spectral_axis_index)
+            if converter.to_frequency:
+                print("\033[96mThe radio-velocity axis opens in frequency, f = f0 (1 - v/c) "
+                      "(spectral axis: freq).\033[0m")
+                return converter
+            print(f"\033[93mThe spectral axis opens in velocity: {converter.reason}.\033[0m")
+            if "rest frequency" in str(converter.reason):
+                print("\033[96m  To show frequencies, set RestFreq in Unit Conversion, "
+                      "save the cube and reopen it.\033[0m")
+        return _KeptFrequencyAxis()
+    return FreqToVelocity(header)
+
+
+def _spectral_axis_mode(spectral_metadata) -> dict:
+    """The mode that applied to a frequency axis, for source records; {} for other axes."""
+    if spectral_metadata.get('converted_from_frequency'):
+        return {"frequency_axis": "velocity"}
+    if spectral_metadata.get('current_axis_type') == 'frequency':
+        return {"frequency_axis": "frequency"}
+    return {}
 
 
 def _get_restfreq_hz(header):
@@ -290,8 +339,7 @@ def _ensure_velocity_axis_ascending(data, header, fits_axis):
     if fits_axis is None or data is None or header is None:
         return data, False
 
-    cdelt_key = f'CDELT{fits_axis}'
-    cdelt = header.get(cdelt_key)
+    cdelt = header_axis_step(header, fits_axis)  # CDELT or CD matrix
     if cdelt is None or cdelt >= 0:
         return data, False
 
@@ -302,11 +350,11 @@ def _ensure_velocity_axis_ascending(data, header, fits_axis):
         axis_length = data.shape[data_axis]
 
     if axis_length in (None, 0) or axis_length == 1:
-        header[cdelt_key] = abs(cdelt)
+        set_header_axis_step(header, fits_axis, abs(cdelt))
         return data, False
 
     if data_axis < 0 or data_axis >= getattr(data, 'ndim', 0):
-        header[cdelt_key] = abs(cdelt)
+        set_header_axis_step(header, fits_axis, abs(cdelt))
         return data, False
 
     if is_lazy_scaled(data):
@@ -314,7 +362,7 @@ def _ensure_velocity_axis_ascending(data, header, fits_axis):
     else:
         data = np.flip(data, axis=data_axis)
 
-    header[cdelt_key] = abs(cdelt)
+    set_header_axis_step(header, fits_axis, abs(cdelt))
 
     crpix_key = f'CRPIX{fits_axis}'
     if crpix_key in header:
@@ -343,11 +391,27 @@ class FITSLoadError(Exception):
         self.detail = detail
         super().__init__(message)
 
-def load_fits(filename, compute_wcs=True, hdu: int | None = None):
+FREQUENCY_AXIS_MODES = ("velocity", "frequency")
+
+
+def load_fits(filename, compute_wcs=True, hdu: int | None = None, frequency_axis: str = "velocity"):
     """
     Load a FITS file and process header/data.
     Optionally compute WCS and perform velocity unit conversion.
+
+    ``frequency_axis`` says whether a radio cube shows velocity or frequency:
+    'velocity' converts a frequency axis to radio velocity when the header
+    gives a rest frequency (the default, as always); 'frequency' keeps a
+    frequency axis and converts a radio velocity axis (VRAD) to frequency,
+    with the same rest frequency.  The mode that applied is in
+    ``spectral_metadata['spectral_axis_mode']`` (TF-415 slice A).
     """
+    if frequency_axis not in FREQUENCY_AXIS_MODES:
+        raise FITSLoadError(
+            f"frequency_axis must be one of {FREQUENCY_AXIS_MODES}",
+            filename=filename,
+            kind="invalid_spectral_axis",
+        )
     path = Path(filename)
 
     if not path.exists():
@@ -512,6 +576,8 @@ def load_fits(filename, compute_wcs=True, hdu: int | None = None):
                 f"Using image HDU {selected_hdu_index}.\033[0m"
             )
 
+        _normalize_known_ctype_typos(header)
+
         # Wrap raw memmap in LazyScaledArray when lazy scaling is active.
         if lazy_scaling_active and data is not None:
             data = _wrap_lazy_scaled_data(data, header)
@@ -526,6 +592,7 @@ def load_fits(filename, compute_wcs=True, hdu: int | None = None):
         original_axis_ctype = header.get(f'CTYPE{spectral_axis_index}', '') if spectral_axis_index else ''
         original_axis_unit = header.get(f'CUNIT{spectral_axis_index}', '').strip() if spectral_axis_index else None
         spectral_metadata = {
+            'selected_hdu_index': int(selected_hdu_index),
             'axis_index': spectral_axis_index,
             'original_axis_ctype': original_axis_ctype,
             'original_axis_type': _classify_axis_type(original_axis_ctype),
@@ -534,6 +601,7 @@ def load_fits(filename, compute_wcs=True, hdu: int | None = None):
             'current_axis_type': None,
             'current_axis_unit': None,
             'converted_from_frequency': False,
+            'converted_from_velocity': False,
             'frequency_unit_original': None,
             'velocity_unit_adjusted': False,
             'velocity_unit_original': None,
@@ -572,7 +640,7 @@ def load_fits(filename, compute_wcs=True, hdu: int | None = None):
             spectral_metadata['_needs_per_slice_sanitize'] = True
 
         # Frequency conversion using FreqToVelocity
-        converter = FreqToVelocity(header)
+        converter = _frequency_converter(header, frequency_axis, spectral_axis_index)
         if converter.converted:
             header = converter.header
             data, flipped = _ensure_velocity_axis_ascending(data, header, converter.freq_axis)
@@ -587,6 +655,17 @@ def load_fits(filename, compute_wcs=True, hdu: int | None = None):
             spectral_metadata['current_axis_type'] = _classify_axis_type(spectral_metadata['current_axis_ctype'])
             spectral_metadata['current_axis_unit'] = header.get(f'CUNIT{converter.freq_axis}', '').strip() or None
             spectral_metadata['restfreq_hz'] = converter.restfreq
+            refresh_alternate_reference(header, converter.freq_axis, converter.restfreq)
+        elif converter.to_frequency:
+            # A radio-velocity axis shown in frequency; the data keep their order.
+            header = converter.header
+            spectral_metadata['converted_from_velocity'] = True  # the disk unit stays in original_axis_unit
+            spectral_metadata['axis_index'] = converter.freq_axis
+            spectral_metadata['current_axis_ctype'] = header.get(f'CTYPE{converter.freq_axis}', '')
+            spectral_metadata['current_axis_type'] = 'frequency'
+            spectral_metadata['current_axis_unit'] = 'Hz'
+            spectral_metadata['restfreq_hz'] = converter.restfreq
+            refresh_alternate_reference(header, converter.freq_axis, converter.restfreq)
 
         # Normalize TIMESYS value
         #if header.get("TIMESYS") == 'UTC':
@@ -623,6 +702,9 @@ def load_fits(filename, compute_wcs=True, hdu: int | None = None):
         spectral_metadata['large_data_mode'] = bool(large_data_profile.get('enabled'))
         spectral_metadata['large_data_profile'] = large_data_profile
 
+    for axis_number, original_unit, canonical_unit in normalize_velocity_cunits(header):
+        print(f"\033[96mRead CUNIT{axis_number} '{original_unit}' as {canonical_unit}.\033[0m")
+
     wcs = None
     if compute_wcs:
         try:
@@ -635,8 +717,8 @@ def load_fits(filename, compute_wcs=True, hdu: int | None = None):
                 non_velocity_indices = []
                 for i in range(1, 3):
                     ctype = header.get(f'CTYPE{i}', '').upper()
-                    if 'VRAD' in ctype or 'VEL' in ctype or  'VOPT' in ctype:
-                        velocity_indices.append(i)
+                    if 'VRAD' in ctype or 'VEL' in ctype or 'VOPT' in ctype or 'FREQ' in ctype:
+                        velocity_indices.append(i)  # the spectral axis (FREQ too: --spectral-axis freq)
                     else:
                         non_velocity_indices.append(i)
                 
@@ -687,62 +769,7 @@ def load_fits(filename, compute_wcs=True, hdu: int | None = None):
             spec_axis_idx = spectral_metadata['axis_index'] or _identify_spectral_axis(header)
             if spec_axis_idx is not None:
                 spectral_metadata['axis_index'] = spec_axis_idx
-            if spec_axis_idx and spec_axis_idx <= wcs.wcs.naxis:
-                wcs_axis_idx = spec_axis_idx - 1
-                header_cunit_key = f'CUNIT{spec_axis_idx}'
-                header_cdelt_key = f'CDELT{spec_axis_idx}'
-                header_crval_key = f'CRVAL{spec_axis_idx}'
-                unit_header = str(header.get(header_cunit_key, '')).replace(' ', '').lower()
-                try:
-                    unit_wcs = wcs.wcs.cunit[wcs_axis_idx].to_string().replace(' ', '').lower()
-                except Exception:
-                    unit_wcs = ''
-
-                if unit_header == 'km/s' and unit_wcs != 'km/s':
-                    try:
-                        wcs_unit = u.Unit(unit_wcs) if unit_wcs else None
-                    except Exception:
-                        wcs_unit = None
-                    if wcs_unit is not None:
-                        wcs.wcs.cdelt[wcs_axis_idx] = (wcs.wcs.cdelt[wcs_axis_idx] * wcs_unit).to(u.km / u.s).value
-                        wcs.wcs.crval[wcs_axis_idx] = (wcs.wcs.crval[wcs_axis_idx] * wcs_unit).to(u.km / u.s).value
-                elif (unit_header in ('m/s', '') and abs(wcs.wcs.cdelt[wcs_axis_idx]) > 100.0):
-                    if unit_header == '':
-                        print("\033[96mCUNIT{} is not found. Interpreted velocity unit as m/s.\033[0m".format(spec_axis_idx))
-                    wcs.wcs.cdelt[wcs_axis_idx] = (wcs.wcs.cdelt[wcs_axis_idx] * u.m / u.s).to(u.km / u.s).value
-                    wcs.wcs.crval[wcs_axis_idx] = (wcs.wcs.crval[wcs_axis_idx] * u.m / u.s).to(u.km / u.s).value
-                    header[header_cunit_key] = 'km/s'
-                    header[header_cdelt_key] = wcs.wcs.cdelt[wcs_axis_idx]
-                    header[header_crval_key] = wcs.wcs.crval[wcs_axis_idx]
-                    spectral_metadata['velocity_unit_adjusted'] = True
-                    spectral_metadata['velocity_unit_original'] = 'm/s'
-                    spectral_metadata['velocity_unit_target'] = 'km/s'
-                    spectral_metadata['current_axis_unit'] = 'km/s'
-
-                    print("\033[96mConverted velocity unit from m/s to km/s.\033[0m")
-
-                elif unit_header == '':
-                    print("\033[96mCUNIT{} is not found. Interpreted velocity unit as km/s.\033[0m".format(spec_axis_idx))
-                    header[header_cunit_key] = 'km/s'
-                    #try:
-                    #    wcs.wcs.cunit[wcs_axis_idx] = u.Unit('km/s')
-                    #except Exception as e:
-                    #    print(f"\033[91mError: Failed to update WCS CUNIT: {e}\033[0m")
-                    spectral_metadata['velocity_unit_adjusted'] = False # No conversion needed
-                    spectral_metadata['velocity_unit_original'] = 'km/s' # Assumed
-                    spectral_metadata['velocity_unit_target'] = 'km/s'
-                    spectral_metadata['current_axis_unit'] = 'km/s'
-
-                if spectral_metadata.get('current_axis_unit') is None:
-                    spectral_metadata['current_axis_unit'] = header.get(header_cunit_key, '').strip() or None
-                spectral_metadata['current_axis_ctype'] = header.get(f'CTYPE{spec_axis_idx}', spectral_metadata['current_axis_ctype'])
-            elif wcs.wcs.naxis == 2:
-                for i in range(2):
-                    wcs_unit = wcs.wcs.cunit[i].to_string().replace(' ', '').lower()
-                    if wcs_unit == 'm/s':
-                        wcs.wcs.cdelt[i] = (wcs.wcs.cdelt[i] * u.m / u.s).to(u.km / u.s).value
-                        wcs.wcs.crval[i] = (wcs.wcs.crval[i] * u.m / u.s).to(u.km / u.s).value
-                        spectral_metadata['velocity_unit_adjusted'] = True
+            apply_load_convention(wcs, header, spectral_metadata, spec_axis_idx)
     final_axis_idx = spectral_metadata['axis_index'] or _identify_spectral_axis(header)
     if final_axis_idx is not None:
         spectral_metadata['axis_index'] = final_axis_idx
@@ -756,5 +783,14 @@ def load_fits(filename, compute_wcs=True, hdu: int | None = None):
     spectral_metadata['restfreq_hz'] = _get_restfreq_hz(header)
     if spectral_metadata['restfreq_original_hz'] is None:
         spectral_metadata['restfreq_original_hz'] = spectral_metadata['restfreq_hz']
+    spectral_metadata['spectral_axis_mode'] = _spectral_axis_mode(spectral_metadata)
+    # A systemic redshift saved by takefits (TF-415 slice B): RESTFRQ is f0 / (1 + z).
+    systemic_z, zsource_notice = systemic_redshift_from_header(header)
+    if zsource_notice:
+        print(f"\033[93m{zsource_notice}\033[0m")
+    spectral_metadata['systemic_z'] = systemic_z
+    rest_hz = spectral_metadata['restfreq_hz']
+    spectral_metadata['line_restfreq_hz'] = None if rest_hz is None else rest_hz * (1.0 + systemic_z)
+    spectral_metadata['zsource_header'] = header.get('ZSOURCE') if zsource_notice else None
 
     return data, header, wcs, spectral_metadata

@@ -2,12 +2,10 @@ import copy
 import math
 import os
 import tempfile
-import threading
 import weakref
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, ProcessPoolExecutor
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, NamedTuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from astropy import units as u
@@ -24,6 +22,14 @@ _os_for_threads.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 _os_for_threads.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 from reproject import reproject_interp
+from takefits.core.spectral_units import (
+    MS_TO_KMS_MIN_STEP,
+    axis_step,
+    convert_axis_cards,
+    convert_velocity_axis_cards,
+    header_axis_step,
+    kms_per_unit,
+)
 from takefits.logic.data_tools import (
     LazyScaledArray,
     _get_available_memory_bytes,
@@ -280,22 +286,6 @@ def parse_obstime_from_header(hdr):
             pass
     return obstime
 
-def preflight_center_mapping(src_wcs_2d, tgt_wcs_2d, ny, nx):
-    """Fail fast if target->source mapping yields non-finite pixels (helps catch FK4 issues)."""
-    try:
-        cx, cy = (nx - 1) / 2.0, (ny - 1) / 2.0
-        world = tgt_wcs_2d.pixel_to_world(cx, cy)
-        from astropy.wcs.utils import wcs_to_celestial_frame
-        src_frame = wcs_to_celestial_frame(src_wcs_2d)
-        world_src = world.transform_to(src_frame)
-        sx, sy = src_wcs_2d.world_to_pixel(world_src)
-        import numpy as _np
-        if not _np.isfinite([sx, sy]).all():
-            raise RuntimeError("Target WCS maps to non-finite source pixels; check FK4 obstime/E-terms.")
-    except Exception as e:
-        raise RuntimeError(f"Preflight WCS mapping failed: {e}")
-
-
 from astropy.wcs.utils import wcs_to_celestial_frame
 from scipy.interpolate import interp1d
 
@@ -339,18 +329,12 @@ class RegridEngine:
         self._last_frame_hint = None  # Remember last requested celestial frame
         self.original_data = original_data
         self._dask_data = self._maybe_wrap_data(original_data)
-        self._slice_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
-        self._slice_cache_lock = threading.Lock()
-        self._max_cached_slices = 6
         self._spectral_axis_cache: Optional[int] = None
-        self._spectral_numpy_axis_cache: Optional[int] = None
         self._nan_high_order_fallback_used = False
         self._nan_high_order_downgraded = False
 
-        # Keep the incoming WCS numeric convention intact.  load_fits() may have
-        # already converted velocity crval/cdelt values to km/s while wcslib still
-        # reports cunit as m/s; changing only cunit here causes Astropy to rescale
-        # those values by 1000 during later WCS initialization.
+        # Work on a copy of the live WCS (SI numbers); relabelling a unit here
+        # would make astropy rescale the numbers at the next WCS set().
         wcs_sanitized = copy.deepcopy(original_wcs)
 
         self.original_wcs = wcs_sanitized
@@ -487,250 +471,6 @@ class RegridEngine:
 
         world_samples = self.original_wcs.wcs_pix2world(pixel_samples, 0)
         return world_samples[:, axis_index]
-
-    def _regrid_manual_legacy(self, params: Dict, method: str) -> Tuple[np.ndarray, fits.Header]:
-        """
-        Legacy manual regridding pipeline, rewritten for robustness.
-        This version creates a clean WCS from scratch to avoid inconsistencies.
-        """
-        anchor_world = params["anchor_world"]
-        grid_cdelt = params["grid_cdelt"]
-        naxis = self.original_wcs.wcs.naxis
-        spectral_wcs_idx = self._spectral_axis_index()
-
-        if spectral_wcs_idx is None or self.original_wcs.wcs.naxis != 3:
-            # This path is for non-spectral or non-3D data, which was not the issue.
-            # We keep it for completeness, but the main logic is below.
-            final_data, final_header, _ = self._regrid_manual_wcs_only(params, method)
-            return final_data, final_header
-        
-        self._emit_progress(20)
-
-        # --- 1. NEW: Build a clean, new 2D celestial WCS from scratch ---
-        # This is the core of the fix. Instead of patching a copied WCS, we build a
-        # new, internally consistent one from the user's parameters.
-        wcs_2d_celestial = WCS(naxis=2)
-        celestial_indices = self._celestial_axis_indices()
-        
-        # Determine the shape of the new 2D celestial grid
-        shape_orig = self.original_data.shape
-        shape_out_2d_list = [0, 0]
-
-        for i_2d, i_nd in enumerate(celestial_indices):
-            wcs_2d_celestial.wcs.crval[i_2d] = anchor_world[i_nd]
-            wcs_2d_celestial.wcs.cdelt[i_2d] = grid_cdelt[i_nd]
-            wcs_2d_celestial.wcs.ctype[i_2d] = self.original_wcs.wcs.ctype[i_nd]
-            wcs_2d_celestial.wcs.cunit[i_2d] = self.original_wcs.wcs.cunit[i_nd]
-            
-            world_corners = self._world_corners_for_axis(i_nd, shape_orig)
-            dist = np.max(np.abs(world_corners - anchor_world[i_nd]))
-            new_size = int(np.ceil(dist * 2 / abs(grid_cdelt[i_nd])))
-            new_size = max(new_size, 1)
-            shape_out_2d_list[i_2d] = new_size
-            wcs_2d_celestial.wcs.crpix[i_2d] = new_size / 2.0
-        
-        shape_out_2d = tuple(reversed(shape_out_2d_list))
-        wcs_2d_celestial.wcs.set()
-        
-        # --- 2. NEW: Combine the new 2D WCS with the original spectral axis ---
-        # Use the robust _build_combined_wcs helper to create a complete and correct 3D WCS.
-        target_wcs_3d = self._build_combined_wcs(wcs_2d_celestial, celestial_indices)
-        
-        # --- 3. Perform plane-by-plane spatial reprojection ---
-        n_spec_orig = shape_orig[0]
-        source_wcs_2d = self._drop_axis_safe(self.original_wcs, spectral_wcs_idx)
-        target_wcs_2d_final = self._drop_axis_safe(target_wcs_3d, spectral_wcs_idx)
-
-        if source_wcs_2d is None or target_wcs_2d_final is None:
-            raise RuntimeError("Failed to create 2D WCS for plane-by-plane reprojection.")
-
-        shape_out_spatial = (n_spec_orig,) + shape_out_2d
-        work_dtype = self._reproject_float_dtype()
-        data_spatial_regridded = np.empty(shape_out_spatial, dtype=work_dtype)
-        # Preflight mapping check
-        try:
-            ny, nx = shape_out_2d[0], shape_out_2d[1]
-        except Exception:
-            ny, nx = shape_out_2d
-        preflight_center_mapping(source_wcs_2d, target_wcs_2d_final, ny, nx)
-
-        for i in range(n_spec_orig):
-            plane_data = self.original_data[i, :, :]
-            if not isinstance(plane_data, np.ndarray):
-                plane_data = np.asarray(plane_data)
-            if plane_data.dtype != work_dtype:
-                plane_data = plane_data.astype(work_dtype, copy=False)
-            output_plane = np.empty(shape_out_2d, dtype=work_dtype)
-            reprojected_plane, _, used_fix, downgraded = _reproject_with_nan_support(
-                plane_data,
-                source_wcs_2d,
-                target_wcs_2d_final,
-                shape_out_2d,
-                method,
-                work_dtype,
-                output_array=output_plane,
-                need_coverage=False,
-            )
-            if used_fix:
-                self._nan_high_order_fallback_used = True
-            if downgraded:
-                self._nan_high_order_downgraded = True
-            data_spatial_regridded[i, :, :] = reprojected_plane
-        
-        self._emit_progress(60)
-
-        # --- 4. Perform 1D spectral interpolation (logic unchanged) ---
-        # This part was already correct.
-        spec_idx_numpy = naxis - 1 - spectral_wcs_idx
-        crpix_orig = self.original_wcs.wcs.crpix
-        crval_orig = self.original_wcs.wcs.crval
-        cdelt_orig = self.original_wcs.wcs.cdelt
-        cdelt_new = np.array(grid_cdelt)
-        crval_new = np.array(anchor_world)
-
-        n_spec_orig = shape_orig[spec_idx_numpy]
-        crpix_spec_orig = crpix_orig[spectral_wcs_idx]
-        crval_spec_orig = crval_orig[spectral_wcs_idx]
-        cdelt_spec_orig = cdelt_orig[spectral_wcs_idx]
-        cdelt_spec_new = cdelt_new[spectral_wcs_idx]
-        crval_spec_new = crval_new[spectral_wcs_idx]
-        
-        orig_spec_coords = (np.arange(n_spec_orig) - (crpix_spec_orig - 1)) * cdelt_spec_orig + crval_spec_orig
-        velocity_scale = self._spectral_velocity_scale_factor(spectral_wcs_idx, cdelt_spec_orig)
-        if velocity_scale != 1.0:
-            orig_spec_coords *= velocity_scale
-
-        spectral_min, spectral_max = np.nanmin(orig_spec_coords), np.nanmax(orig_spec_coords)
-        step = float(cdelt_spec_new)
-        tolerance = max(abs(step) * 1e-8, 1e-9)
-        if step > 0:
-            k_min = int(math.ceil((spectral_min - crval_spec_new - tolerance) / step))
-            k_max = int(math.floor((spectral_max - crval_spec_new + tolerance) / step))
-        else:
-            k_min = int(math.ceil((spectral_max - crval_spec_new + tolerance) / step))
-            k_max = int(math.floor((spectral_min - crval_spec_new - tolerance) / step))
-        
-        k_indices = np.arange(k_min, k_max + 1)
-
-        # SAFEGUARD: Check if the new spectral range is empty.
-        if k_indices.size == 0:
-            raise ValueError(
-                "No spectral overlap found. The requested spectral range does not "
-                "overlap with the original data's spectral range. "
-                "No output channels could be generated."
-            )
-        n_spec_new = len(k_indices)
-        crpix_spec_new = 1.0 - k_min
-        new_spec_coords = crval_spec_new + k_indices * step
-
-        data_reshaped = data_spatial_regridded.reshape(n_spec_orig, -1)
-        interpolator = interp1d(
-            orig_spec_coords, data_reshaped, axis=0, bounds_error=False,
-            fill_value=np.nan, kind=method if method in ("nearest", "linear") else "linear",
-            assume_sorted=True
-        )
-        regridded_spec_data = interpolator(new_spec_coords)
-        
-        final_shape = (n_spec_new,) + shape_out_2d
-        final_data = regridded_spec_data.reshape(final_shape)
-        preferred_dtype = self._preferred_float_dtype()
-        if final_data.dtype != preferred_dtype:
-            final_data = final_data.astype(preferred_dtype, copy=False)
-
-        self._emit_progress(90)
-
-        # --- 5. Construct Final Header using the corrected 3D WCS ---
-        # Update the target_wcs_3d with the new spectral axis solution
-        target_wcs_3d.wcs.crpix[spectral_wcs_idx] = crpix_spec_new
-        target_wcs_3d.wcs.crval[spectral_wcs_idx] = crval_spec_new
-        target_wcs_3d.wcs.cdelt[spectral_wcs_idx] = cdelt_spec_new
-        target_wcs_3d.wcs.set()
-        
-        final_header = self._base_header_copy()
-        self._apply_wcs_to_header(final_header, target_wcs_3d)
-        final_header[f"NAXIS{spectral_wcs_idx+1}"] = n_spec_new
-
-        self._ensure_header_pc(final_header)
-        self._ensure_header_units(final_header)
-
-        return final_data, final_header
-
-
-    def _regrid_manual_wcs_only(self, params: Dict, method: str) -> Tuple[np.ndarray, fits.Header, WCS]:
-        """Original WCS-based regridding for non-3D or non-spectral cubes."""
-        anchor_world: Sequence[float] = params["anchor_world"]
-        grid_cdelt: Sequence[float] = params["grid_cdelt"]
-        naxis = self.original_wcs.wcs.naxis
-
-        new_header = self._base_header_copy()
-        self._apply_wcs_to_header(new_header, self.original_wcs)
-        new_cdelt_arr = np.array(grid_cdelt, dtype=float)
-        anchor_arr = np.array(anchor_world, dtype=float)
-        if np.any(new_cdelt_arr == 0):
-            raise ValueError("Grid width (world) must be non-zero for every axis.")
-
-        axis_changed = [self._axis_requires_regrid(axis, anchor_arr[axis], new_cdelt_arr[axis]) for axis in range(naxis)]
-        if not any(axis_changed):
-            data_copy = self._copy_original_cube()
-            header = self._base_header_copy()
-            self._apply_wcs_to_header(header, self.original_wcs)
-            self._ensure_header_pc(header)
-            self._ensure_header_units(header)
-            return data_copy, header, self.original_wcs.copy()
-
-        for idx in range(naxis):
-            new_header[f"CDELT{idx + 1}"] = new_cdelt_arr[idx]
-            new_header[f"CRVAL{idx + 1}"] = anchor_arr[idx]
-            
-        data_shape = self._data_shape_for_wcs(naxis)
-
-
-        for axis in range(naxis):
-            world_corners = self._world_corners_for_axis(axis, data_shape)
-            world_min, world_max = np.min(world_corners), np.max(world_corners)
-            
-            crval_new = anchor_arr[axis]
-            cdelt_new = new_cdelt_arr[axis]
-            
-            step = float(cdelt_new)
-            tolerance = max(abs(step) * 1e-8, 1e-9)
-
-            if step > 0:
-                k_min = int(math.ceil((world_min - crval_new - tolerance) / step))
-                k_max = int(math.floor((world_max - crval_new + tolerance) / step))
-            else:
-                k_min = int(math.ceil((world_max - crval_new + tolerance) / step))
-                k_max = int(math.floor((world_min - crval_new - tolerance) / step))
-
-            if k_max < k_min:
-                new_size = 1
-                new_crpix = 1.0
-            else:
-                new_size = k_max - k_min + 1
-                new_crpix = 1.0 - k_min
-            
-            new_header[f"NAXIS{axis + 1}"] = new_size
-            new_header[f"CRPIX{axis + 1}"] = new_crpix
-
-        new_header["NAXIS"] = naxis
-        self._ensure_header_pc(new_header)
-        self._ensure_header_units(new_header)
-
-        target_wcs = self._create_wcs_safely(new_header)
-        shape_out = tuple(int(new_header[f"NAXIS{i+1}"]) for i in reversed(range(new_header["NAXIS"])))
-
-        regridded_data = self._reproject_to_target(
-            target_wcs,
-            shape_out,
-            method,
-        )
-        
-        header = self._base_header_copy()
-        self._apply_wcs_to_header(header, target_wcs)
-        self._ensure_header_pc(header)
-        self._ensure_header_units(header)
-        
-        return regridded_data, header, target_wcs
 
     def _create_wcs_safely(self, header):
         try:
@@ -1047,7 +787,7 @@ class RegridEngine:
                 continue
 
             cdelt_key = f"CDELT{axis}"
-            cdelt_value = header.get(cdelt_key)
+            cdelt_value = header_axis_step(header, axis)  # CDELT or CD matrix
             try:
                 cdelt = float(cdelt_value)
             except (TypeError, ValueError):
@@ -1066,7 +806,8 @@ class RegridEngine:
                 continue
 
             if should_scale:
-                header[cdelt_key] = cdelt * 1e-3
+                if cdelt_key in header:
+                    header[cdelt_key] = float(header[cdelt_key]) * 1e-3
 
                 crval_key = f"CRVAL{axis}"
                 if crval_key in header:
@@ -1584,6 +1325,8 @@ class RegridEngine:
             original_unit = ""
             if self.original_header is not None:
                 original_unit = self.original_header.get(unit_key, "")
+            # numbers into the unit written below (km/s, GHz, um, ...)
+            convert_axis_cards(header, axis_number, original_unit)
             self._set_axis_unit(header, axis_number, original_unit)
 
     def _annotate_history(
@@ -1710,7 +1453,11 @@ class RegridEngine:
     # ------------------------------------------------------------------
     # WCS helpers
     def _ensure_wcs_pc(self, wcs_obj: WCS):
-        """Ensures the WCS object has a PC matrix, defaulting to identity."""
+        """Ensures the WCS object has a PC matrix, defaulting to identity.
+
+        A CD matrix is rewritten as the same transform in PC + CDELT form:
+        an identity PC next to it would take precedence with CDELT = 1.
+        """
         try:
             # The only way to know if pc is missing is to try to access it.
             # If it exists, we don't need to do anything, unless it's None.
@@ -1723,7 +1470,13 @@ class RegridEngine:
         # If we're here, pc is missing or is None.
         try:
             naxis = wcs_obj.wcs.naxis
-            if naxis > 0:
+            if naxis > 0 and wcs_obj.wcs.has_cd():
+                cd = np.asarray(wcs_obj.wcs.cd, dtype=float)
+                steps = np.array([axis_step(wcs_obj, axis) for axis in range(naxis)], dtype=float)
+                steps[steps == 0] = 1.0
+                wcs_obj.wcs.cdelt = steps
+                wcs_obj.wcs.pc = cd / steps[:, np.newaxis]
+            elif naxis > 0:
                 wcs_obj.wcs.pc = np.identity(naxis)
         except Exception:  # pragma: no cover
             # In case naxis is not available or other issues.
@@ -1757,17 +1510,6 @@ class RegridEngine:
         self._spectral_axis_cache = None
         return self._spectral_axis_cache
 
-    def _spectral_numpy_axis(self) -> Optional[int]:
-        if self._spectral_numpy_axis_cache is not None:
-            return self._spectral_numpy_axis_cache
-        spectral_wcs_idx = self._spectral_axis_index()
-        if spectral_wcs_idx is None:
-            self._spectral_numpy_axis_cache = None
-            return None
-        np_axis = self.original_data.ndim - 1 - spectral_wcs_idx
-        self._spectral_numpy_axis_cache = np_axis
-        return np_axis
-
     def _spectral_axis_coordinates(
         self,
         size: int,
@@ -1786,7 +1528,7 @@ class RegridEngine:
             try:
                 crpix = float(header.get(f"CRPIX{axis_number}"))
                 crval = float(header.get(f"CRVAL{axis_number}"))
-                cdelt = float(header.get(f"CDELT{axis_number}"))
+                cdelt = float(header_axis_step(header, axis_number))  # CDELT or CD matrix
                 coords = (np.arange(size, dtype=float) - (crpix - 1.0)) * cdelt + crval
                 cdelt_value = cdelt
                 unit_value = header.get(f"CUNIT{axis_number}")
@@ -1797,7 +1539,7 @@ class RegridEngine:
         if coords is None:
             crpix = float(wcs_obj.wcs.crpix[axis_index])
             crval = float(wcs_obj.wcs.crval[axis_index])
-            cdelt = float(wcs_obj.wcs.cdelt[axis_index])
+            cdelt = float(axis_step(wcs_obj, axis_index))
             coords = (np.arange(size, dtype=float) - (crpix - 1.0)) * cdelt + crval
             cdelt_value = cdelt
             if axis_index < len(wcs_obj.wcs.cunit):
@@ -1806,114 +1548,15 @@ class RegridEngine:
                 ctype_value = wcs_obj.wcs.ctype[axis_index]
 
         if self._is_velocity_axis(str(ctype_value)):
-            if self._velocity_values_need_kms_scaling(
-                unit_value,
-                float(cdelt_value or 0.0),
-                assume_missing_unit=True,
-            ):
-                coords = coords * 1e-3
+            # Both sides of the template interpolation in m/s, from each
+            # axis's own CUNIT; without one, the loader's rule (km/s for small
+            # steps, m/s for large ones).
+            kms = kms_per_unit(str(unit_value)) if unit_value not in (None, "") else None
+            if kms is None:
+                kms = 1e-3 if abs(float(cdelt_value or 0.0)) > MS_TO_KMS_MIN_STEP else 1.0
+            coords = coords * (kms * 1000.0)
 
         return coords
-
-    def _get_spectral_slice(self, index: int) -> np.ndarray:
-        if index < 0:
-            raise IndexError("Spectral slice index must be non-negative.")
-        np_axis = self._spectral_numpy_axis()
-        if np_axis is None:
-            raise RuntimeError("Spectral axis is undefined for this dataset.")
-
-        with self._slice_cache_lock:
-            cached = self._slice_cache.get(index)
-            if cached is not None:
-                self._slice_cache.move_to_end(index)
-                return cached
-
-        slice_data: np.ndarray
-        if self._dask_data is not None:
-            try:
-                slice_data = np.asarray(self._dask_data.take(index, axis=np_axis).compute())
-            except Exception:
-                slice_data = _take_plane(self.original_data, index, np_axis)
-        else:
-            slice_data = _take_plane(self.original_data, index, np_axis)
-
-        slice_data = np.asarray(slice_data, dtype=self._preferred_float_dtype())
-
-        with self._slice_cache_lock:
-            self._slice_cache[index] = slice_data
-            if len(self._slice_cache) > self._max_cached_slices:
-                self._slice_cache.popitem(last=False)
-        return slice_data
-
-    def _spectral_plane_at(
-        self,
-        world_value: float,
-        method: str,
-        orig_spec_coords: np.ndarray,
-    ) -> Optional[np.ndarray]:
-        coords = np.asarray(orig_spec_coords, dtype=float)
-        if coords.size == 0:
-            return None
-
-        interp_mode = method.lower()
-        if interp_mode in ("nearest", "nearest-neighbor"):
-            nearest_idx = int(np.argmin(np.abs(coords - world_value)))
-            return np.array(self._get_spectral_slice(nearest_idx), copy=True)
-
-        increasing = coords[-1] >= coords[0]
-        coords_for_search = coords if increasing else coords[::-1]
-        idx = int(np.searchsorted(coords_for_search, world_value))
-        size = coords_for_search.size
-        if size == 0:
-            return None
-
-        if increasing:
-            first_val = float(coords_for_search[0])
-            last_val = float(coords_for_search[-1])
-        else:
-            first_val = float(coords_for_search[-1])
-            last_val = float(coords_for_search[0])
-
-        if self._almost_equal(world_value, first_val):
-            target_idx = 0 if increasing else size - 1
-            return np.array(self._get_spectral_slice(target_idx), copy=True)
-        if self._almost_equal(world_value, last_val):
-            target_idx = size - 1 if increasing else 0
-            return np.array(self._get_spectral_slice(target_idx), copy=True)
-
-        if idx <= 0 or idx >= size:
-            return None
-
-        lower_idx = idx - 1
-        upper_idx = idx
-
-        if not increasing:
-            lower_idx = size - idx
-            upper_idx = size - idx - 1
-
-        x0 = float(coords_for_search[idx - 1])
-        x1 = float(coords_for_search[idx])
-
-        if self._almost_equal(world_value, x0):
-            target_idx = lower_idx
-            return np.array(self._get_spectral_slice(target_idx), copy=True)
-        if self._almost_equal(world_value, x1):
-            target_idx = upper_idx
-            return np.array(self._get_spectral_slice(target_idx), copy=True)
-
-        if not np.isfinite(x0) or not np.isfinite(x1) or math.isclose(x0, x1, rel_tol=1e-12, abs_tol=1e-12):
-            nearest_idx = lower_idx if abs(world_value - x0) <= abs(world_value - x1) else upper_idx
-            return np.array(self._get_spectral_slice(nearest_idx), copy=True)
-
-        weight = (world_value - x0) / (x1 - x0)
-        weight = min(max(weight, 0.0), 1.0)
-        slice_lo = self._get_spectral_slice(lower_idx)
-        slice_hi = self._get_spectral_slice(upper_idx)
-        dtype = self._preferred_float_dtype()
-        plane = (1.0 - weight) * slice_lo + weight * slice_hi
-        if plane.dtype != dtype:
-            plane = plane.astype(dtype, copy=False)
-        return plane
 
     def _interpolation_to_spline_order(self, method: str) -> Optional[int]:
         order_map = {
@@ -1924,250 +1567,6 @@ class RegridEngine:
             "bicubic": 3,
         }
         return order_map.get(method.lower())
-
-    def _reproject_2d_plane(
-        self,
-        plane: Optional[np.ndarray],
-        source_wcs: Optional[WCS],
-        target_wcs: Optional[WCS],
-        shape_out: Tuple[int, int],
-        order: str,
-    ) -> np.ndarray:
-        preferred_dtype = self._preferred_float_dtype()
-        work_dtype = self._reproject_float_dtype()
-        if plane is None or source_wcs is None or target_wcs is None:
-            return np.full(shape_out, np.nan, dtype=preferred_dtype)
-
-        # Ensure the source plane matches the dtype we will hand to reproject_interp.
-        if not isinstance(plane, np.ndarray):
-            plane = np.asarray(plane)
-        if plane.dtype != work_dtype:
-            plane = plane.astype(work_dtype, copy=False)
-
-        output_array = np.empty(shape_out, dtype=work_dtype)
-        result, _, used_fix, downgraded = _reproject_with_nan_support(
-            plane,
-            source_wcs,
-            target_wcs,
-            shape_out,
-            order,
-            work_dtype,
-            output_array=output_array,
-            need_coverage=False,
-        )
-        if used_fix:
-            self._nan_high_order_fallback_used = True
-        if downgraded:
-            self._nan_high_order_downgraded = True
-        if preferred_dtype != work_dtype:
-            result = result.astype(preferred_dtype, copy=False)
-        return result
-
-    class _SpatialMapping(NamedTuple):
-        coords: Optional[np.ndarray]
-        valid_mask: Optional[np.ndarray]
-        output_shape: Tuple[int, int]
-        integer_shift: Optional[Tuple[int, int]]
-
-    def _prepare_spatial_resampler(
-        self,
-        source_wcs: WCS,
-        target_wcs: WCS,
-        output_shape: Tuple[int, int],
-        source_shape: Tuple[int, int],
-        unit_step_axes: Optional[Tuple[bool, ...]] = None,
-    ) -> Optional["_SpatialMapping"]:
-        if map_coordinates is None and not (unit_step_axes and any(unit_step_axes)):
-            return None
-        if len(output_shape) != 2 or len(source_shape) != 2:
-            return None
-
-        try:
-            y_grid, x_grid = np.indices(output_shape, dtype=float)
-            target_pixels = np.column_stack((x_grid.ravel(), y_grid.ravel()))
-            world_coords = target_wcs.wcs_pix2world(target_pixels, 0)
-            source_pixels = source_wcs.wcs_world2pix(world_coords, 0)
-        except Exception:
-            return None
-
-        if not isinstance(source_pixels, np.ndarray):
-            source_pixels = np.asarray(source_pixels, dtype=float)
-        source_x = np.asarray(source_pixels[:, 0], dtype=float)
-        source_y = np.asarray(source_pixels[:, 1], dtype=float)
-
-        valid = np.isfinite(source_x) & np.isfinite(source_y)
-        height, width = int(source_shape[0]), int(source_shape[1])
-        valid &= (source_x >= -0.5) & (source_x <= width - 0.5)
-        valid &= (source_y >= -0.5) & (source_y <= height - 0.5)
-        valid = valid.astype(bool, copy=False)
-
-        safe_x = np.where(valid, source_x, 0.0)
-        safe_y = np.where(valid, source_y, 0.0)
-        coords = np.vstack((safe_y, safe_x))
-        integer_shift: Optional[Tuple[int, int]] = None
-
-        def _detect_shift(deltas: np.ndarray) -> Optional[int]:
-            if deltas.size == 0:
-                return None
-            base = float(deltas[0])
-            if np.max(np.abs(deltas - base)) > 1e-4:
-                return None
-            nearest = int(round(base))
-            if abs(base - nearest) > 1e-4:
-                return None
-            return nearest
-
-        if unit_step_axes and valid.any():
-            shifts: List[Optional[int]] = [None, None]
-            diffs_x = source_x - x_grid.ravel()
-            diffs_y = source_y - y_grid.ravel()
-            valid_indices = valid
-
-            if len(unit_step_axes) > 0 and unit_step_axes[0]:
-                shift_x = _detect_shift(diffs_x[valid_indices])
-                if shift_x is not None:
-                    shifts[1] = shift_x
-            if len(unit_step_axes) > 1 and unit_step_axes[1]:
-                shift_y = _detect_shift(diffs_y[valid_indices])
-                if shift_y is not None:
-                    shifts[0] = shift_y
-
-            if all(shift is not None for shift in shifts):
-                integer_shift = (int(shifts[0]), int(shifts[1]))
-
-        return self._SpatialMapping(
-            coords=coords,
-            valid_mask=valid,
-            output_shape=(int(output_shape[0]), int(output_shape[1])),
-            integer_shift=integer_shift,
-        )
-
-    def _apply_spatial_resampler(
-        self,
-        plane: np.ndarray,
-        mapping: "_SpatialMapping",
-        order: int,
-        dtype: np.dtype,
-        source_shape: Tuple[int, int],
-        ) -> np.ndarray:
-        if map_coordinates is None:
-            raise RuntimeError("Spatial resampler requested but scipy.ndimage is unavailable.")
-
-        coords = mapping.coords
-        valid_flat = mapping.valid_mask
-        output_shape = mapping.output_shape
-
-        if coords is None:
-            return np.full(output_shape, np.nan, dtype=dtype)
-
-        if plane.shape != tuple(int(dim) for dim in source_shape):
-            plane = np.reshape(plane, tuple(int(dim) for dim in source_shape))
-
-        # Handle NaNs correctly for high-order interpolation
-        
-        nan_mask = np.isnan(plane)
-        filled_plane = plane
-        
-        has_nans = False
-        prefilter = bool(order > 1)
-        if prefilter and np.any(nan_mask):
-            has_nans = True
-            # Use nan_to_num which replaces NaN with 0.0
-            filled_plane = np.nan_to_num(plane)
-
-        # We use cval=0.0 because any out-of-bounds will be masked
-        # to NaN by the reprojected masks later.
-        sampled = map_coordinates(
-            filled_plane,
-            coords,
-            order=int(order),
-            mode="constant",
-            cval=0.0, 
-            prefilter=prefilter,
-        )
-
-        if has_nans:
-            # Resample the NaN mask (True=NaN, False=Valid)
-            # We sample nan_mask.astype(float) (1.0=NaN, 0.0=Valid)
-            # order=0 (nearest), mode='constant', cval=1.0 (out-of-bounds is invalid/NaN)
-            nan_mask_sampled = map_coordinates(
-                nan_mask.astype(float),
-                coords,
-                order=0,
-                mode="constant",
-                cval=1.0, 
-            )
-            # Apply the NaN mask
-            sampled[nan_mask_sampled > 0.5] = np.nan
-        
-        reshaped = sampled.reshape(output_shape)
-
-        # This mask handles pixels that mapped outside the original image bounds
-        # *regardless* of whether they were NaN or not.
-        if valid_flat is not None and valid_flat.size == sampled.size:
-            invalid_mask = ~valid_flat.reshape(output_shape)
-            if np.any(invalid_mask):
-                reshaped[invalid_mask] = np.nan
-
-        if reshaped.dtype != dtype:
-            reshaped = reshaped.astype(dtype, copy=False)
-        return reshaped
-
-    @staticmethod
-    def _compute_shift_overlap(
-        source_len: int,
-        output_len: int,
-        shift: int,
-    ) -> Tuple[int, int, int]:
-        if shift >= 0:
-            src_start = shift
-            dst_start = 0
-        else:
-            src_start = 0
-            dst_start = -shift
-        available_src = source_len - src_start
-        available_dst = output_len - dst_start
-        length = min(available_src, available_dst)
-        if length <= 0:
-            return src_start, dst_start, 0
-        return src_start, dst_start, length
-
-    def _apply_integer_shift(
-        self,
-        plane: np.ndarray,
-        shift: Tuple[int, int],
-        dtype: np.dtype,
-        source_shape: Tuple[int, int],
-        output_shape: Tuple[int, int],
-    ) -> np.ndarray:
-        if plane.shape != tuple(int(dim) for dim in source_shape):
-            plane = np.reshape(plane, tuple(int(dim) for dim in source_shape))
-
-        shift_y, shift_x = int(shift[0]), int(shift[1])
-        out = np.full(output_shape, np.nan, dtype=dtype)
-
-        src_y_start, dst_y_start, y_len = self._compute_shift_overlap(
-            source_shape[0],
-            output_shape[0],
-            shift_y,
-        )
-        src_x_start, dst_x_start, x_len = self._compute_shift_overlap(
-            source_shape[1],
-            output_shape[1],
-            shift_x,
-        )
-
-        if y_len <= 0 or x_len <= 0:
-            return out
-
-        out[
-            dst_y_start : dst_y_start + y_len,
-            dst_x_start : dst_x_start + x_len,
-        ] = plane[
-            src_y_start : src_y_start + y_len,
-            src_x_start : src_x_start + x_len,
-        ]
-        return out
 
     def _build_combined_wcs(self, target_wcs2d: WCS, celestial_indices: List[int]) -> WCS:
         """
@@ -2196,7 +1595,7 @@ class RegridEngine:
             final_wcs.wcs.crval[i_nd] = original_wcs.wcs.crval[i_nd]
             final_wcs.wcs.ctype[i_nd] = original_wcs.wcs.ctype[i_nd]
             final_wcs.wcs.cunit[i_nd] = original_wcs.wcs.cunit[i_nd]
-            final_wcs.wcs.cdelt[i_nd] = original_wcs.wcs.cdelt[i_nd]
+            final_wcs.wcs.cdelt[i_nd] = axis_step(original_wcs, i_nd)  # CDELT = 1 next to a scaled PC
 
         final_pc = np.identity(naxis)
         target_pc = target_wcs2d.wcs.get_pc()
@@ -2222,27 +1621,6 @@ class RegridEngine:
         self._ensure_wcs_units(final_wcs)
         return final_wcs
 
-    def _spectral_velocity_scale_factor(
-        self,
-        spectral_axis_index: int,
-        cdelt_spec_orig: float,
-    ) -> float:
-        try:
-            unit_value = (
-                self.original_wcs.wcs.cunit[spectral_axis_index]
-                if spectral_axis_index < len(self.original_wcs.wcs.cunit)
-                else None
-            )
-            if self._velocity_values_need_kms_scaling(
-                unit_value,
-                cdelt_spec_orig,
-                assume_missing_unit=False,
-            ):
-                return 1e-3
-        except Exception:
-            return 1.0
-        return 1.0
-
     def _manual_axis_unit_context(self, axis_index: int) -> Tuple[str, str, float]:
         ctype = self.original_wcs.wcs.ctype[axis_index]
         is_velocity = self._is_velocity_axis(ctype)
@@ -2263,22 +1641,24 @@ class RegridEngine:
                     is_velocity=is_velocity,
                 )
 
+        # The typed numbers are in the display unit, which the in-memory header
+        # holds (km/s, GHz, um, ...); the live WCS holds SI numbers.
         display_unit = header_unit or wcs_unit
         if is_velocity and not display_unit:
             display_unit = "km/s"
 
         world_to_display_scale = 1.0
         if is_velocity and display_unit == "km/s":
+            scale = kms_per_unit(str(wcs_unit_value))
+            world_to_display_scale = float(scale) if scale else 1e-3
+        elif not is_velocity and display_unit and wcs_unit and display_unit != wcs_unit:
+            # frequency and wavelength axes shown in GHz / um / Angstrom (TF-415 slice A)
             try:
-                cdelt_orig = float(self.original_wcs.wcs.cdelt[axis_index])
-            except (TypeError, ValueError):
-                cdelt_orig = 0.0
-            if self._velocity_values_need_kms_scaling(
-                wcs_unit_value,
-                cdelt_orig,
-                assume_missing_unit=(not bool(header_unit)),
-            ):
-                world_to_display_scale = 1e-3
+                source, target = u.Unit(wcs_unit), u.Unit(display_unit)
+                if source.is_equivalent(target):
+                    world_to_display_scale = float(source.to(target))
+            except (ValueError, TypeError):
+                pass
 
         return wcs_unit, display_unit, world_to_display_scale
 
@@ -2311,6 +1691,9 @@ class RegridEngine:
                         is_velocity=True,
                     )
                 if orig_unit:
+                    # The template may be in the other velocity unit (m/s vs
+                    # km/s): convert its numbers before taking the source unit.
+                    convert_velocity_axis_cards(template_header, axis_number, orig_unit)
                     self._set_axis_unit(template_header, axis_number, orig_unit)
 
         self._synchronize_rest_metadata(template_header)
@@ -2989,38 +2372,6 @@ class RegridEngine:
                     self._flush_memmap_quietly(out)
                     flush_bytes = 0
 
-    @staticmethod
-    def _almost_equal(a: float, b: float, tol: float = 1e-9) -> bool:
-        if a == b:
-            return True
-        if not (np.isfinite(a) and np.isfinite(b)):
-            return False
-        scale = max(1.0, abs(a), abs(b))
-        return abs(a - b) <= tol * scale
-
-    def _axis_requires_regrid(self, axis: int, crval_new: float, cdelt_new: float) -> bool:
-        try:
-            orig_crval = float(self.original_wcs.wcs.crval[axis])
-            orig_cdelt = float(self.original_wcs.wcs.cdelt[axis])
-        except Exception:
-            return True
-        if not self._almost_equal(orig_crval, float(crval_new)):
-            return True
-        if not self._almost_equal(orig_cdelt, float(cdelt_new)):
-            return True
-        return False
-
-    def _copy_original_cube(self) -> np.ndarray:
-        preferred_dtype = self._preferred_float_dtype()
-        if self._dask_data is not None:
-            try:
-                data_np = np.asarray(self._dask_data.compute(), dtype=preferred_dtype)
-            except Exception:
-                data_np = np.asarray(self.original_data, dtype=preferred_dtype)
-        else:
-            data_np = np.asarray(self.original_data, dtype=preferred_dtype)
-        return np.array(data_np, copy=True, dtype=preferred_dtype)
-
     def _maybe_wrap_data(self, data):
         if da is None:
             return None
@@ -3069,21 +2420,6 @@ class RegridEngine:
         except Exception:
             dropped.array_shape = None
         return dropped
-
-    def _celestial_has_projection(self, wcs_obj: WCS) -> bool:
-        """Checks if the celestial axes have a projection code (e.g., -SIN, -TAN)."""
-        celestial_indices = self._celestial_axis_indices()
-        if not celestial_indices:
-            return False
-
-        for i in celestial_indices:
-            try:
-                ctype = wcs_obj.wcs.ctype[i]
-                if '-' in ctype:
-                    return True
-            except (IndexError, AttributeError):
-                continue
-        return False
 
     def _is_axis_coupled(self, wcs_obj: WCS, axis: int, tol: float = 1e-10) -> bool:
         try:
@@ -3698,318 +3034,3 @@ class RegridEngine:
                     comment=comment,
                     after=None,
                 )
-
-
-    def _regrid_manual_reproject(self, params: Dict, method: str) -> Tuple[np.ndarray, fits.Header, WCS]:
-        """High-precision manual regridding using reproject library.
-        Kept as a backend but not exposed to the GUI by default.
-        """
-        spectral_wcs_idx = self._spectral_axis_index()
-        if spectral_wcs_idx is None or self.original_wcs.wcs.naxis != 3:
-            # Note: _regrid_manual_wcs_only now returns a WCS object as the third element.
-            return self._regrid_manual_wcs_only(params, method)
-
-        if self._is_axis_coupled(self.original_wcs, spectral_wcs_idx) or self._celestial_has_projection(self.original_wcs):
-            # Fall back to the legacy implementation when axes are strongly coupled.
-            # This path is less common; for simplicity, we create WCS from the final header here.
-            # A more robust solution would refactor _regrid_manual_legacy as well.
-            final_data, final_header = self._regrid_manual_legacy(params, method)
-            final_wcs = WCS(final_header)
-            return final_data, final_header, final_wcs
-
-        cache_override = params.get("slice_cache_size")
-        previous_cache_limit = self._max_cached_slices
-        if isinstance(cache_override, int) and cache_override > 0:
-            self._max_cached_slices = cache_override
-
-        try:
-            anchor_world = params["anchor_world"]
-            grid_cdelt = params["grid_cdelt"]
-            naxis = self.original_wcs.wcs.naxis
-
-            self._emit_progress(20)
-
-            # --- Build spatial target WCS without touching the spectral axis ---
-            wcs_spatial = copy.deepcopy(self.original_wcs)
-            shape_orig = self.original_data.shape
-            shape_spatial = list(shape_orig)
-            crpix_orig = np.array(self.original_wcs.wcs.crpix, dtype=float)
-            crval_orig = np.array(self.original_wcs.wcs.crval, dtype=float)
-            cdelt_orig = np.array(self.original_wcs.wcs.cdelt, dtype=float)
-            crval_new = np.array(anchor_world, dtype=float)
-            cdelt_new = np.array(grid_cdelt, dtype=float)
-
-            unit_pixel_steps: List[bool] = []
-            for axis in range(naxis):
-                try:
-                    orig_step = float(cdelt_orig[axis])
-                    new_step = float(cdelt_new[axis])
-                except Exception:
-                    unit_pixel_steps.append(False)
-                    continue
-                if not np.isfinite(orig_step) or not np.isfinite(new_step):
-                    unit_pixel_steps.append(False)
-                    continue
-                if abs(orig_step) <= 0:
-                    unit_pixel_steps.append(False)
-                    continue
-                unit_pixel_steps.append(
-                    self._almost_equal(abs(orig_step), abs(new_step), tol=1e-6)
-                )
-
-            axis_changed = [
-                self._axis_requires_regrid(axis, crval_new[axis], cdelt_new[axis])
-                for axis in range(naxis)
-            ]
-
-            if not any(axis_changed):
-                data_copy = self._copy_original_cube()
-                header = self._base_header_copy()
-                self._apply_wcs_to_header(header, self.original_wcs)
-                self._ensure_header_pc(header)
-                self._ensure_header_units(header)
-                return data_copy, header, self.original_wcs.copy()
-
-            spectral_changed = axis_changed[spectral_wcs_idx]
-            needs_spatial_reproject = any(
-                axis_changed[axis] for axis in range(naxis) if axis != spectral_wcs_idx
-            )
-
-            for axis in range(naxis):
-                if axis == spectral_wcs_idx:
-                    continue
-
-                np_axis = naxis - 1 - axis
-                if np_axis < 0 or np_axis >= len(shape_spatial):
-                    final_data, final_header = self._regrid_manual_legacy(params, method)
-                    final_wcs = WCS(final_header)
-                    return final_data, final_header, final_wcs
-
-                if not axis_changed[axis]:
-                    shape_spatial[np_axis] = shape_orig[np_axis]
-                    wcs_spatial.wcs.crval[axis] = crval_orig[axis]
-                    wcs_spatial.wcs.cdelt[axis] = cdelt_orig[axis]
-                    wcs_spatial.wcs.crpix[axis] = crpix_orig[axis]
-                    continue
-
-                wcs_spatial.wcs.crval[axis] = crval_new[axis]
-                wcs_spatial.wcs.cdelt[axis] = cdelt_new[axis]
-
-                world_corners = self._world_corners_for_axis(axis, shape_orig)
-                dist = np.max(np.abs(world_corners - crval_new[axis]))
-                new_size = int(np.ceil(dist * 2 / max(abs(cdelt_new[axis]), 1e-12)))
-                new_size = max(new_size, 1)
-                shape_spatial[np_axis] = new_size
-                wcs_spatial.wcs.crpix[axis] = new_size / 2.0
-
-            wcs_spatial.wcs.set()
-            shape_out_spatial = tuple(shape_spatial)
-            wcs_spatial.array_shape = shape_out_spatial
-
-            source_wcs_2d = self._drop_axis_safe(self.original_wcs, spectral_wcs_idx)
-            target_wcs_2d = self._drop_axis_safe(wcs_spatial, spectral_wcs_idx)
-            if source_wcs_2d is None or target_wcs_2d is None:
-                final_data, final_header = self._regrid_manual_legacy(params, method)
-                final_wcs = WCS(final_header)
-                return final_data, final_header, final_wcs
-
-            # --- Prepare spectral coordinates ---
-            spec_idx_numpy = naxis - 1 - spectral_wcs_idx
-            if spec_idx_numpy < 0 or spec_idx_numpy >= len(shape_orig):
-                final_data, final_header = self._regrid_manual_legacy(params, method)
-                final_wcs = WCS(final_header)
-                return final_data, final_header, final_wcs
-
-            n_spec_orig = shape_orig[spec_idx_numpy]
-            if n_spec_orig <= 0:
-                raise ValueError("Spectral axis has zero length.")
-
-            crpix_spec_orig = crpix_orig[spectral_wcs_idx]
-            crval_spec_orig = self.original_wcs.wcs.crval[spectral_wcs_idx]
-            cdelt_spec_orig = self.original_wcs.wcs.cdelt[spectral_wcs_idx]
-            cdelt_spec_new = cdelt_new[spectral_wcs_idx]
-            if cdelt_spec_new == 0:
-                raise ValueError("Spectral grid spacing must be non-zero.")
-            crval_spec_new = crval_new[spectral_wcs_idx]
-
-            orig_spec_coords = (
-                (np.arange(n_spec_orig) - (crpix_spec_orig - 1)) * cdelt_spec_orig + crval_spec_orig
-            )
-            velocity_scale = self._spectral_velocity_scale_factor(
-                spectral_wcs_idx,
-                cdelt_spec_orig,
-            )
-            if velocity_scale != 1.0:
-                orig_spec_coords = orig_spec_coords * velocity_scale
-
-            if spectral_changed:
-                spectral_min = float(np.nanmin(orig_spec_coords))
-                spectral_max = float(np.nanmax(orig_spec_coords))
-                step = float(cdelt_spec_new)
-                tolerance = max(abs(step) * 1e-8, 1e-9)
-
-                if step > 0:
-                    k_min = int(math.ceil((spectral_min - crval_spec_new - tolerance) / step))
-                    k_max = int(math.floor((spectral_max - crval_spec_new + tolerance) / step))
-                else:
-                    k_min = int(math.ceil((spectral_max - crval_spec_new + tolerance) / step))
-                    k_max = int(math.floor((spectral_min - crval_spec_new - tolerance) / step))
-
-                if k_max < k_min:
-                    k_min = k_max = 0
-
-                k_indices = np.arange(k_min, k_max + 1, dtype=int)
-                if k_indices.size == 0:
-                    k_indices = np.array([0], dtype=int)
-                    k_min = k_max = 0
-
-                n_spec_new = k_indices.size
-                crpix_spec_new = float(1 - k_min)
-                new_spec_coords = crval_spec_new + k_indices.astype(float) * step
-            else:
-                n_spec_new = n_spec_orig
-                crpix_spec_new = float(crpix_spec_orig)
-                new_spec_coords = orig_spec_coords
-
-            target_shape_2d = tuple(shape_out_spatial[1:])
-            preferred_dtype = self._preferred_float_dtype()
-            final_data = np.empty((n_spec_new,) + target_shape_2d, dtype=preferred_dtype)
-
-            source_shape_2d: Optional[Tuple[int, int]] = None
-            spatial_mapping: Optional["_SpatialMapping"] = None
-            integer_shift: Optional[Tuple[int, int]] = None
-            spline_order: Optional[int] = None
-            if needs_spatial_reproject:
-                source_shape_candidate = tuple(
-                    int(dim) for idx, dim in enumerate(shape_orig) if idx != spec_idx_numpy
-                )
-                if len(source_shape_candidate) == 2:
-                    source_shape_2d = source_shape_candidate
-                    spatial_axes = [axis for axis in range(naxis) if axis != spectral_wcs_idx]
-                    unit_step_flags_spatial = tuple(unit_pixel_steps[axis] for axis in spatial_axes)
-                    spatial_mapping = self._prepare_spatial_resampler(
-                        source_wcs_2d,
-                        target_wcs_2d,
-                        target_shape_2d,
-                        source_shape_2d,
-                        unit_step_flags_spatial,
-                    )
-                    if spatial_mapping is not None:
-                        integer_shift = spatial_mapping.integer_shift
-                    if map_coordinates is not None:
-                        spline_order = self._interpolation_to_spline_order(method)
-
-            enable_parallel = bool(params.get("enable_parallel", True))
-            requested_workers = params.get("workers") or params.get("parallel_workers")
-            if isinstance(requested_workers, int) and requested_workers > 0:
-                max_workers = requested_workers
-            else:
-                cpu_count = os.cpu_count() or 1
-                max_workers = min(8, max(1, cpu_count - 1))
-
-            # Ensure at least one worker is active.
-            max_workers = max(1, max_workers)
-            worker_items = list(enumerate(new_spec_coords))
-            total_planes = len(worker_items)
-
-            spectral_identity = not spectral_changed
-
-            def _process_plane(item):
-                idx, world_value = item
-                if spectral_identity:
-                    plane = self._get_spectral_slice(idx)
-                else:
-                    plane = self._spectral_plane_at(world_value, method, orig_spec_coords)
-                if plane is None:
-                    plane = np.full(target_shape_2d, np.nan, dtype=preferred_dtype)
-                elif plane.dtype != preferred_dtype:
-                    plane = plane.astype(preferred_dtype, copy=False)
-
-                if needs_spatial_reproject:
-                    if (
-                        integer_shift is not None
-                        and source_shape_2d is not None
-                    ):
-                        plane = self._apply_integer_shift(
-                            plane,
-                            integer_shift,
-                            preferred_dtype,
-                            source_shape_2d,
-                            target_shape_2d,
-                        )
-                    elif (
-                        spatial_mapping is not None
-                        and source_shape_2d is not None
-                        and spline_order is not None
-                        and map_coordinates is not None
-                    ):
-                        plane = self._apply_spatial_resampler(
-                            plane,
-                            spatial_mapping,
-                            spline_order,
-                            preferred_dtype,
-                            source_shape_2d,
-                        )
-                    else:
-                        plane = self._reproject_2d_plane(
-                            plane,
-                            source_wcs_2d,
-                            target_wcs_2d,
-                            target_shape_2d,
-                            method,
-                        )
-                else:
-                    if plane.shape != target_shape_2d:
-                        plane = np.reshape(plane, target_shape_2d)
-                return idx, plane
-
-            progress_start = 20
-            progress_end = 90
-
-            if enable_parallel and total_planes > 1 and max_workers > 1:
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    def _write_plane(_item, future):
-                        idx, plane = future.result()
-                        final_data[idx] = plane
-
-                    self._drain_bounded_futures(
-                        executor,
-                        worker_items,
-                        submit=lambda item: executor.submit(_process_plane, item),
-                        handle_result=_write_plane,
-                        total=total_planes,
-                        progress_start=progress_start,
-                        progress_span=progress_end - progress_start,
-                        max_workers=max_workers,
-                    )
-            else:
-                for completed, item in enumerate(worker_items, start=1):
-                    idx, plane = _process_plane(item)
-                    final_data[idx] = plane
-                    ratio = completed / total_planes
-                    self._emit_progress(
-                        int(progress_start + (progress_end - progress_start) * ratio)
-                    )
-
-            self._emit_progress(90)
-
-            # --- Build final header and WCS ---
-            final_header = self._base_header_copy()
-            # The wcs_spatial object contains the correct new spatial WCS information.
-            # We will now update it with the new spectral axis parameters to make it complete.
-            final_wcs = wcs_spatial
-            final_wcs.wcs.crpix[spectral_wcs_idx] = crpix_spec_new
-            final_wcs.wcs.crval[spectral_wcs_idx] = crval_spec_new
-            final_wcs.wcs.cdelt[spectral_wcs_idx] = cdelt_spec_new
-            final_wcs.wcs.set()
-            
-            # Apply the completed WCS to the header
-            self._apply_wcs_to_header(final_header, final_wcs)
-            final_header[f"NAXIS{spectral_wcs_idx + 1}"] = n_spec_new # Ensure NAXIS is correct
-
-            self._ensure_header_pc(final_header)
-            self._ensure_header_units(final_header)
-
-            return final_data, final_header, final_wcs
-        finally:
-            self._max_cached_slices = previous_cache_limit
